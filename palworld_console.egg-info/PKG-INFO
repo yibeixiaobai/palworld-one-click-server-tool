@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: palworld-console
+Version: 0.2.0
+Summary: Local and remote Palworld dedicated server console
+Requires-Python: >=3.10
+Requires-Dist: PySide6>=6.6
+Requires-Dist: keyring>=24.3
+Requires-Dist: requests>=2.31
+Requires-Dist: paramiko>=3.4
+Requires-Dist: palworld-save-tools==0.24.0

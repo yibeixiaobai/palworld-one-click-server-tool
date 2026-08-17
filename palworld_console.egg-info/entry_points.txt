@@ -1,0 +1,2 @@
+[console_scripts]
+palworld-console = palworld_console.main:main
