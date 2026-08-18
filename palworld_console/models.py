@@ -18,6 +18,25 @@ class TaskProgress:
 
 
 @dataclass(frozen=True)
+class LocalSteamCmdState:
+    root: str
+    executable: str
+    ready: bool
+    downloaded: bool = False
+    repaired: bool = False
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class PlayerRoleIdentity:
+    instance_id: str
+    player_uid: str
+    user_id: str = ""
+    nickname: str = ""
+    account_name: str = ""
+
+
+@dataclass(frozen=True)
 class ConfigSyncResult:
     values: dict[str, Any]
     config_path: str
@@ -259,6 +278,10 @@ class ServerInstance:
     mod_environment: dict[str, Any] = field(default_factory=dict)
     mod_profile: dict[str, Any] = field(default_factory=dict)
     mod_last_sync: str = ""
+    workshop_catalog_state: dict[str, Any] = field(default_factory=dict)
+    mod_source_preference: str = "workshop"
+    local_steamcmd_state: dict[str, Any] = field(default_factory=dict)
+    mod_environment_version: int = 1
     ui_preferences: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

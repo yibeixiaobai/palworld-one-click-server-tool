@@ -25,7 +25,7 @@ from pathlib import PurePosixPath
 from typing import Callable
 
 from .config_ini import PalWorldSettings, default_settings_path, settings_path
-from .models import ConfigSyncResult, EndpointStatus, GuildSummary, PlayerRecord, ServerHealthSnapshot, ServerInstance, TaskProgress, UninstallResult
+from .models import ConfigSyncResult, EndpointStatus, GuildSummary, LocalSteamCmdState, PlayerRecord, ServerHealthSnapshot, ServerInstance, TaskProgress, UninstallResult
 
 
 class _LineBuffer:
@@ -46,7 +46,7 @@ class _LineBuffer:
 
 
 class SteamCmdInstaller:
-    """Runs a user-supplied SteamCMD executable; downloading it stays an explicit UI action."""
+    """Runs a prepared SteamCMD executable and streams install progress."""
     APP_ID = "2394010"
 
     @staticmethod
@@ -80,6 +80,74 @@ class SteamCmdInstaller:
         if process.wait() != 0:
             raise RuntimeError(f"SteamCMD 安装/更新失败，退出码 {process.returncode}")
         progress(TaskProgress(98, "完成检查", "SteamCMD 安装结果验证通过"))
+
+
+class LocalSteamCmdManager:
+    DOWNLOAD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
+
+    @staticmethod
+    def validate_install_dir(install_dir: Path) -> Path:
+        if not str(install_dir).strip():
+            raise ValueError("请先选择本机服务端安装目录")
+        resolved = install_dir.expanduser().resolve()
+        project_root = Path(__file__).resolve().parent.parent
+        dangerous = {Path(resolved.anchor), Path.home().resolve(), project_root.resolve(), Path(os.environ.get("WINDIR", "C:/Windows")).resolve()}
+        if resolved in dangerous:
+            raise ValueError(f"拒绝使用危险安装目录: {resolved}")
+        resolved.mkdir(parents=True, exist_ok=True)
+        probe = resolved / f".palworld-write-{uuid.uuid4().hex}"
+        try:
+            probe.write_text("ok", encoding="ascii")
+        except OSError as exc:
+            raise PermissionError(f"安装目录不可写: {resolved}") from exc
+        finally:
+            probe.unlink(missing_ok=True)
+        if shutil.disk_usage(resolved).free < 6 * 1024**3:
+            raise RuntimeError("安装目录可用空间不足 6 GB")
+        return resolved
+
+    @staticmethod
+    def tool_root(install_dir: Path) -> Path:
+        return install_dir / "_tools" / "steamcmd"
+
+    def prepare(self, install_dir: Path, on_log: Callable[[str], None] | None = None, on_progress: Callable[[TaskProgress], None] | None = None) -> LocalSteamCmdState:
+        log = on_log or (lambda _line: None); progress = on_progress or (lambda _progress: None)
+        install_dir = self.validate_install_dir(install_dir); root = self.tool_root(install_dir); executable = root / "steamcmd.exe"
+        downloaded = False; repaired = False
+        progress(TaskProgress(2, "检测 SteamCMD", f"工具目录：{root}"))
+        if not executable.is_file() or executable.stat().st_size < 100_000:
+            repaired = executable.exists(); root.mkdir(parents=True, exist_ok=True); archive = root / "steamcmd.zip.download"
+            progress(TaskProgress(5, "下载 SteamCMD", "正在从 Steam 官方地址下载", True))
+            try:
+                request = urllib.request.Request(self.DOWNLOAD_URL, headers={"User-Agent": "PalworldConsole/0.3"})
+                with urllib.request.urlopen(request, timeout=60) as response, archive.open("wb") as output:
+                    total = int(response.headers.get("Content-Length") or 0); received = 0
+                    while True:
+                        block = response.read(1024 * 256)
+                        if not block: break
+                        output.write(block); received += len(block)
+                        if total: progress(TaskProgress(5 + round(received / total * 8), "下载 SteamCMD", f"已下载 {received / 1024 / 1024:.1f} MB"))
+                with zipfile.ZipFile(archive) as bundle:
+                    root_resolved = root.resolve()
+                    for entry in bundle.infolist():
+                        target = (root / entry.filename).resolve()
+                        if root_resolved not in target.parents and target != root_resolved:
+                            raise RuntimeError("SteamCMD ZIP 包含不安全路径")
+                    bundle.extractall(root)
+                downloaded = True; log(f"SteamCMD 已下载到 {root}")
+            except Exception:
+                executable.unlink(missing_ok=True)
+                raise
+            finally:
+                archive.unlink(missing_ok=True)
+        progress(TaskProgress(14, "初始化 SteamCMD", "正在执行 SteamCMD 自更新", True))
+        process = subprocess.run([str(executable), "+quit"], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+        for line in (process.stdout + "\n" + process.stderr).splitlines():
+            if line.strip(): log(line.strip())
+        if process.returncode != 0 or not executable.is_file():
+            raise RuntimeError(f"SteamCMD 初始化失败，退出码 {process.returncode}")
+        progress(TaskProgress(18, "初始化 SteamCMD", "SteamCMD 已就绪"))
+        return LocalSteamCmdState(str(root), str(executable), True, downloaded, repaired, "SteamCMD 自动管理")
 
 
 class RemoteHostClient:
