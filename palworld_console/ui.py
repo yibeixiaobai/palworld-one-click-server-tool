@@ -14,7 +14,7 @@ from .config_ini import coerce_setting_value
 from .config_cache import ConfigCacheRepository
 from .localization import GameLocalizationService
 from .models import ConfigSyncResult, GuildSummary, PlayerRecord, ServerHealthSnapshot, ServerInstance, TaskProgress, UninstallResult, ScheduleDefinition
-from .services import BackupService, FirewallService, GuildSnapshotService, LocalServerLifecycle, LocalSteamCmdManager, NetworkDiagnostics, PalworldRestClient, PlayerAdminService, RemoteHostClient, RemoteServerInspector, RemoteServerLifecycle, ServerConfigBootstrap, ServerDiagnostics, SSHTunnelManager, SteamCmdInstaller, WindowsShortcutService
+from .services import BackupService, FirewallService, GuildSnapshotService, LocalServerLifecycle, LocalSteamCmdManager, NetworkDiagnostics, PalworldRestClient, PlayerAdminService, RemoteHostClient, RemoteServerInspector, RemoteServerLifecycle, WindowsRemoteServerLifecycle, ServerConfigBootstrap, ServerDiagnostics, SSHTunnelManager, SteamCmdInstaller, WindowsShortcutService
 from .management import AuditService, AutomationService, HostTaskDeployer, RconClient, SaveGameService, WhitelistService
 from .player_store import PlayerIdentityGroup, PlayerIdentityService, PlayerRepository
 from .player_edit import PlayerEditSession
@@ -31,6 +31,15 @@ class WorkerSignals(QObject):
     error = Signal(str)
     progress = Signal(object)
     log = Signal(str)
+
+
+def _remote_lifecycle_for(instance, client, on_log=None, on_progress=None):
+    platform_name = str(instance.remote_profile.get("platform") or "linux").lower()
+    if platform_name == "windows":
+        return WindowsRemoteServerLifecycle(instance, client, on_log, on_progress)
+    if platform_name == "unknown":
+        raise RuntimeError("远程操作系统尚未识别，只能重新检测或导出诊断")
+    return RemoteServerLifecycle(instance, client, on_log, on_progress)
 
 
 class UiSignals(QObject):
@@ -463,7 +472,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _repair_and_collect(signals, selected, client, password, username):
-        RemoteServerLifecycle(selected, client, signals.log.emit).repair_runtime()
+        _remote_lifecycle_for(selected, client, signals.log.emit).repair_runtime()
         return MainWindow._collect_remote_health(selected, client, password, username)
 
     def run_async(self, fn, done=lambda _result: None):
@@ -485,7 +494,7 @@ class MainWindow(QMainWindow):
     def _run_start_and_sync(signals, selected, client):
         lifecycle = None
         if selected.kind == "remote":
-            remote_lifecycle = RemoteServerLifecycle(selected, client, signals.log.emit); remote_lifecycle.start(); remote_lifecycle.wait_for_game_listener()
+            remote_lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit); remote_lifecycle.start(); remote_lifecycle.wait_for_game_listener()
         else:
             lifecycle = LocalServerLifecycle(selected, signals.log.emit)
             lifecycle.start()
@@ -547,12 +556,26 @@ class MainWindow(QMainWindow):
             return QMessageBox.information(self, "任务进行中", "当前安装或更新任务尚未结束。")
         if self.selected and self.selected.kind == "remote":
             if self.selected.discovery_status != "ready": return QMessageBox.information(self, "需要检测", "请先连接并检测 SSH。")
+            if self.selected.remote_profile.get("platform") == "unknown": return QMessageBox.warning(self, "未知系统", "无法识别远程操作系统，已禁止部署。请重新检测或导出诊断。")
+            prerequisites = self.selected.remote_profile.get("prerequisites") or {}
+            missing = list(prerequisites.get("missing") or [])
+            if missing:
+                actions = list(prerequisites.get("repair_actions") or [])
+                volume_text = "\n".join(f"{item.get('root')}: {int(item.get('free_bytes') or 0) // 1024 // 1024} MB 可用" for item in self.selected.remote_profile.get("volumes") or [])
+                detail = f"检测到缺少：{', '.join(missing)}\n\n准备执行：\n" + "\n".join(f"- {item}" for item in actions)
+                if volume_text: detail += f"\n\n可用磁盘：\n{volume_text}"
+                if "管理员权限" in missing:
+                    return QMessageBox.warning(self, "需要管理员 SSH 会话", detail + "\n\nWinSW 服务和防火墙配置需要管理员权限。请使用管理员账户重新连接，程序不会尝试绕过权限。")
+                if "磁盘空间" in missing:
+                    return QMessageBox.warning(self, "磁盘空间不足", detail + "\n\n请选择有足够空间的固定磁盘，或先清理本应用创建的缓存、失败事务和过期已验证备份。")
+                if QMessageBox.question(self, "确认自动准备依赖", detail + "\n\n继续后将按上述清单自动准备，且不会重启操作系统。", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes: return
             try: admin_password = self._ensure_admin_password()
             except Exception as exc: return QMessageBox.critical(self, "凭据错误", str(exc))
             self._begin_install_task("正在安装…" if not self.selected.remote_profile.get("installed") else "正在更新…")
             selected = self.selected
             client = self._remote_client()
-            worker = Worker(lambda signals: self._run_remote_install(signals, selected, client, admin_password), with_signals=True)
+            backup_root = self._backup_destination(selected)
+            worker = Worker(lambda signals: self._run_remote_install(signals, selected, client, admin_password, backup_root), with_signals=True)
             self._connect_install_worker(worker, self._remote_install_done)
             self.pool.start(worker)
             return
@@ -612,10 +635,10 @@ class MainWindow(QMainWindow):
                 signals.log.emit("卸载前已请求保存世界")
             except Exception as exc:
                 signals.log.emit(f"保存世界请求失败，将通过停止服务保证备份一致性：{exc}")
-        lifecycle = RemoteServerLifecycle(selected, client, signals.log.emit, signals.progress.emit)
+        lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit, signals.progress.emit)
         result = lifecycle.uninstall(backup_dir)
         signals.progress.emit(TaskProgress(97, "重新检测", "正在确认远程服务端已移除", True))
-        profile = RemoteServerInspector(client, signals.log.emit, result.install_dir).discover()
+        profile = RemoteServerInspector(client, signals.log.emit, result.install_dir, selected.id).discover()
         if profile.get("installed"):
             raise RuntimeError("卸载命令已执行，但重新检测仍发现 Palworld 服务端")
         return result, profile
@@ -625,21 +648,30 @@ class MainWindow(QMainWindow):
         return root / "backups" / instance.id
 
     @staticmethod
-    def _run_remote_install(signals, selected, client, admin_password):
-        lifecycle = RemoteServerLifecycle(selected, client, signals.log.emit, signals.progress.emit)
+    def _run_remote_install(signals, selected, client, admin_password, backup_root=None):
+        lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit, signals.progress.emit)
         if selected.remote_profile.get("installed"):
+            was_running = lifecycle.status() in {"active", "running"}
+            if was_running: lifecycle.stop()
+            try:
+                signals.progress.emit(TaskProgress(12, "更新前备份", "正在下载并校验配置与存档备份", True))
+                if backup_root is not None: BackupService().create_remote(client, selected, Path(backup_root), selected.install_dir)
+            except Exception:
+                if was_running: lifecycle.start()
+                raise
             lifecycle.update(restart=False)
         else:
             lifecycle.install()
         signals.progress.emit(TaskProgress(87, "生成服务器配置", "正在创建或读取 PalWorldSettings.ini", True))
         config = ServerConfigBootstrap.ensure_remote(client, selected, admin_password)
         lifecycle.configure_service()
+        if hasattr(lifecycle, "allow_game_firewall"): lifecycle.allow_game_firewall()
         signals.progress.emit(TaskProgress(95, "启动服务器", "正在启动 Palworld 服务", True))
         lifecycle.start()
         lifecycle.wait_for_game_listener()
         signals.progress.emit(TaskProgress(97, "重新检测", "正在确认服务端安装状态", True))
         try:
-            profile = RemoteServerInspector(client, signals.log.emit, selected.install_dir).discover()
+            profile = RemoteServerInspector(client, signals.log.emit, selected.install_dir, selected.id).discover()
             return profile, config
         except Exception as exc:
             raise RuntimeError(f"服务端安装/更新已执行，但状态复检失败：{exc}") from exc
@@ -832,8 +864,8 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _run_remote_backup(signals, selected, client, destination, admin_password, rest_user):
-        lifecycle = RemoteServerLifecycle(selected, client, signals.log.emit)
-        was_running = lifecycle.status() == "active"
+        lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit)
+        was_running = lifecycle.status() in {"active", "running"}
         tunnel = SSHTunnelManager(client)
         try:
             try:
@@ -2096,14 +2128,14 @@ class MainWindow(QMainWindow):
         phrase = self.storage.get_secret(self.selected.ssh_key_passphrase_ref)
         return RemoteHostClient(self.selected.host, self.selected.remote_username, password, self.selected.ssh_port, self.selected.ssh_key_path if self.selected.ssh_auth_type == "key" else "", phrase)
 
-    def _remote_lifecycle(self): return RemoteServerLifecycle(self.selected, self._remote_client(), self.ui_signals.log.emit)
+    def _remote_lifecycle(self): return _remote_lifecycle_for(self.selected, self._remote_client(), self.ui_signals.log.emit)
 
     def discover_remote(self):
         self.save_instance()
         if not self.selected or self.selected.kind != "remote": return
         client = self._remote_client()
         selected = self.selected
-        worker = Worker(lambda signals: RemoteServerInspector(client, signals.log.emit, selected.install_dir).discover(), with_signals=True)
+        worker = Worker(lambda signals: RemoteServerInspector(client, signals.log.emit, selected.install_dir, selected.id).discover(), with_signals=True)
         worker.signals.log.connect(self.append_log)
         worker.signals.finished.connect(self._discovery_done)
         worker.signals.error.connect(self._discovery_failed)
@@ -2121,10 +2153,10 @@ class MainWindow(QMainWindow):
             self.pool.start(worker)
 
     def _apply_discovery_profile(self, profile):
-        self.selected.remote_profile = profile; self.selected.discovery_status = "ready"
+        self.selected.remote_profile = profile; self.selected.discovery_status = "ready" if profile.get("platform") in {"linux", "windows"} else "unknown"
         from datetime import datetime
         self.selected.discovered_at = datetime.now().isoformat(timespec="seconds")
-        self.selected.install_dir = str(profile.get("install_dir", self.selected.install_dir)); self.selected.game_port = int(profile.get("game_port", self.selected.game_port)); self.selected.rest_url = str(profile.get("rest_url", self.selected.rest_url)); self.lifecycle = self._remote_lifecycle(); self.storage.save_instances(self.instances); self.path_edit.setText(self.selected.install_dir); self.port_spin.setValue(self.selected.game_port); self.rest_edit.setText(self.selected.rest_url); self._show_discovery(); self._toggle_remote_fields()
+        self.selected.install_dir = str(profile.get("install_dir", self.selected.install_dir)); self.selected.game_port = int(profile.get("game_port", self.selected.game_port)); self.selected.rest_url = str(profile.get("rest_url", self.selected.rest_url)); self.lifecycle = self._remote_lifecycle() if self.selected.discovery_status == "ready" else None; self.storage.save_instances(self.instances); self.path_edit.setText(self.selected.install_dir); self.port_spin.setValue(self.selected.game_port); self.rest_edit.setText(self.selected.rest_url); self._show_discovery(); self._toggle_remote_fields()
 
     def _discovery_failed(self, error):
         self.selected.discovery_status = "failed"; self.storage.save_instances(self.instances); self._show_discovery(error); QMessageBox.critical(self, "SSH 检测失败", error)
@@ -2134,8 +2166,15 @@ class MainWindow(QMainWindow):
         if error: self.discovery_result.setPlainText(f"检测失败\n{error}"); return
         profile = self.selected.remote_profile
         if not profile: self.discovery_result.setPlainText("尚未检测。请保存 SSH 信息后点击“连接并检测 SSH”。"); return
-        steamcmd = profile.get("steamcmd_path") or ("未安装，部署时将自动安装" if profile.get("steamcmd_installable") else "未安装，缺少下载或解压条件")
-        fields = (("系统", profile.get("os")), ("架构", profile.get("architecture")), ("磁盘", profile.get("disk")), ("sudo", "可用" if profile.get("sudo") else "不可免交互使用"), ("SteamCMD", steamcmd), ("SteamCMD 来源", profile.get("steamcmd_source") or "未知"), ("服务端", profile.get("install_dir") or "未部署"), ("systemd", f"{profile.get('service_name') or '未找到'} / {profile.get('service_state')}"), ("配置", profile.get("config_path") or "未找到"), ("REST", profile.get("rest_url") or "未启用"))
+        platform_name = str(profile.get("platform") or "linux")
+        if platform_name == "unknown":
+            self.discovery_result.setPlainText(f"系统: 未知\n部署能力: 已禁用\n诊断: {profile.get('detection_error') or 'Windows 与 Linux 探针均未成功'}\n\n若目标是 Windows Server 且 SSH 尚未启用，请先通过 RDP 或云厂商控制台以管理员 PowerShell 安装并启动 OpenSSH Server。")
+            return
+        steamcmd = profile.get("steamcmd_path") or ("未安装，部署时将自动安装" if profile.get("steamcmd_installable") else "未安装，等待修复依赖")
+        if platform_name == "windows":
+            fields = (("平台", "Windows Server / OpenSSH"), ("系统", profile.get("os")), ("版本", profile.get("version")), ("架构", profile.get("architecture")), ("PowerShell", profile.get("powershell_version")), ("管理员权限", "可用" if profile.get("elevated") else "缺失，安装前需修复"), ("固定磁盘", profile.get("disk")), ("SteamCMD", steamcmd), ("WinSW", profile.get("winsw_path") or "未安装，部署时将自动安装并校验"), ("服务端", profile.get("install_dir") or "未部署"), ("Windows 服务", f"{profile.get('service_name') or '未找到'} / {profile.get('service_state')}"), ("配置", profile.get("config_path") or "未找到"), ("网络", f"游戏 UDP {profile.get('game_port', 8211)}；REST {profile.get('rest_port', 8212)} 仅 SSH 隧道"))
+        else:
+            fields = (("平台", "Linux / SSH"), ("系统", profile.get("os")), ("架构", profile.get("architecture")), ("磁盘", profile.get("disk")), ("sudo", "可用" if profile.get("sudo") else "不可免交互使用"), ("SteamCMD", steamcmd), ("SteamCMD 来源", profile.get("steamcmd_source") or "未知"), ("服务端", profile.get("install_dir") or "未部署"), ("systemd", f"{profile.get('service_name') or '未找到'} / {profile.get('service_state')}"), ("配置", profile.get("config_path") or "未找到"), ("REST", "仅通过 SSH 隧道访问" if profile.get("rest_enabled") else "未启用"))
         self.discovery_result.setPlainText("\n".join(f"{key}: {value}" for key, value in fields))
     def _rest_client(self):
         if not self.selected: raise RuntimeError("未选择服务器实例")

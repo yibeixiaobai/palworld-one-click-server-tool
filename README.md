@@ -1,10 +1,10 @@
 # Palworld One-Click Server Tool
 
-> 幻兽帕鲁一键开服工具：用一个 Windows 桌面控制台完成本机开服、远程 Linux 部署、配置、玩家管理、模组、备份与日常运维。
+> 幻兽帕鲁一键开服工具：用一个 Windows 桌面控制台完成本机开服、远程 Linux/Windows Server 部署、配置、玩家管理、模组、备份与日常运维。
 
 作者：江小白 Cresent
 
-基于 Python 与 PySide6，支持管理本机 Windows Dedicated Server，也支持通过 SSH 管理远程 Linux `systemd` 实例。远程 REST 与 RCON 默认通过 SSH 隧道访问，管理端口无需直接暴露到公网。
+基于 Python 与 PySide6，支持管理本机 Windows Dedicated Server，也支持通过 SSH 自动识别和管理远程 Linux `systemd` 或 Windows Server `WinSW` 实例。远程 REST 与 RCON 默认通过 SSH 隧道访问，管理端口无需直接暴露到公网。
 
 ## 界面预览
 
@@ -16,7 +16,7 @@
 
 ### 连接与部署
 
-同一个实例表单同时覆盖本机与远程服务器。本机只需指定安装目录；远程实例填写 SSH 信息后，工具会自动探测 SteamCMD、PalServer、`systemd`、配置、存档和日志路径。
+同一个实例表单同时覆盖本机与远程服务器。本机只需指定安装目录；远程实例填写 SSH 信息后，工具会自动识别操作系统，并探测磁盘、权限、SteamCMD、PalServer、服务、配置、存档和日志路径。
 
 ![连接与部署](docs/screenshots/connection.jpg)
 
@@ -32,7 +32,7 @@
 flowchart LR
     A[创建服务器实例] --> B{部署位置}
     B -->|本机 Windows| C[选择服务端目录]
-    B -->|远程 Linux| D[填写 SSH 并自动探测]
+    B -->|远程 Linux 或 Windows Server| D[填写 SSH 并自动探测]
     C --> E[安装或更新 SteamCMD 与服务端]
     D --> E
     E --> F[读取并调整游戏配置]
@@ -54,7 +54,7 @@ flowchart LR
 | 工作区 | 主要能力 | 设计重点 |
 | --- | --- | --- |
 | 仪表盘 | 安装、更新、启停、重启、卸载、健康检查、端口诊断 | 高频操作集中展示，长任务提供阶段与进度反馈 |
-| 连接与部署 | 本机目录、SSH、SteamCMD、systemd、路径自动探测 | 同一套实例模型管理本机与远程环境 |
+| 连接与部署 | 本机目录、SSH、SteamCMD、systemd/WinSW、路径自动探测 | 同一套实例模型管理本机与远程环境 |
 | 游戏配置 | 60 余项中文配置、搜索、预设、离线草稿、持久缓存 | 密码不写 JSON，推送前检测服务器外部修改 |
 | 玩家中心 | 永久档案、中文帕鲁/物品名、角色 UID、属性、背包、公会 | 中文名只用于显示，稳定内部 ID 保持不变 |
 | 公会与基地 | 在线快照、成员关系、基地与帕鲁统计 | 高风险关系修改必须停服并经过完整校验 |
@@ -66,7 +66,8 @@ flowchart LR
 ## 核心能力
 
 - 自动下载、校验和初始化 SteamCMD，并安装或更新 Palworld Dedicated Server。
-- 远程 SSH 自动识别系统、架构、磁盘、SteamCMD、服务端、`systemd`、配置、存档与日志。
+- 远程 SSH 自动识别 Linux、Windows Server 或未知系统；Windows 命令统一使用编码 PowerShell，Linux 使用 Bash。
+- Windows Server 自动维护实例目录内的 SteamCMD 与校验后的 WinSW 2.12.0，并使用低权限服务账户运行 PalServer。
 - SQLite 永久玩家档案通过 UID 与平台账号安全聚合，REST 与存档重复记录只显示一次。
 - 中文存档字段注册表展示字段含义、来源、有效范围、可写状态、只读原因和风险等级。
 - 中文资源采用用户覆盖、游戏/导入资源、内置词典和内部 ID 回退四级解析，可导入 `pal.json`、`items.json` 等版本化目录。
@@ -104,7 +105,9 @@ python run.py
 ## 远程部署说明
 
 - 支持密码或私钥 SSH 认证，凭据保存到 Windows Credential Manager。
-- 自动检测现有服务端；没有安装时可通过 SteamCMD 部署，并由 `systemd` 托管。
+- 自动检测现有服务端；Linux 由 `systemd` 托管，Windows Server 由固定版本 WinSW 托管。
+- Windows Server 需要预先启用 OpenSSH Server 和 PowerShell 5.1+；SSH 无法连接时，需要先通过 RDP 或云厂商控制台执行一次性 OpenSSH 初始化。
+- Windows 自动选择空间最大的可写固定磁盘，并拒绝磁盘根目录、系统目录、UNC 路径和重解析点逃逸。
 - REST 与 RCON 默认绑定到 SSH 隧道，不要求开放公网管理端口。
 - 游戏 UDP 端口仍需在云安全组、主机防火墙和必要的路由器端口映射中放行。
 

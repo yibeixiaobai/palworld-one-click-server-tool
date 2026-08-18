@@ -28,6 +28,42 @@ class LocalSteamCmdState:
 
 
 @dataclass(frozen=True)
+class RemoteVolume:
+    root: str
+    total_bytes: int = 0
+    free_bytes: int = 0
+    writable: bool = False
+    recommended: bool = False
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class PrerequisiteStatus:
+    steamcmd: bool = False
+    powershell: bool = False
+    systemd: bool = False
+    winsw: bool = False
+    elevated: bool = False
+    download_tool: bool = False
+    archive_tool: bool = False
+    missing: tuple[str, ...] = ()
+    repair_actions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RemotePlatformProfile:
+    platform: str = "unknown"
+    version: str = ""
+    architecture: str = ""
+    shell: str = "unknown"
+    path_style: str = "unknown"
+    service_manager: str = "unknown"
+    home_dir: str = ""
+    volumes: tuple[RemoteVolume, ...] = ()
+    prerequisites: PrerequisiteStatus = field(default_factory=PrerequisiteStatus)
+
+
+@dataclass(frozen=True)
 class PlayerRoleIdentity:
     instance_id: str
     player_uid: str
@@ -293,4 +329,8 @@ class ServerInstance:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ServerInstance":
         valid = {f.name for f in cls.__dataclass_fields__.values()}
-        return cls(**{k: v for k, v in data.items() if k in valid})
+        values = {k: v for k, v in data.items() if k in valid}
+        profile = values.get("remote_profile")
+        if values.get("kind") == "remote" and isinstance(profile, dict) and profile and "platform" not in profile:
+            values["remote_profile"] = {**profile, "platform": "linux", "platform_inferred": True}
+        return cls(**values)
