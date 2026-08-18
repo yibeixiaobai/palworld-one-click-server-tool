@@ -74,3 +74,49 @@ def test_local_save_transaction_rolls_back_when_health_fails(tmp_path: Path):
         SaveTransaction(FakeService()).execute_local(save, tmp_path / "backups", mutate, [], lambda: events.append("stop"), lambda: events.append("start"), lambda: False)
     assert save.read_bytes() == b"original"
     assert events == ["stop", "start", "start"]
+
+
+def test_remote_save_transaction_verifies_uploaded_file_and_rolls_back(tmp_path: Path):
+    class FakeService(SaveGameService):
+        def load(self, path): return {"data": path.read_bytes()}
+        @staticmethod
+        def _write_document(document, path): path.write_bytes(document["data"])
+        def validate(self, path):
+            from palworld_console.models import SaveValidationResult
+            return SaveValidationResult(True)
+
+    class Client:
+        remote = b"original"
+        def download_file(self, _remote, local): Path(local).write_bytes(self.remote)
+        def upload_file_atomic(self, local, _remote, backup=False):
+            data = Path(local).read_bytes()
+            self.remote = b"corrupt" if backup else data
+            return ""
+
+    client = Client(); events = []
+    with pytest.raises(RuntimeError, match="服务器写入后验证失败，已恢复原存档"):
+        SaveTransaction(FakeService()).execute_remote(client, "/Level.sav", tmp_path, lambda document: document.update(data=b"changed"), lambda: events.append("stop"), lambda: events.append("start"), lambda: True)
+    assert client.remote == b"original"
+    assert events == ["stop", "start"]
+
+
+def test_remote_candidate_failure_does_not_claim_server_was_replaced(tmp_path: Path):
+    class FakeService(SaveGameService):
+        def load(self, path): return {"data": path.read_bytes()}
+        @staticmethod
+        def _write_document(document, path): path.write_bytes(document["data"])
+        def validate(self, path):
+            from palworld_console.models import SaveValidationResult
+            return SaveValidationResult(False, ("bad candidate",))
+
+    class Client:
+        remote = b"original"; uploads = 0
+        def download_file(self, _remote, local): Path(local).write_bytes(self.remote)
+        def upload_file_atomic(self, _local, _remote, backup=False): self.uploads += 1
+
+    client = Client(); events = []
+    with pytest.raises(RuntimeError, match="候选存档验证失败，服务器原存档未被替换"):
+        SaveTransaction(FakeService()).execute_remote(client, "/Level.sav", tmp_path, lambda document: document.update(data=b"changed"), lambda: events.append("stop"), lambda: events.append("start"), lambda: True)
+    assert client.uploads == 0
+    assert client.remote == b"original"
+    assert events == ["stop", "start"]

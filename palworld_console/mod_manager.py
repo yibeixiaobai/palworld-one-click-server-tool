@@ -694,8 +694,9 @@ class ModManager:
         self.validate_enable(manifest, installed)
         plan = self.build_install_plan(manifest, environment)
         if plan.read_only: raise RuntimeError(plan.reason or "UE4SS 安装计划不可执行")
-        root = Path(environment.ue4ss_root); backup = self.cache_dir / "transactions" / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / "UE4SS"
-        backup.parent.mkdir(parents=True, exist_ok=True); existed = root.exists()
+        root = Path(environment.ue4ss_root); transaction = self.cache_dir / "transactions" / datetime.now().strftime("%Y%m%d-%H%M%S-%f"); backup = transaction / "UE4SS"
+        transaction.mkdir(parents=True, exist_ok=True); existed = root.exists()
+        (transaction / "transaction.json").write_text(json.dumps({"action": "install", "package": manifest.package_name, "target": str(Path(plan.target)), "states": {mod.package_name: mod.enabled for mod in installed}, "ue4ss": True, "ue4ss_existed": existed}, ensure_ascii=False, indent=2), encoding="utf-8")
         stop()
         try:
             if existed: shutil.copytree(root, backup)
@@ -888,6 +889,19 @@ class ModManager:
         candidates = sorted((path for path in root.glob("*") if (path / "transaction.json").is_file() and not (path / "rolled-back").exists()), reverse=True) if root.exists() else []
         if not candidates: raise FileNotFoundError("没有可回滚的本机模组事务")
         transaction = candidates[0]; metadata = json.loads((transaction / "transaction.json").read_text(encoding="utf-8"))
+        if metadata.get("ue4ss"):
+            ue4ss_root = Path(environment.ue4ss_root); backup_ue4ss = transaction / "UE4SS"
+            stop()
+            try:
+                if ue4ss_root.exists(): shutil.rmtree(ue4ss_root)
+                if metadata.get("ue4ss_existed") and backup_ue4ss.exists(): shutil.copytree(backup_ue4ss, ue4ss_root)
+                start()
+                if not health(): raise RuntimeError("回滚后服务器健康检查失败")
+                (transaction / "rolled-back").write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+                return {str(key): bool(value) for key, value in dict(metadata.get("states") or {}).items()}
+            except Exception:
+                try: start()
+                finally: raise
         mods_dir = Path(environment.mods_dir); settings = Path(environment.settings_path); mods_root = settings.parent; paks = Path(environment.palserver_exe).parent / "Pal" / "Content" / "Paks"; backup_mods = transaction / "Mods"; backup_target = transaction / "mod"; backup_paks = transaction / "Paks"; existed = dict(metadata.get("existed") or {})
         stop()
         try:

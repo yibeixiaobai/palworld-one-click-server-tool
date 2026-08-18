@@ -28,6 +28,13 @@ def test_player_records_tolerate_official_and_legacy_field_names():
     assert players[0].guild_id == "guild-1"
 
 
+def test_player_records_normalize_uid_casing_and_underscores():
+    players = PalworldRestClient.player_records({"players": [{"playeruid": "1050661243", "user_id": "steam_765", "account_name": "Alice"}]})
+    assert players[0].player_uid == "1050661243"
+    assert players[0].user_id == "steam_765"
+    assert players[0].account_name == "Alice"
+
+
 def test_game_data_is_aggregated_into_read_only_guild_summaries():
     players = PalworldRestClient.player_records({"players": [
         {"name": "A", "userId": "1", "level": 20, "guildId": "g1"},

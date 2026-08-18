@@ -267,6 +267,46 @@ def test_player_center_renders_one_row_for_shared_platform_identity(window):
     assert set(identity["aliases"]) == {"100", "200"}
 
 
+def test_player_center_uses_list_then_detail_pages_and_preserves_draft(window):
+    instance_id = "ui-player-detail"
+    window.selected.id = instance_id
+    payload = {
+        "players": [{
+            "player_uid": "200", "nickname": "Alice", "level": 20, "exp": 3000,
+            "inventory_status": "complete",
+            "inventory_containers": [{"key": key, "count": 1 if key == "CommonContainerId" else 0, "data_status": "complete"} for key in ui_module.CONTAINER_LABELS],
+            "pals": [{"individual_id": "pal-1", "type": "SheepBall", "nickname": "棉花", "level": 10, "exp": 500, "gender": "Female", "is_lucky": True, "rank": 2, "melee": 30, "ranged": 40, "defense": 50, "workspeed": 80, "rank_attack": 1, "rank_defence": 2, "rank_craftspeed": 3, "active_skills": ["FireBall"], "passive_skills": ["Lucky"], "data_status": "complete", "stable_id_valid": True}],
+            "items": {"CommonContainerId": [{"ContainerId": "bag-1", "SlotIndex": 0, "ItemId": "wood", "StackCount": 12, "data_status": "complete"}]},
+        }],
+        "guilds": [{"guild_id": "guild-1", "name": "Builders", "admin_player_uid": "200", "base_camp_level": 8, "players": [{"player_uid": "200", "nickname": "Alice"}, {"player_uid": "201", "nickname": "Bob"}], "data_status": "complete"}],
+        "bases": [{"base_id": "base-1", "name": "主基地", "guild_id": "guild-1", "position": {"x": 1, "y": 2, "z": 3}, "worker_container_id": "workers-1", "worker_pal_ids": ["pal-1"], "worker_pals": [{"individual_id": "pal-1", "type": "SheepBall"}], "container_ids": ["items-1"], "data_status": "complete"}],
+    }
+    window.player_repository.upsert_save_snapshot(instance_id, payload)
+    window.current_players = window.player_repository.list_players(instance_id)
+    window.current_player_groups = window.player_repository.list_identity_groups(instance_id)
+    window.player_center.complete_sync(instance_id, payload["players"], [], "Level.sav", True)
+    window._render_players()
+    assert window.player_view_stack.currentWidget() is window.player_list_page
+    assert window.players_table.rowCount() == 1
+
+    window._show_player_detail(0, 0)
+    assert window.player_view_stack.currentWidget() is window.player_detail_page
+    assert window.active_player_uid == "200"
+    assert window.player_pals_table.rowCount() == 1
+    assert window.player_inventory_table.rowCount() == 1
+    assert window.player_guild_members_table.rowCount() == 2
+    assert window.player_bases_table.rowCount() == 1
+    assert window.player_detail_tabs.tabText(window.player_pals_tab_index) == "帕鲁 1"
+    assert "普通背包 1" in window.inventory_status_label.text()
+
+    session = window._active_edit_session()
+    session.stage("players[0].level", 20, 21, "玩家等级", "player", "200", "中")
+    window._return_to_player_list()
+    assert window.player_view_stack.currentWidget() is window.player_list_page
+    assert window.player_center.pending_count(instance_id, "200") == 1
+    assert window.players_table.item(0, 6).text() == "1 项"
+
+
 def test_config_preset_updates_fields_without_saving(window):
     window.preset_combo.setCurrentText("高倍率")
     window.apply_config_preset()

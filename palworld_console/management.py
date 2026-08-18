@@ -227,6 +227,17 @@ class SaveGameService:
         return result
 
     @staticmethod
+    def get_path(root: Any, path: str) -> Any:
+        parts = re.findall(r"(?:^|\.)([^.\[]+)|\[(\d+)\]", path)
+        tokens: list[str | int] = [int(index) if index else key for key, index in parts]
+        if not tokens:
+            raise ValueError("存档字段路径为空")
+        current = root
+        for token in tokens:
+            current = current[token]
+        return current
+
+    @staticmethod
     def set_path(root: Any, path: str, value: Any) -> None:
         parts = re.findall(r"(?:^|\.)([^.\[]+)|\[(\d+)\]", path)
         tokens: list[str | int] = [int(index) if index else key for key, index in parts]
@@ -258,18 +269,19 @@ class SaveGameService:
         return ParsedSave(GvasFile.read(gvas_data, PALWORLD_TYPE_HINTS, PALWORLD_CUSTOM_PROPERTIES), save_type)
 
     @staticmethod
-    def _write_document(document, path: Path) -> None:
+    def _write_document(document, path: Path) -> dict[str, Any] | None:
         if isinstance(document, PluginParsedSave):
             patch = document.patch_manifest()
             if not any(patch.get(section) for section in ("players", "pals", "inventory", "guilds", "bases")):
                 raise ValueError("没有可写回的受支持存档字段")
             document.plugin.apply_patch(document.source_path, patch, path)
             document.plugin.verify_roundtrip(path, patch)
-            return
+            return patch
         from palworld_save_tools.palsav import compress_gvas_to_sav
         from palworld_save_tools.paltypes import PALWORLD_CUSTOM_PROPERTIES
         gvas_data = document.gvas.write(PALWORLD_CUSTOM_PROPERTIES)
         path.write_bytes(compress_gvas_to_sav(gvas_data, document.save_type))
+        return None
 
     def validate(self, path: Path) -> SaveValidationResult:
         try:
@@ -293,6 +305,7 @@ class SaveTransaction:
         start: Callable[[], None],
         health: Callable[[], bool],
         full_backup: Callable[[], Any] | None = None,
+        expected_source_hash: str = "",
     ) -> Path:
         if not save_path.is_file():
             raise FileNotFoundError(f"找不到存档: {save_path}")
@@ -308,6 +321,10 @@ class SaveTransaction:
             full_backup()
         shutil.copy2(save_path, backup)
         original_hash = self.service.sha256(backup)
+        if expected_source_hash and original_hash != expected_source_hash:
+            start()
+            raise RuntimeError("服务器存档已在同步后发生变化，请重新同步玩家数据后再保存")
+        deployed = False
         try:
             with tempfile.TemporaryDirectory(prefix="palworld-save-") as temp:
                 candidate = Path(temp) / "Level.sav"
@@ -318,20 +335,24 @@ class SaveTransaction:
                 if not validation.valid:
                     raise RuntimeError("存档二次解析失败: " + "; ".join(validation.errors))
                 os.replace(candidate, save_path)
+                deployed = True
             start()
             if not health():
                 raise RuntimeError("写回后服务器健康检查失败")
             return backup
-        except Exception:
-            if save_path.exists():
-                shutil.copy2(save_path, failed)
-            shutil.copy2(backup, save_path)
-            if self.service.sha256(save_path) != original_hash:
-                raise RuntimeError("存档恢复校验失败，服务器保持停止状态")
-            try:
+        except Exception as exc:
+            if not deployed:
                 start()
-            finally:
-                raise
+                raise RuntimeError(f"候选存档验证失败，服务器原存档未被替换：{exc}") from exc
+            try:
+                if save_path.exists(): shutil.copy2(save_path, failed)
+                shutil.copy2(backup, save_path)
+                if self.service.sha256(save_path) != original_hash:
+                    raise RuntimeError("恢复后的 SHA-256 不匹配")
+                start()
+            except Exception as rollback_exc:
+                raise RuntimeError(f"回滚失败，服务器已保持停止：{rollback_exc}；原错误：{exc}") from exc
+            raise RuntimeError(f"服务器写入后验证失败，已恢复原存档：{exc}") from exc
 
     def execute_remote(
         self,
@@ -343,11 +364,14 @@ class SaveTransaction:
         start: Callable[[], None],
         health: Callable[[], bool],
         full_backup: Callable[[], Any] | None = None,
+        expected_source_hash: str = "",
     ) -> Path:
         local_backup_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         original = local_backup_dir / f"Level.sav.{stamp}.bak"
         candidate = local_backup_dir / f"Level.sav.{stamp}.candidate"
+        readback = local_backup_dir / f"Level.sav.{stamp}.readback"
+        rollback_check = local_backup_dir / f"Level.sav.{stamp}.rollback-check"
         stop()
         if full_backup:
             full_backup()
@@ -356,28 +380,45 @@ class SaveTransaction:
             start()
             raise RuntimeError("本机备份目录空间不足，至少需要存档体积的 3 倍")
         original_hash = self.service.sha256(original)
-        remote_backup = ""
+        if expected_source_hash and original_hash != expected_source_hash:
+            start()
+            raise RuntimeError("服务器存档已在同步后发生变化，请重新同步玩家数据后再保存")
+        deployed = False
         try:
             document = self.service.load(original)
             mutate(document)
-            self.service._write_document(document, candidate)
+            expected_patch = self.service._write_document(document, candidate)
             validation = self.service.validate(candidate)
             if not validation.valid:
                 raise RuntimeError("存档二次解析失败: " + "; ".join(validation.errors))
-            remote_backup = client.upload_file_atomic(candidate, remote_save_path, backup=True)
+            client.upload_file_atomic(candidate, remote_save_path, backup=True)
+            deployed = True
+            client.download_file(remote_save_path, readback)
+            if self.service.sha256(readback) != self.service.sha256(candidate):
+                raise RuntimeError("服务器回读文件与候选存档 SHA-256 不一致")
+            if expected_patch and isinstance(document, PluginParsedSave):
+                document.plugin.verify_roundtrip(readback, expected_patch)
             start()
             if not health():
                 raise RuntimeError("写回后服务器健康检查失败")
             return original
-        except Exception:
+        except Exception as exc:
+            if not deployed:
+                try:
+                    start()
+                except Exception as start_exc:
+                    raise RuntimeError(f"候选存档验证失败且原服务无法恢复启动：{start_exc}；原错误：{exc}") from exc
+                raise RuntimeError(f"候选存档验证失败，服务器原存档未被替换：{exc}") from exc
             try:
                 client.upload_file_atomic(original, remote_save_path, backup=False)
-                code, output, error = client.run(f"sha256sum {shlex.quote(remote_save_path)} | awk '{{print $1}}'")
-                if code or output.strip() != original_hash:
-                    raise RuntimeError(error.strip() or "远程回滚后的 SHA-256 不匹配")
+                client.download_file(remote_save_path, rollback_check)
+                if self.service.sha256(rollback_check) != original_hash:
+                    raise RuntimeError("远程回滚后的 SHA-256 不匹配")
                 start()
-            finally:
-                candidate.unlink(missing_ok=True)
-            raise
+            except Exception as rollback_exc:
+                raise RuntimeError(f"回滚失败，服务器已保持停止：{rollback_exc}；原错误：{exc}") from exc
+            raise RuntimeError(f"服务器写入后验证失败，已恢复原存档：{exc}") from exc
         finally:
             candidate.unlink(missing_ok=True)
+            readback.unlink(missing_ok=True)
+            rollback_check.unlink(missing_ok=True)

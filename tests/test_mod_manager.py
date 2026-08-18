@@ -84,35 +84,28 @@ def test_url_import_uses_content_type_when_url_has_no_extension(tmp_path, monkey
 
 
 def test_local_install_rolls_back_when_health_check_fails(tmp_path):
-    root = tmp_path / "server"; mods = root / "Pal" / "Content" / "Mods"; mods.mkdir(parents=True)
-    (mods / "old.txt").write_text("old", encoding="utf-8")
-    settings = root / "Pal" / "Saved" / "Config" / "WindowsServer" / "PalModSettings.ini"; settings.parent.mkdir(parents=True); settings.write_text("old-settings", encoding="utf-8")
-    archive = tmp_path / "mod.zip"
-    with zipfile.ZipFile(archive, "w") as bundle:
-        bundle.writestr("Info.json", json.dumps({"PackageName": "Example", "InstallRules": ["DedicatedServer"]}))
-    manifest = LocalArchiveProvider().prepare(archive, tmp_path / "cache")
-    environment = ModEnvironment("Windows", "windows", mods_dir=str(mods), settings_path=str(settings), supported=True)
+    root = tmp_path / "server"; (root / "UE4SS" / "Mods").mkdir(parents=True); (root / "UE4SS" / "NativeMods").mkdir(); (root / "UE4SS" / "old.txt").write_text("old", encoding="utf-8"); (root / "PalServer.exe").write_bytes(b"exe")
+    source = tmp_path / "source"; source.mkdir(); (source / "main.lua").write_text("return {}", encoding="utf-8")
+    manifest = ModManifest("Example", mod_type="ue4ss", ue4ss_kind="script", archive_path=str(source), server_supported=True)
+    environment = ModManager.detect_local(root)
     starts = []
-    with pytest.raises(RuntimeError, match="健康检查失败"):
+    with pytest.raises(RuntimeError, match="UE4SS 模组部署后服务器健康检查失败"):
         ModManager(tmp_path / "cache").install_local(manifest, environment, [], lambda: None, lambda: starts.append(True), lambda: False)
-    assert (mods / "old.txt").read_text(encoding="utf-8") == "old"
-    assert settings.read_text(encoding="utf-8") == "old-settings"
+    assert (root / "UE4SS" / "old.txt").read_text(encoding="utf-8") == "old"
+    assert not (root / "UE4SS" / "Mods" / "Example").exists()
     assert starts
 
 
 def test_local_transaction_can_be_rolled_back(tmp_path):
-    root = tmp_path / "server"; mods = root / "Pal" / "Content" / "Mods"; mods.mkdir(parents=True)
-    (mods / "old.txt").write_text("old", encoding="utf-8")
-    settings = root / "Pal" / "Saved" / "Config" / "WindowsServer" / "PalModSettings.ini"; settings.parent.mkdir(parents=True); settings.write_text("old-settings", encoding="utf-8")
-    archive = tmp_path / "mod.zip"
-    with zipfile.ZipFile(archive, "w") as bundle:
-        bundle.writestr("Info.json", json.dumps({"PackageName": "Example", "InstallRules": ["DedicatedServer"]}))
-    manager = ModManager(tmp_path / "cache"); manifest = LocalArchiveProvider().prepare(archive, tmp_path / "cache")
-    environment = ModEnvironment("Windows", "windows", mods_dir=str(mods), settings_path=str(settings), supported=True)
+    root = tmp_path / "server"; (root / "UE4SS" / "Mods").mkdir(parents=True); (root / "UE4SS" / "NativeMods").mkdir(); (root / "UE4SS" / "old.txt").write_text("old", encoding="utf-8"); (root / "PalServer.exe").write_bytes(b"exe")
+    source = tmp_path / "source"; source.mkdir(); (source / "main.lua").write_text("return {}", encoding="utf-8")
+    manager = ModManager(tmp_path / "cache"); manifest = ModManifest("Example", mod_type="ue4ss", ue4ss_kind="script", archive_path=str(source), server_supported=True)
+    environment = ModManager.detect_local(root)
     manager.install_local(manifest, environment, [], lambda: None, lambda: None, lambda: True)
     states = manager.rollback_latest_local(environment, lambda: None, lambda: None, lambda: True)
     assert states == {}
-    assert (mods / "old.txt").read_text(encoding="utf-8") == "old"
+    assert (root / "UE4SS" / "old.txt").read_text(encoding="utf-8") == "old"
+    assert not (root / "UE4SS" / "Mods" / "Example").exists()
 
 
 def test_workshop_catalog_parses_titles_authors_and_images():

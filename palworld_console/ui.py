@@ -310,15 +310,17 @@ class MainWindow(QMainWindow):
         self.config_diff_label = QLabel("尚无修改"); self.config_diff_label.setWordWrap(True); layout.addWidget(self.config_diff_label); return outer
 
     def _players_tab(self):
-        w = QWidget(); l = QVBoxLayout(w); controls = QHBoxLayout(); self.player_search = QLineEdit(); self.player_search.setPlaceholderText("搜索玩家、平台账号或关联 UID"); self.player_search.textChanged.connect(self._render_players); controls.addWidget(self.player_search)
+        w = QWidget(); root = QVBoxLayout(w); self.player_view_stack = QStackedWidget(); root.addWidget(self.player_view_stack, 1)
+        self.player_list_page = QWidget(); l = QVBoxLayout(self.player_list_page); controls = QHBoxLayout(); self.player_search = QLineEdit(); self.player_search.setPlaceholderText("搜索玩家、平台账号或关联 UID"); self.player_search.textChanged.connect(self._render_players); controls.addWidget(self.player_search)
         self.player_state_filter = QComboBox(); self.player_state_filter.addItem("全部状态", "all"); self.player_state_filter.addItem("在线", "online"); self.player_state_filter.addItem("离线", "offline"); self.player_state_filter.addItem("存档缺失", "missing"); self.player_state_filter.currentIndexChanged.connect(self._render_players); controls.addWidget(self.player_state_filter)
         self.player_sync_button = QPushButton("同步玩家数据"); self.player_sync_button.clicked.connect(self.sync_player_center); controls.addWidget(self.player_sync_button)
         self.player_online_refresh = QPushButton("刷新在线状态"); self.player_online_refresh.clicked.connect(self.refresh_players); self.player_online_refresh.setVisible(False); controls.addWidget(self.player_online_refresh)
         self.player_save_sync_legacy = QPushButton("同步完整存档"); self.player_save_sync_legacy.clicked.connect(self.load_save_snapshot); self.player_save_sync_legacy.setVisible(False); controls.addWidget(self.player_save_sync_legacy)
-        l.addLayout(controls); split = QSplitter(Qt.Horizontal)
-        self.players_table = QTableWidget(0, 6); self.players_table.setHorizontalHeaderLabels(["状态", "玩家", "平台账号", "等级", "最后出现", "存档"]); self.players_table.setAlternatingRowColors(True); self.players_table.setSortingEnabled(True); self.players_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.players_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.players_table.horizontalHeader().setStretchLastSection(True); self.players_table.currentCellChanged.connect(self._show_player_detail); split.addWidget(self.players_table)
-        detail = QWidget(); dl = QVBoxLayout(detail)
-        title_row = QHBoxLayout(); self.player_detail_title = QLabel("选择玩家查看永久档案"); self.player_detail_title.setStyleSheet("font-size:16px;font-weight:650;"); title_row.addWidget(self.player_detail_title); title_row.addWidget(QLabel("角色")); self.player_role_combo = QComboBox(); self.player_role_combo.setMinimumWidth(180); self.player_role_combo.currentIndexChanged.connect(self._role_uid_changed); title_row.addWidget(self.player_role_combo); title_row.addStretch(); self.player_sync_label = QLabel("尚未同步存档"); title_row.addWidget(self.player_sync_label); self.pending_save_label = QLabel("未保存修改 0 项"); title_row.addWidget(self.pending_save_label); dl.addLayout(title_row)
+        self.player_sync_label = QLabel("尚未同步存档"); controls.addWidget(self.player_sync_label); l.addLayout(controls)
+        self.player_list_hint = QLabel("同步完成后选择玩家，进入该玩家的存档详情和修改页面。"); self.player_list_hint.setWordWrap(True); l.addWidget(self.player_list_hint)
+        self.players_table = QTableWidget(0, 7); self.players_table.setHorizontalHeaderLabels(["状态", "玩家", "平台账号", "等级", "最后出现", "存档", "草稿"]); self.players_table.setAlternatingRowColors(True); self.players_table.setSortingEnabled(True); self.players_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.players_table.setSelectionMode(QAbstractItemView.SingleSelection); self.players_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.players_table.horizontalHeader().setStretchLastSection(True); self.players_table.cellClicked.connect(self._show_player_detail); self.players_table.cellActivated.connect(self._show_player_detail); l.addWidget(self.players_table, 1); self.player_view_stack.addWidget(self.player_list_page)
+        self.player_detail_page = QWidget(); dl = QVBoxLayout(self.player_detail_page)
+        title_row = QHBoxLayout(); back = QPushButton("返回玩家列表"); back.clicked.connect(self._return_to_player_list); title_row.addWidget(back); self.player_detail_title = QLabel("玩家详情"); self.player_detail_title.setStyleSheet("font-size:16px;font-weight:650;"); title_row.addWidget(self.player_detail_title); title_row.addWidget(QLabel("角色")); self.player_role_combo = QComboBox(); self.player_role_combo.setMinimumWidth(210); self.player_role_combo.currentIndexChanged.connect(self._role_uid_changed); title_row.addWidget(self.player_role_combo); title_row.addStretch(); self.player_detail_sync_label = QLabel("尚未同步"); title_row.addWidget(self.player_detail_sync_label); self.pending_save_label = QLabel("未保存修改 0 项"); title_row.addWidget(self.pending_save_label); dl.addLayout(title_row)
         plugin_row = QHBoxLayout(); self.plm_plugin_status = QLabel("正在检测 PlM1/Oodle 插件"); self.plm_plugin_status.setWordWrap(True); plugin_row.addWidget(self.plm_plugin_status, 1); install_plugin = QPushButton("安装/修复插件"); install_plugin.clicked.connect(self.install_plm_plugin); plugin_row.addWidget(install_plugin); dl.addLayout(plugin_row)
         localization_row = QHBoxLayout(); self.localization_status = QLabel("中文资源：内置词典"); self.localization_status.setWordWrap(True); localization_row.addWidget(self.localization_status, 1); detect_client = QPushButton("检测游戏资源"); detect_client.clicked.connect(self.detect_localization_source); localization_row.addWidget(detect_client); import_names = QPushButton("导入中文资源"); import_names.clicked.connect(self.import_localization_source); localization_row.addWidget(import_names); dl.addLayout(localization_row)
         self.player_detail_tabs = QTabWidget(); dl.addWidget(self.player_detail_tabs, 1)
@@ -326,19 +328,19 @@ class MainWindow(QMainWindow):
         attributes = QWidget(); al = QVBoxLayout(attributes); attr_tools = QHBoxLayout(); self.save_path_label = QLabel("尚未同步 Level.sav"); attr_tools.addWidget(self.save_path_label, 1); validate = QPushButton("验证存档"); validate.clicked.connect(self.validate_save_snapshot); attr_tools.addWidget(validate); al.addLayout(attr_tools)
         self.save_scope = QComboBox(); self.save_scope.addItem("玩家属性", "player"); self.save_scope.addItem("全部可识别字段", "all"); self.save_scope.currentIndexChanged.connect(self._render_save_fields); self.save_search = QLineEdit(); self.save_search.setPlaceholderText("搜索中文字段或当前值"); self.save_search.textChanged.connect(self._render_save_fields); self.save_changed_only = QCheckBox("仅看已修改"); self.save_changed_only.toggled.connect(self._render_save_fields); filter_row = QHBoxLayout(); filter_row.addWidget(self.save_scope); filter_row.addWidget(self.save_search, 1); filter_row.addWidget(self.save_changed_only); al.addLayout(filter_row)
         self.save_fields_table = QTableWidget(0, 7); self.save_fields_table.setHorizontalHeaderLabels(["对象", "中文字段", "当前值", "修改值", "来源", "状态", "风险"]); self.save_fields_table.setAlternatingRowColors(True); self.save_fields_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch); self.save_fields_table.itemChanged.connect(self._save_edit_changed); al.addWidget(self.save_fields_table); self.player_detail_tabs.addTab(attributes, "玩家属性")
-        pals = QWidget(); pal_l = QVBoxLayout(pals); self.player_pals_table = QTableWidget(0, 7); self.player_pals_table.setHorizontalHeaderLabels(["帕鲁", "昵称", "等级", "经验", "性别", "星级", "稳定 ID"]); self.player_pals_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.player_pals_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_pals_table.horizontalHeader().setStretchLastSection(True); self.player_pals_table.currentCellChanged.connect(self._show_pal_editor); pal_l.addWidget(self.player_pals_table)
-        pal_editor = QGroupBox("所选帕鲁修改草稿"); pal_form = QGridLayout(pal_editor); self.pal_editors = {}
+        pals = QWidget(); pal_l = QVBoxLayout(pals); pal_split = QSplitter(Qt.Horizontal); self.player_pals_table = QTableWidget(0, 8); self.player_pals_table.setHorizontalHeaderLabels(["帕鲁", "昵称", "等级", "性别", "幸运", "星级", "个体值", "状态"]); self.player_pals_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.player_pals_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_pals_table.horizontalHeader().setStretchLastSection(True); self.player_pals_table.currentCellChanged.connect(self._show_pal_editor); pal_split.addWidget(self.player_pals_table)
+        pal_detail = QWidget(); pal_detail_l = QVBoxLayout(pal_detail); self.pal_detail_text = QPlainTextEdit(); self.pal_detail_text.setReadOnly(True); self.pal_detail_text.setMinimumWidth(320); pal_detail_l.addWidget(self.pal_detail_text, 1); pal_editor = QGroupBox("所选帕鲁修改草稿"); pal_form = QGridLayout(pal_editor); self.pal_editors = {}
         for index, (key, label) in enumerate((("nickname", "昵称"), ("level", "等级"), ("exp", "经验"), ("workspeed", "工作速度"), ("melee", "生命个体值"), ("ranged", "攻击个体值"), ("defense", "防御个体值"), ("rank", "星级"))):
             edit = QLineEdit(); self.pal_editors[key] = edit; pal_form.addWidget(QLabel(label), index // 4 * 2, index % 4); pal_form.addWidget(edit, index // 4 * 2 + 1, index % 4)
-        stage_pal = QPushButton("加入修改草稿"); stage_pal.clicked.connect(self.stage_selected_pal); pal_form.addWidget(stage_pal, 4, 3); pal_l.addWidget(pal_editor); self.player_detail_tabs.addTab(pals, "帕鲁")
-        inventory = QWidget(); inv_l = QVBoxLayout(inventory); inv_filter = QHBoxLayout(); inv_filter.addWidget(QLabel("容器")); self.inventory_container_filter = QComboBox(); self.inventory_container_filter.addItem("全部", "all"); [self.inventory_container_filter.addItem(label, key) for key, label in CONTAINER_LABELS.items()]; self.inventory_container_filter.currentIndexChanged.connect(self._render_inventory_for_active_player); inv_filter.addWidget(self.inventory_container_filter); inv_filter.addStretch(); inv_l.addLayout(inv_filter); self.player_inventory_table = QTableWidget(0, 5); self.player_inventory_table.setHorizontalHeaderLabels(["容器", "槽位", "物品", "物品 ID", "数量"]); self.player_inventory_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.player_inventory_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_inventory_table.horizontalHeader().setStretchLastSection(True); self.player_inventory_table.currentCellChanged.connect(self._show_inventory_editor); inv_l.addWidget(self.player_inventory_table)
-        inventory_editor = QHBoxLayout(); self.inventory_selected_label = QLabel("选择背包槽位后可修改数量"); inventory_editor.addWidget(self.inventory_selected_label, 1); self.inventory_quantity = QSpinBox(); self.inventory_quantity.setRange(0, 999999); inventory_editor.addWidget(self.inventory_quantity); stage_item = QPushButton("加入修改草稿"); stage_item.clicked.connect(self.stage_selected_inventory); inventory_editor.addWidget(stage_item); inv_l.addLayout(inventory_editor); self.player_detail_tabs.addTab(inventory, "背包")
-        relations = QWidget(); rel_l = QVBoxLayout(relations); self.player_relations_text = QPlainTextEdit(); self.player_relations_text.setReadOnly(True); rel_l.addWidget(self.player_relations_text); self.player_detail_tabs.addTab(relations, "公会与基地")
+        self.stage_pal_button = QPushButton("加入修改草稿"); self.stage_pal_button.clicked.connect(self.stage_selected_pal); pal_form.addWidget(self.stage_pal_button, 4, 3); pal_detail_l.addWidget(pal_editor); pal_split.addWidget(pal_detail); pal_split.setSizes([650, 390]); pal_l.addWidget(pal_split); self.player_pals_tab_index = self.player_detail_tabs.addTab(pals, "帕鲁 0")
+        inventory = QWidget(); inv_l = QVBoxLayout(inventory); inv_filter = QHBoxLayout(); inv_filter.addWidget(QLabel("容器")); self.inventory_container_filter = QComboBox(); self.inventory_container_filter.addItem("全部", "all"); [self.inventory_container_filter.addItem(label, key) for key, label in CONTAINER_LABELS.items()]; self.inventory_container_filter.currentIndexChanged.connect(self._render_inventory_for_active_player); inv_filter.addWidget(self.inventory_container_filter); self.inventory_status_label = QLabel("尚未载入背包"); inv_filter.addWidget(self.inventory_status_label); inv_filter.addStretch(); inv_l.addLayout(inv_filter); self.player_inventory_table = QTableWidget(0, 5); self.player_inventory_table.setHorizontalHeaderLabels(["容器", "槽位", "物品", "物品 ID", "数量"]); self.player_inventory_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.player_inventory_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_inventory_table.horizontalHeader().setStretchLastSection(True); self.player_inventory_table.currentCellChanged.connect(self._show_inventory_editor); inv_l.addWidget(self.player_inventory_table)
+        inventory_editor = QHBoxLayout(); self.inventory_selected_label = QLabel("选择背包槽位后可修改数量"); inventory_editor.addWidget(self.inventory_selected_label, 1); self.inventory_quantity = QSpinBox(); self.inventory_quantity.setRange(0, 999999); inventory_editor.addWidget(self.inventory_quantity); self.stage_inventory_button = QPushButton("加入修改草稿"); self.stage_inventory_button.clicked.connect(self.stage_selected_inventory); inventory_editor.addWidget(self.stage_inventory_button); inv_l.addLayout(inventory_editor); self.player_inventory_tab_index = self.player_detail_tabs.addTab(inventory, "背包 0")
+        relations = QWidget(); rel_l = QVBoxLayout(relations); self.player_relations_summary = QLabel("尚未载入公会与基地关系"); self.player_relations_summary.setWordWrap(True); rel_l.addWidget(self.player_relations_summary); rel_split = QSplitter(Qt.Vertical); self.player_guild_members_table = QTableWidget(0, 3); self.player_guild_members_table.setHorizontalHeaderLabels(["公会成员", "角色 UID", "身份"]); self.player_guild_members_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_guild_members_table.horizontalHeader().setStretchLastSection(True); rel_split.addWidget(self.player_guild_members_table); self.player_bases_table = QTableWidget(0, 7); self.player_bases_table.setHorizontalHeaderLabels(["基地", "基地 ID", "坐标", "工作帕鲁", "工作容器", "关联容器", "状态"]); self.player_bases_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_bases_table.horizontalHeader().setStretchLastSection(True); rel_split.addWidget(self.player_bases_table); rel_split.setSizes([220, 320]); rel_l.addWidget(rel_split, 1); self.player_relations_tab_index = self.player_detail_tabs.addTab(relations, "公会与基地 0")
         operations = QWidget(); op_l = QVBoxLayout(operations); operation_row = QHBoxLayout();
         for text, handler in (("广播", self.broadcast), ("踢出", self.kick_player), ("封禁", self.ban_player), ("按 ID 解封", self.unban_player), ("保存世界", self.rest_save)): b=QPushButton(text); b.clicked.connect(handler); operation_row.addWidget(b)
         operation_row.addStretch(); op_l.addLayout(operation_row); op_l.addWidget(QLabel("踢出、封禁和存档写回会记录审计；高风险写回必须输入实例名称与操作原因。")); op_l.addStretch(); self.player_detail_tabs.addTab(operations, "管理操作")
-        save_actions = QHBoxLayout(); preview = QPushButton("预览差异"); preview.clicked.connect(self.preview_save_changes); save_actions.addWidget(preview); revert = QPushButton("撤销全部修改"); revert.clicked.connect(self.revert_save_changes); save_actions.addWidget(revert); apply_btn = QPushButton("保存到服务器"); apply_btn.clicked.connect(self.apply_save_changes); apply_btn.setStyleSheet("color:#b42318;"); save_actions.addWidget(apply_btn); self.retry_save_button = QPushButton("重试上次保存"); self.retry_save_button.clicked.connect(self.apply_save_changes); self.retry_save_button.setVisible(False); save_actions.addWidget(self.retry_save_button); save_actions.addStretch(); dl.addLayout(save_actions)
-        split.addWidget(detail); split.setSizes([390, 700]); l.addWidget(split); self.save_document = None; self.save_scalar_values = {}; self.save_working_path = None; self._refresh_plm_plugin_status(); self._refresh_localization_status(); self.player_detail_tabs.setEnabled(False); return w
+        save_actions = QHBoxLayout(); self.preview_save_button = QPushButton("预览差异"); self.preview_save_button.clicked.connect(self.preview_save_changes); save_actions.addWidget(self.preview_save_button); revert = QPushButton("撤销全部修改"); revert.clicked.connect(self.revert_save_changes); save_actions.addWidget(revert); self.apply_save_button = QPushButton("保存到服务器"); self.apply_save_button.clicked.connect(self.apply_save_changes); self.apply_save_button.setStyleSheet("color:#b42318;"); save_actions.addWidget(self.apply_save_button); self.retry_save_button = QPushButton("重试上次保存"); self.retry_save_button.clicked.connect(self.apply_save_changes); self.retry_save_button.setVisible(False); save_actions.addWidget(self.retry_save_button); save_actions.addStretch(); dl.addLayout(save_actions)
+        self.player_view_stack.addWidget(self.player_detail_page); self.player_view_stack.setCurrentWidget(self.player_list_page); self.save_document = None; self.save_scalar_values = {}; self.save_working_path = None; self._refresh_plm_plugin_status(); self._refresh_localization_status(); self.player_detail_tabs.setEnabled(False); return w
 
     def _guilds_tab(self):
         w = QWidget(); l = QVBoxLayout(w); row = QHBoxLayout(); refresh = QPushButton("刷新公会与基地"); refresh.clicked.connect(self.refresh_guilds); row.addWidget(refresh); row.addWidget(QLabel("在线数据来自官方接口；改名、转移、合并和删除通过停服存档事务执行。")); row.addStretch(); l.addLayout(row)
@@ -440,10 +442,13 @@ class MainWindow(QMainWindow):
         if getattr(self, "player_save_busy", False): return QMessageBox.information(self, "任务进行中", "玩家存档正在保存，请等待任务完成后再切换实例。")
         self._close_rest_tunnel()
         self.active_player_uid = ""
+        self.selected_pal_edit = {}; self.selected_inventory_edit = {}
         self.player_center.begin_sync(self.instances[row].id)
         if hasattr(self, "player_detail_tabs"): self.player_detail_tabs.setEnabled(False)
+        if hasattr(self, "player_view_stack"): self.player_view_stack.setCurrentWidget(self.player_list_page)
         if hasattr(self, "player_sync_label"):
             self.player_sync_label.setText("尚未同步存档")
+        if hasattr(self, "player_detail_sync_label"): self.player_detail_sync_label.setText("尚未同步")
         self.current_players = self.player_repository.list_players(self.instances[row].id); self.current_player_groups = self.player_repository.list_identity_groups(self.instances[row].id); self.current_guilds = []
         self.selected = self.instances[row]; self.title.setText(self.selected.name); self.name_edit.setText(self.selected.name); self.kind_combo.setCurrentIndex(0 if self.selected.kind == "local" else 1); self.path_edit.setText(self.selected.install_dir); self.host_edit.setText(self.selected.host); self.user_edit.setText(self.selected.remote_username); self.ssh_port_spin.setValue(self.selected.ssh_port); self.auth_combo.setCurrentIndex(0 if self.selected.ssh_auth_type == "password" else 1); self.key_path_edit.setText(self.selected.ssh_key_path); self.port_spin.setValue(self.selected.game_port); self.rest_edit.setText(self.selected.rest_url); self.rest_password_edit.setText(self.storage.get_secret(self.selected.admin_secret_ref)); self.public_edit.setText(self.selected.public_address); self.config_source_label.setText(f"配置状态：{self.selected.config_source or '尚未同步'}" + ("，需要重启" if self.selected.config_restart_required else "")); self.lifecycle = LocalServerLifecycle(self.selected, self.ui_signals.log.emit) if self.selected.kind == "local" else (self._remote_lifecycle() if self.selected.discovery_status == "ready" else None); self._toggle_remote_fields(); self._show_discovery(); self.refresh_status()
         self._load_cached_config()
@@ -1367,7 +1372,7 @@ class MainWindow(QMainWindow):
 
     def sync_player_center(self):
         if not self.selected or self.install_task_active: return
-        selected = self.selected; self.player_center.begin_sync(selected.id); self.player_sync_button.setEnabled(False); self.player_sync_label.setText("正在同步玩家、帕鲁和背包…")
+        selected = self.selected; self.player_center.begin_sync(selected.id); self.player_sync_button.setEnabled(False); self.player_sync_label.setText("正在同步玩家、帕鲁、背包、公会和基地…")
         def sync():
             players = PlayerAdminService(self._rest_client()).list_players()
             path = self._find_save_path(); local = Path(path)
@@ -1379,14 +1384,30 @@ class MainWindow(QMainWindow):
 
     def _player_center_sync_done(self, payload):
         players, document, path, local = payload
-        self._players_loaded(players)
-        self._save_snapshot_loaded((document, SaveGameService.flatten(document.properties), path, local))
-        ready = isinstance(document, PluginParsedSave)
-        self.player_center.complete_sync(self.selected.id, list(document.properties.get("players", [])), [asdict(player) for player in players], path, ready)
-        self.player_detail_tabs.setEnabled(ready); self.player_sync_button.setEnabled(True); self.player_sync_label.setText("已同步，可选择玩家并编辑")
+        try:
+            self.save_document, self.save_scalar_values = document, SaveGameService.flatten(document.properties)
+            self.save_remote_path, self.save_working_path = path, local
+            ready = isinstance(document, PluginParsedSave)
+            if ready:
+                run_id = self.player_repository.begin_sync(self.selected.id)
+                try:
+                    count = self.player_repository.upsert_save_snapshot(self.selected.id, document.properties)
+                    self.player_repository.finish_sync(run_id, "success", count)
+                except Exception as exc:
+                    self.player_repository.finish_sync(run_id, "failed", detail=str(exc)); raise
+            self._players_loaded(players)
+            self.current_players = self.player_repository.list_players(self.selected.id)
+            self.current_player_groups = self.player_repository.list_identity_groups(self.selected.id)
+            self._render_players()
+            self.save_path_label.setText(f"已载入：{path} · {len(self.save_scalar_values)} 个结构化字段")
+            self.player_center.complete_sync(self.selected.id, list(document.properties.get("players", [])), [asdict(player) for player in players], path, ready)
+            self._render_save_fields(); self.append_log("玩家、帕鲁、背包、公会、基地和在线状态已完成一次性同步")
+            self.player_detail_tabs.setEnabled(True); self._set_player_editing_enabled(ready); self.player_sync_button.setEnabled(True); self.player_sync_label.setText("已同步，可选择玩家进入详情"); self.player_detail_sync_label.setText(f"同步于 {self.player_center.snapshot.synced_at}")
+        except Exception as exc:
+            self._player_center_sync_failed(str(exc))
 
     def _player_center_sync_failed(self, error):
-        self.player_center.fail_sync(error); self.player_sync_button.setEnabled(True); self.player_sync_label.setText("同步失败，保留上次有效数据"); self.player_detail_tabs.setEnabled(bool(self.player_center.snapshot.synced)); QMessageBox.critical(self, "玩家中心同步失败", error)
+        self.player_center.fail_sync(error); self.player_sync_button.setEnabled(True); self.player_sync_label.setText("同步失败，保留上次有效数据"); self.player_detail_sync_label.setText("数据已过期" if self.player_center.snapshot.synced else "同步失败"); self.player_detail_tabs.setEnabled(bool(self.player_center.snapshot.synced)); self._set_player_editing_enabled(bool(self.player_center.snapshot.plugin_ready)); QMessageBox.critical(self, "玩家中心同步失败", error)
 
     def _players_loaded(self, players):
         if not self.selected: return
@@ -1410,16 +1431,20 @@ class MainWindow(QMainWindow):
         selected_user = self._selected_player_id() if self.players_table.currentRow() >= 0 else ""
         selected_uid = self.active_player_uid or (self._selected_player_uid() if self.players_table.currentRow() >= 0 else "")
         query = self.player_search.text().strip().lower() if hasattr(self, "player_search") else ""; state = self.player_state_filter.currentData() if hasattr(self, "player_state_filter") else "all"
-        self.current_player_groups = PlayerIdentityService.group(self.current_players)
+        repository_groups = self.player_repository.list_identity_groups(self.selected.id) if self.selected else []
+        self.current_player_groups = repository_groups or PlayerIdentityService.group(self.current_players)
         rows = [group for group in self.current_player_groups if (not query or query in group.primary.name.lower() or query in group.primary.user_id.lower() or query in group.primary.account_name.lower() or any(query in uid.lower() for uid in group.aliases)) and (state == "all" or (state == "online" and group.primary.online) or (state == "offline" and not group.primary.online and group.primary.save_status != "missing") or (state == "missing" and group.primary.save_status == "missing"))]
-        self.players_table.setRowCount(len(rows))
+        self.players_table.setSortingEnabled(False); self.players_table.blockSignals(True); self.players_table.setRowCount(len(rows))
         for row, group in enumerate(rows):
-            player = group.primary; values = ("在线" if player.online else "离线", player.name or player.account_name or "未命名玩家", player.account_name or player.user_id, player.level, player.last_seen or "-", "缺失" if player.save_status == "missing" else "存在")
-            identity = {"player_uid": player.player_uid, "user_id": player.user_id, "aliases": list(group.aliases)}
+            player = group.primary; draft_count = sum(self.player_center.pending_count(self.selected.id, uid) for uid in group.role_uids) if self.selected else 0
+            values = ("在线" if player.online else "离线", player.name or player.account_name or "未命名玩家", player.account_name or player.user_id, player.level, player.last_seen or "-", "缺失" if player.save_status == "missing" else "存在", f"{draft_count} 项" if draft_count else "-")
+            identity = {"player_uid": player.player_uid, "user_id": player.user_id, "aliases": list(group.aliases), "role_uids": list(group.role_uids)}
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value)); item.setData(Qt.UserRole, identity); self.players_table.setItem(row, column, item)
             if (selected_user and selected_user in {player.user_id, player.player_uid}) or (selected_uid and selected_uid in group.aliases):
                 self.players_table.setCurrentCell(row, 0)
+        self.players_table.blockSignals(False); self.players_table.setSortingEnabled(True)
+        self.player_list_hint.setText(f"共 {len(rows)} 名唯一玩家。选择玩家后进入其存档详情；返回列表不会丢失草稿。")
 
     def _selected_player_id(self) -> str:
         row = self.players_table.currentRow(); item = self.players_table.item(row, 0) if row >= 0 else None
@@ -1430,28 +1455,37 @@ class MainWindow(QMainWindow):
         row = self.players_table.currentRow(); item = self.players_table.item(row, 0) if row >= 0 else None
         data = item.data(Qt.UserRole) if item else {}; return str((data or {}).get("player_uid") or "")
 
-    def _show_player_detail(self, row, _column=0, _previous_row=-1, _previous_column=-1):
+    def _show_player_detail(self, row, _column=0, *_args):
         if not self.selected or row < 0: return
+        if not self.player_center.snapshot.synced:
+            return QMessageBox.information(self, "玩家中心", "请先同步玩家数据，再打开玩家存档详情。")
         uid_item = self.players_table.item(row, 0)
         if not uid_item: return
-        identity = uid_item.data(Qt.UserRole) or {}; aliases = list(identity.get("aliases") or [identity.get("player_uid")])
-        if self.active_player_uid and self.active_player_uid not in aliases and not self._confirm_leave_active_role():
-            self._restore_active_player_selection(); return
-        preferred = self.active_player_uid if self.active_player_uid in aliases else str(identity.get("player_uid") or aliases[0] or "")
+        identity = uid_item.data(Qt.UserRole) or {}; roles = list(identity.get("role_uids") or [])
+        preferred = self.active_player_uid if self.active_player_uid in roles else str(roles[0] if roles else "")
         self.player_role_combo.blockSignals(True); self.player_role_combo.clear()
-        for alias in aliases:
-            role = self.player_repository.player_detail(self.selected.id, alias).get("player", {})
-            self.player_role_combo.addItem(f"{role.get('nickname') or '角色'} · {alias}", alias)
+        for role_uid in roles:
+            role = self.player_repository.player_detail(self.selected.id, role_uid).get("player", {})
+            self.player_role_combo.addItem(f"{role.get('nickname') or '角色'} · {role_uid}", role_uid)
         index = self.player_role_combo.findData(preferred); self.player_role_combo.setCurrentIndex(max(0, index)); self.player_role_combo.blockSignals(False)
-        self._load_player_role(str(self.player_role_combo.currentData() or preferred), aliases)
+        if preferred:
+            self._load_player_role(str(self.player_role_combo.currentData() or preferred), roles)
+        else:
+            self.active_player_uid = ""; self.player_detail_title.setText(identity.get("user_id") or "历史玩家"); self.player_detail_text.setPlainText("该玩家当前没有可编辑的存档角色，历史身份记录仍然保留。")
+            self.player_detail_tabs.setEnabled(True); self._set_player_editing_enabled(False); self._set_player_tab_counts(0, 0, 0)
+        self.player_view_stack.setCurrentWidget(self.player_detail_page)
+
+    def _return_to_player_list(self):
+        self._update_pending_save_label(); self._render_players(); self.player_view_stack.setCurrentWidget(self.player_list_page); self.players_table.setFocus()
 
     def _load_player_role(self, uid: str, aliases: list[str] | None = None):
         if not self.selected or not uid: return
         if not self.player_center.snapshot.synced: return
         self.active_player_uid = uid; self.player_center.select(uid); aliases = aliases or [uid]
         detail = self.player_repository.player_detail(self.selected.id, uid)
-        player = detail.get("player", {}); pals = detail.get("pals", []); items = detail.get("items", []); guild = detail.get("guild", {})
+        player = detail.get("player", {}); pals = detail.get("pals", []); items = detail.get("items", []); guild = detail.get("guild", {}); bases = detail.get("bases", []); completeness = detail.get("completeness", {})
         self.player_detail_title.setText(player.get("nickname") or player.get("account_name") or uid)
+        self.player_detail_sync_label.setText(("数据已过期 · " if self.player_center.snapshot.stale else "同步于 ") + (self.player_center.snapshot.synced_at or "未知时间"))
         self.player_note.setText(player.get("note") or "")
         masked_ips = ", ".join(__import__("json").loads(player.get("masked_ips") or "[]")) or "无"
         self.player_detail_text.setPlainText(
@@ -1459,23 +1493,70 @@ class MainWindow(QMainWindow):
             f"状态：{'在线' if player.get('online') else '离线'} / 存档 {player.get('save_status')}\n"
             f"等级 / 经验：{player.get('level', 0)} / {player.get('experience', 0)}\n"
             f"首次 / 最后出现：{player.get('first_seen') or '-'} / {player.get('last_seen') or '-'}\n"
-            f"历史 IP（脱敏）：{masked_ips}\n公会：{guild.get('guild_name') or '-'}\n"
-            f"关联帕鲁：{len(pals)} 只\n背包记录：{len(items)} 项"
+            f"历史 IP（脱敏）：{masked_ips}\n公会：{guild.get('name') or guild.get('guild_name') or '-'}\n"
+            f"关联帕鲁：{len(pals)} 只（{self._data_status_text(completeness.get('pals'))}）\n"
+            f"背包记录：{len(items)} 项（{self._data_status_text(completeness.get('inventory'))}）\n"
+            f"关联基地：{len(bases)} 个（{self._data_status_text(completeness.get('bases'))}）"
         )
         self.player_pals_table.setRowCount(len(pals))
         for pal_row, pal in enumerate(pals):
             pal_id = str(pal.get("type") or "")
             pal_name = self.localization.display("pals", pal_id)
             gender_id = str(pal.get("gender") or "Unknown")
-            values = (pal_name, pal.get("nickname") or "-", pal.get("level", 0), pal.get("exp", 0), self.localization.display("gender", gender_id), pal.get("rank", 0), pal.get("individual_id") or "未检测到稳定 ID")
-            metadata = {"individual_id": pal.get("individual_id") or "", "pal": pal}
+            stable = bool(pal.get("stable_id_valid", bool(pal.get("individual_id"))))
+            state = "可编辑" if stable else pal.get("read_only_reason") or "关系不完整"
+            values = (pal_name, pal.get("nickname") or "-", pal.get("level", 0), self.localization.display("gender", gender_id), "是" if pal.get("is_lucky") else "否", pal.get("rank", 0), f"生 {pal.get('melee', 0)} / 攻 {pal.get('ranged', 0)} / 防 {pal.get('defense', 0)}", state)
+            metadata = {"individual_id": pal.get("individual_id") or "", "stable_id_valid": stable, "pal": pal}
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value)); item.setData(Qt.UserRole, metadata)
-                if column in {0, 4}: item.setToolTip(f"游戏内部 ID：{pal_id if column == 0 else gender_id}")
+                if column == 0: item.setToolTip(f"帕鲁内部 ID：{pal_id}\n稳定 InstanceId：{pal.get('individual_id') or '-'}")
+                elif column == 3: item.setToolTip(f"性别内部值：{gender_id}")
                 self.player_pals_table.setItem(pal_row, column, item)
+        container_counts = {entry.get("key"): int(entry.get("count") or 0) for entry in detail.get("inventory_containers") or []}
+        container_summary = "，".join(f"{CONTAINER_LABELS.get(key, key)} {container_counts.get(key, 0)}" for key in CONTAINER_LABELS)
+        inventory_reason = detail.get("inventory_read_only_reason") or self._data_status_text(completeness.get("inventory"))
+        self.inventory_status_label.setText(f"{inventory_reason} · {container_summary}")
         self._render_inventory_for_active_player(items)
-        self.player_relations_text.setPlainText(f"公会：{guild.get('guild_name') or '-'}\n公会 ID：{guild.get('guild_id') or '-'}\n身份：{'会长' if guild.get('is_admin') else '成员' if guild else '-'}\n\n公会转移、合并、删除和基地归属修改仅在完整关系校验通过后开放。")
-        self._render_save_fields()
+        self._render_player_relations(detail); self._set_player_tab_counts(len(pals), len(items), len(bases)); self._render_save_fields(); self._update_pending_save_label(); self.player_detail_tabs.setEnabled(True); self._set_player_editing_enabled(bool(self.player_center.snapshot.plugin_ready))
+
+    @staticmethod
+    def _data_status_text(status: str | None) -> str:
+        return {"complete": "完整", "partial": "部分数据未解析", "empty": "无记录"}.get(str(status or ""), "状态未知")
+
+    def _set_player_tab_counts(self, pals: int, items: int, bases: int):
+        self.player_detail_tabs.setTabText(self.player_pals_tab_index, f"帕鲁 {pals}")
+        self.player_detail_tabs.setTabText(self.player_inventory_tab_index, f"背包 {items}")
+        self.player_detail_tabs.setTabText(self.player_relations_tab_index, f"公会与基地 {bases}")
+
+    def _set_player_editing_enabled(self, enabled: bool):
+        enabled = bool(enabled and not getattr(self, "player_save_busy", False))
+        self.save_fields_table.setEnabled(enabled)
+        self.inventory_quantity.setEnabled(enabled)
+        self.stage_inventory_button.setEnabled(enabled)
+        self.stage_pal_button.setEnabled(enabled)
+        self.preview_save_button.setEnabled(enabled)
+        self.apply_save_button.setEnabled(enabled)
+        selected_pal = getattr(self, "selected_pal_edit", {})
+        pal_editable = bool(enabled and selected_pal.get("individual_id") and selected_pal.get("pal_index") is not None)
+        for editor in self.pal_editors.values(): editor.setEnabled(pal_editable)
+
+    def _render_player_relations(self, detail: dict):
+        guild = detail.get("guild") or {}; members = list(detail.get("guild_members") or []); bases = list(detail.get("bases") or []); completeness = detail.get("completeness") or {}
+        guild_name = guild.get("name") or guild.get("guild_name") or "未加入公会"; guild_id = str(guild.get("guild_id") or ""); admin_uid = str(guild.get("admin_player_uid") or "")
+        identity = "会长" if guild.get("is_admin") else "成员" if guild_id else "-"
+        self.player_relations_summary.setText(f"公会：{guild_name}　公会 ID：{guild_id or '-'}　当前身份：{identity}　公会基地等级：{guild.get('base_camp_level', '-')}　关系状态：{self._data_status_text(completeness.get('guild'))}\n公会和基地关系当前仅供查看；关系不完整时不会进入存档写回补丁。")
+        self.player_guild_members_table.setRowCount(len(members))
+        for row, member in enumerate(members):
+            member_uid = str(member.get("player_uid") or ""); values = (member.get("nickname") or "未命名成员", member_uid or "-", "会长" if member_uid and member_uid == admin_uid else "成员")
+            for column, value in enumerate(values): self.player_guild_members_table.setItem(row, column, QTableWidgetItem(str(value)))
+        self.player_bases_table.setRowCount(len(bases))
+        for row, base in enumerate(bases):
+            position = base.get("position") or {}; coordinate = f"X {position.get('x', 0)} / Y {position.get('y', 0)} / Z {position.get('z', 0)}"
+            worker_names = [self.localization.display("pals", worker.get("type")) if worker.get("type") else worker.get("individual_id", "未知帕鲁") for worker in base.get("worker_pals") or []]
+            status = "完整" if base.get("data_status") == "complete" else base.get("read_only_reason") or "关系不完整"
+            values = (base.get("name") or "未命名基地", base.get("base_id") or "-", coordinate, f"{len(base.get('worker_pal_ids') or [])} 只", base.get("worker_container_id") or "-", f"{len(base.get('container_ids') or [])} 个", status)
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value)); cell.setToolTip("\n".join(([f"工作帕鲁：{', '.join(worker_names) or '无'}"] if column == 3 else []) + ([f"关联容器：{', '.join(base.get('container_ids') or []) or '无'}"] if column == 5 else []))); self.player_bases_table.setItem(row, column, cell)
 
     def _confirm_leave_active_role(self) -> bool:
         current = self._active_edit_session(create=False)
@@ -1494,10 +1575,6 @@ class MainWindow(QMainWindow):
     def _role_uid_changed(self, _index=0):
         uid = str(self.player_role_combo.currentData() or "")
         if not uid or uid == self.active_player_uid: return
-        current = self._active_edit_session(create=False)
-        if current and current.changes:
-            if not self._confirm_leave_active_role():
-                self.player_role_combo.blockSignals(True); self.player_role_combo.setCurrentIndex(self.player_role_combo.findData(self.active_player_uid)); self.player_role_combo.blockSignals(False); return
         aliases = [str(self.player_role_combo.itemData(index)) for index in range(self.player_role_combo.count())]
         self._load_player_role(uid, aliases)
 
@@ -1515,7 +1592,7 @@ class MainWindow(QMainWindow):
 
     def _show_pal_editor(self, row, _column=0, _previous_row=-1, _previous_column=-1):
         item = self.player_pals_table.item(row, 0) if row >= 0 else None; metadata = item.data(Qt.UserRole) if item else None
-        pal = (metadata or {}).get("pal") or {}; individual_id = str((metadata or {}).get("individual_id") or "")
+        pal = (metadata or {}).get("pal") or {}; stable = bool((metadata or {}).get("stable_id_valid", False)); individual_id = str((metadata or {}).get("individual_id") or "") if stable else ""
         _player_index, document_player = self._player_document_entry(); document_pal = None; pal_index = None
         if document_player and individual_id:
             for index, candidate in enumerate(document_player.get("pals", [])):
@@ -1524,7 +1601,21 @@ class MainWindow(QMainWindow):
         session = self._active_edit_session(create=False)
         for key, editor in self.pal_editors.items():
             path = f"players[{_player_index}].pals[{pal_index}].{key}" if _player_index is not None and pal_index is not None else ""
-            value = (document_pal or pal).get(key, ""); editor.setText(str(session.value_for(path, value) if session and path else value)); editor.setEnabled(bool(individual_id and document_pal is not None))
+            value = (document_pal or pal).get(key, ""); editor.setText(str(session.value_for(path, value) if session and path else value)); editor.setEnabled(bool(individual_id and document_pal is not None and self.player_center.snapshot.plugin_ready))
+        if not pal:
+            self.pal_detail_text.setPlainText("选择帕鲁后查看完整存档字段。")
+            return
+        passive = [self.localization.display("passives", skill) for skill in pal.get("passive_skills") or pal.get("skills") or []]
+        active = [self.localization.display("skills", skill) for skill in pal.get("active_skills") or []]
+        learned = [self.localization.display("skills", skill) for skill in pal.get("learned_skills") or []]
+        self.pal_detail_text.setPlainText(
+            f"帕鲁：{self.localization.display('pals', pal.get('type'))}\n昵称：{pal.get('nickname') or '-'}\n"
+            f"等级 / 经验：{pal.get('level', 0)} / {pal.get('exp', 0)}\n性别：{self.localization.display('gender', pal.get('gender') or 'Unknown')}\n"
+            f"幸运状态：{'幸运帕鲁' if pal.get('is_lucky') else '普通'}\n生命 / 攻击 / 防御个体值：{pal.get('melee', 0)} / {pal.get('ranged', 0)} / {pal.get('defense', 0)}\n"
+            f"工作速度：{pal.get('workspeed', 0)}\n星级：{pal.get('rank', 0)}\n攻击 / 防御 / 工作强化：{pal.get('rank_attack', 0)} / {pal.get('rank_defence', 0)} / {pal.get('rank_craftspeed', 0)}\n"
+            f"被动技能：{'、'.join(passive) or '无'}\n装备主动技能：{'、'.join(active) or '未解析'}\n已掌握主动技能：{'、'.join(learned) or '未解析'}\n\n"
+            f"稳定 InstanceId：{pal.get('individual_id') or '-'}\n数据状态：{'完整' if pal.get('data_status') == 'complete' else pal.get('read_only_reason') or '部分数据未解析'}"
+        )
 
     def stage_selected_pal(self):
         player_index, player = self._player_document_entry(); selected = getattr(self, "selected_pal_edit", {})
@@ -1550,7 +1641,7 @@ class MainWindow(QMainWindow):
             item_index = next((index for index, current in enumerate(document_items) if str(current.get("ContainerId") or "") == str(item.get("ContainerId") or "") and int(current.get("SlotIndex") or 0) == int(item.get("SlotIndex") or 0)), None)
             path = f"players[{player_index}].items.{container}[{item_index}].StackCount" if player_index is not None and item_index is not None else ""; quantity = session.value_for(path, quantity) if session and path else quantity
             item_id = str(item.get("ItemId") or "")
-            container_name = self.localization.display("containers", container)
+            container_name = CONTAINER_LABELS.get(container, self.localization.display("containers", container))
             localized_item = self.localization.display("items", item_id) if item_id else (item.get("ItemName") or "未知物品")
             values = (container_name, item.get("SlotIndex", 0), localized_item, item_id or "-", quantity)
             for column, value in enumerate(values):
@@ -1562,7 +1653,7 @@ class MainWindow(QMainWindow):
         item = self.player_inventory_table.item(row, 0) if row >= 0 else None; raw = dict(item.data(Qt.UserRole) or {}) if item else {}
         self.selected_inventory_edit = raw
         container = str(raw.get("container") or ""); item_id = str(raw.get("ItemId") or "")
-        self.inventory_selected_label.setText(f"{self.localization.display('containers', container)} · 槽位 {raw.get('SlotIndex', '-')} · {self.localization.display('items', item_id)}")
+        self.inventory_selected_label.setText(f"{CONTAINER_LABELS.get(container, self.localization.display('containers', container))} · 槽位 {raw.get('SlotIndex', '-')} · {self.localization.display('items', item_id)}")
         session = self._active_edit_session(create=False); value = session.value_for(str(raw.get("edit_path") or ""), int(raw.get("StackCount") or 0)) if session else int(raw.get("StackCount") or 0); self.inventory_quantity.setValue(int(value))
 
     def stage_selected_inventory(self):
@@ -2151,7 +2242,11 @@ class MainWindow(QMainWindow):
         self.player_sync_label.setText("存档已同步")
         if self.selected:
             self.player_center.complete_sync(self.selected.id, list(self.save_document.properties.get("players", [])) if isinstance(self.save_document, PluginParsedSave) else [], [asdict(player) for player in self.current_players], remote_path, isinstance(self.save_document, PluginParsedSave))
-            self.player_detail_tabs.setEnabled(isinstance(self.save_document, PluginParsedSave))
+            self.player_detail_tabs.setEnabled(True); self._set_player_editing_enabled(isinstance(self.save_document, PluginParsedSave))
+            self.player_detail_sync_label.setText(f"同步于 {self.player_center.snapshot.synced_at}")
+            if self.active_player_uid and self.player_view_stack.currentWidget() is self.player_detail_page:
+                aliases = [str(self.player_role_combo.itemData(index)) for index in range(self.player_role_combo.count())]
+                self._load_player_role(self.active_player_uid, aliases)
         self._render_save_fields(); self.append_log("存档副本已解析，尚未修改服务器文件")
 
     @staticmethod
@@ -2263,12 +2358,22 @@ class MainWindow(QMainWindow):
         if not ok or not reason.strip(): return
         QMessageBox.information(self, "存档事务", "即将保存世界、停止服务、创建双重备份并验证写回。任务完成前请勿关闭程序。")
         selected = self.selected; service = SaveGameService(); session_key = (selected.id, session.player_uid)
+        expected_source_hash = service.sha256(Path(self.save_working_path))
         self.player_save_busy = True; self.player_detail_tabs.setEnabled(False); self.player_sync_button.setEnabled(False); self.navigation.setEnabled(False)
         def mutate(document): session.apply(document)
         def run(signals):
             from .management import SaveTransaction
             lifecycle = self._remote_lifecycle() if selected.kind == "remote" else self.lifecycle
             try:
+                if selected.kind == "remote":
+                    import tempfile
+                    with tempfile.TemporaryDirectory(prefix="palworld-baseline-") as temp:
+                        baseline = Path(temp) / "Level.sav"
+                        self._remote_client().download_file(self.save_remote_path, baseline)
+                        if service.sha256(baseline) != expected_source_hash:
+                            raise RuntimeError("服务器存档已在同步后发生变化，请重新同步玩家数据后再保存")
+                elif service.sha256(Path(self.save_remote_path)) != expected_source_hash:
+                    raise RuntimeError("服务器存档已在同步后发生变化，请重新同步玩家数据后再保存")
                 try: self._rest_client().save()
                 except Exception: pass
                 if selected.kind == "remote":
@@ -2294,9 +2399,9 @@ class MainWindow(QMainWindow):
     def _save_apply_failed(self, error):
         self.player_center.mark_save_failure(error)
         if hasattr(self, "retry_save_button"): self.retry_save_button.setVisible(True)
-        self.player_save_busy = False; self.navigation.setEnabled(True); self.player_sync_button.setEnabled(True); self.player_detail_tabs.setEnabled(bool(self.player_center.snapshot.synced and self.player_center.snapshot.plugin_ready))
+        self.player_save_busy = False; self.navigation.setEnabled(True); self.player_sync_button.setEnabled(True); self.player_detail_tabs.setEnabled(bool(self.player_center.snapshot.synced)); self._set_player_editing_enabled(bool(self.player_center.snapshot.plugin_ready))
         self.append_log(f"存档事务失败，草稿已保留，可重试：{error}")
-        QMessageBox.critical(self, "存档事务失败", f"服务器已执行自动回滚，当前修改草稿仍保留。\n\n{error}")
+        QMessageBox.critical(self, "存档事务失败", f"{error}\n\n当前修改草稿仍保留，可在重新同步确认基线后重试。")
 
     def _refresh_plm_plugin_status(self):
         if not hasattr(self, "plm_plugin_status"): return

@@ -1714,15 +1714,22 @@ class PalworldRestClient:
         result = []
         for row in rows:
             if not isinstance(row, dict): continue
-            location = row.get("location") or {}
+            normalized = {str(key).replace("_", "").lower(): value for key, value in row.items()}
+            def pick(*keys, default=""):
+                for key in keys:
+                    value = normalized.get(str(key).replace("_", "").lower())
+                    if value not in (None, ""):
+                        return value
+                return default
+            location = row.get("location") or normalized.get("location") or {}
             result.append(PlayerRecord(
-                name=str(row.get("name") or row.get("playerName") or ""),
-                account_name=str(row.get("accountName") or row.get("account_name") or ""),
-                user_id=str(row.get("userId") or row.get("userid") or ""),
-                player_uid=str(row.get("playerUId") or row.get("playerUid") or ""),
-                level=int(row.get("level") or 0), ping=float(row.get("ping") or 0), ip=str(row.get("ip") or ""),
-                location_x=float(location.get("x") or row.get("location_x") or 0), location_y=float(location.get("y") or row.get("location_y") or 0),
-                building_count=int(row.get("buildingCount") or row.get("building_count") or 0), guild_id=str(row.get("guildId") or row.get("GuildID") or ""),
+                name=str(pick("name", "playerName")),
+                account_name=str(pick("accountName", "account_name", "platformAccount")),
+                user_id=str(pick("userId", "userid", "user_id")),
+                player_uid=str(pick("playerUId", "playerUid", "playeruid", "player_uid")),
+                level=int(pick("level", default=0) or 0), ping=float(pick("ping", default=0) or 0), ip=str(pick("ip")),
+                location_x=float(location.get("x") or pick("location_x", default=0) or 0), location_y=float(location.get("y") or pick("location_y", default=0) or 0),
+                building_count=int(pick("buildingCount", "building_count", default=0) or 0), guild_id=str(pick("guildId", "GuildID", "guild_id")),
             ))
         return result
 

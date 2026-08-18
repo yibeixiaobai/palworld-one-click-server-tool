@@ -26,3 +26,11 @@ def test_player_edit_rejects_unknown_or_invalid_fields():
     session = PlayerEditSession("instance-1", "uid-a")
     with pytest.raises(ValueError):
         session.stage("players[0].unknown", 1, 2, "未知字段", "player", "uid-a")
+
+
+def test_player_edit_refuses_stale_server_baseline():
+    session = PlayerEditSession("instance-1", "uid-a")
+    session.stage("players[0].level", 10, 12, "等级", "player", "uid-a")
+    document = type("Document", (), {"properties": {"players": [{"level": 11}]}})()
+    with pytest.raises(RuntimeError, match="服务器存档字段已变化"):
+        session.apply(document)

@@ -32,7 +32,7 @@ class PlayerCenterController:
 
     def begin_sync(self, instance_id: str) -> None:
         if self.snapshot.instance_id != instance_id:
-            self.sessions = {}
+            self.sessions.clear()
             self.selected_uid = ""
         self.snapshot = PlayerCenterSnapshot(instance_id=instance_id)
         self.last_failure = ""

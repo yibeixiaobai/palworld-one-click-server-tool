@@ -45,4 +45,7 @@ class PlayerEditSession:
 
     def apply(self, document: Any) -> None:
         for change in self.changes.values():
+            current = SaveGameService.get_path(document.properties, change.path)
+            if current != change.original:
+                raise RuntimeError(f"服务器存档字段已变化，请重新同步：{change.label} 当前为 {current!r}，同步时为 {change.original!r}")
             SaveGameService.set_path(document.properties, change.path, change.value)

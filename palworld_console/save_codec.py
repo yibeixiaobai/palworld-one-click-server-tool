@@ -21,6 +21,8 @@ PALWORLD_SAVE_TOOLS_COMMIT = "a0e350127dc570593e666f2177eafcee69f7cd5d"
 REFERENCE_TOOL_COMMIT = "f45a48ef25ce08a5311a27e55b17062ba0bb4362"
 SOURCE_URL = "https://github.com/deafdudecomputers/PalworldSaveTools.git"
 VS_BOOTSTRAPPER_URL = "https://aka.ms/vs/17/release/vs_BuildTools.exe"
+HELPER_API_VERSION = 3
+SAVE_PATCH_FORMAT = "palworld-console-save-patch-v2"
 
 
 class SaveCodecPlugin(Protocol):
@@ -72,15 +74,57 @@ class PlmCodecPlugin:
         except (OSError, ValueError):
             return {"stage": "尚未开始", "status": "idle", "detail": ""}
 
+    @staticmethod
+    def helper_sha256() -> str:
+        return hashlib.sha256(PLM_HELPER.encode("utf-8")).hexdigest()
+
+    def _ensure_helper_contract(self, manifest: dict[str, Any]) -> None:
+        expected_hash = self.helper_sha256()
+        current_hash = ""
+        if self.helper.is_file():
+            current_hash = hashlib.sha256(self.helper.read_bytes()).hexdigest()
+        compatible = (
+            manifest.get("helper_api_version") == HELPER_API_VERSION
+            and manifest.get("patch_format") == SAVE_PATCH_FORMAT
+            and manifest.get("helper_sha256") == expected_hash
+            and current_hash == expected_hash
+        )
+        if compatible:
+            return
+        helper_tmp = self.root / f".plm-helper-{uuid.uuid4().hex}.tmp"
+        manifest_tmp = self.root / f".manifest-{uuid.uuid4().hex}.tmp"
+        try:
+            helper_tmp.write_text(PLM_HELPER, encoding="utf-8")
+            updated = dict(manifest)
+            updated.update({
+                "helper_api_version": HELPER_API_VERSION,
+                "patch_format": SAVE_PATCH_FORMAT,
+                "helper_sha256": expected_hash,
+                "helper_updated_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            manifest_tmp.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(helper_tmp, self.helper)
+            os.replace(manifest_tmp, self.manifest)
+            self._record("升级 helper 接口", "complete", f"API v{HELPER_API_VERSION} / {SAVE_PATCH_FORMAT}")
+        except Exception as exc:
+            raise RuntimeError(f"PlM helper 接口版本不匹配且自动升级失败：{exc}") from exc
+        finally:
+            helper_tmp.unlink(missing_ok=True)
+            manifest_tmp.unlink(missing_ok=True)
+
     def probe(self) -> tuple[bool, str]:
-        if not self.python.is_file() or not self.helper.is_file() or not self.manifest.is_file():
+        if not self.python.is_file() or not self.manifest.is_file():
             return False, "PlM 插件尚未安装"
         try:
             manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
             if manifest.get("source_commit") != PALWORLD_SAVE_TOOLS_COMMIT:
                 return False, "PlM 插件版本与应用要求不一致"
+            self._ensure_helper_contract(manifest)
             result = subprocess.run([str(self.python), str(self.helper), "probe"], capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace")
-            return result.returncode == 0, result.stdout.strip() or result.stderr.strip()
+            detail = result.stdout.strip() or result.stderr.strip()
+            if result.returncode:
+                return False, detail
+            return True, f"{detail or 'PlM codec ready'} / helper API v{HELPER_API_VERSION}"
         except Exception as exc:
             return False, str(exc)
 
@@ -108,6 +152,8 @@ class PlmCodecPlugin:
     def verify_roundtrip(self, level_path: Path, expected_patch: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = self.decode(level_path)
         if expected_patch:
+            if expected_patch.get("format") != SAVE_PATCH_FORMAT or "operations" in expected_patch:
+                raise RuntimeError("仅支持 palworld-console-save-patch-v2 补丁验证")
             by_uid = {str(item.get("player_uid")): item for item in payload.get("players", [])}
             invariants = expected_patch.get("invariants", {})
             expected_uids = {str(uid) for uid in invariants.get("player_uids", [])}
@@ -119,23 +165,39 @@ class PlmCodecPlugin:
                 raise RuntimeError("写回后帕鲁数量发生变化")
             if "inventory_count" in invariants and item_count != int(invariants["inventory_count"]):
                 raise RuntimeError("写回后背包槽位数量发生变化")
-            operations = expected_patch.get("players", expected_patch.get("operations", []))
+            operations = expected_patch.get("players", [])
             for operation in operations:
                 player = by_uid.get(str(operation.get("player_uid")))
                 if not player: raise RuntimeError(f"写回后找不到玩家 {operation.get('player_uid')}")
                 for key, expected in operation.get("fields", {}).items():
                     if player.get(key) != expected: raise RuntimeError(f"字段验证失败 {key}: {player.get(key)!r} != {expected!r}")
-            by_pal = {str(pal.get("individual_id")): pal for player in payload.get("players", []) for pal in player.get("pals", []) if pal.get("individual_id")}
+            decoded_pals = [pal for player in payload.get("players", []) for pal in player.get("pals", []) if pal.get("individual_id")]
+            decoded_pal_ids = [str(pal.get("individual_id")) for pal in decoded_pals]
+            if len(decoded_pal_ids) != len(set(decoded_pal_ids)):
+                raise RuntimeError("写回后出现重复帕鲁 InstanceId")
+            by_pal = {str(pal.get("individual_id")): pal for pal in decoded_pals}
+            expected_pal_ids = {str(value) for value in invariants.get("pal_instance_ids", [])}
+            if expected_pal_ids and set(by_pal) != expected_pal_ids:
+                raise RuntimeError("写回后帕鲁 InstanceId 集合发生变化")
             for operation in expected_patch.get("pals", []):
                 pal = by_pal.get(str(operation.get("individual_id")))
                 if not pal: raise RuntimeError(f"写回后找不到帕鲁 {operation.get('individual_id')}")
                 for key, expected in operation.get("fields", {}).items():
                     if pal.get(key) != expected: raise RuntimeError(f"帕鲁字段验证失败 {key}: {pal.get(key)!r} != {expected!r}")
+            for individual_id, expected_fields in invariants.get("unchanged_pal_fields", {}).items():
+                pal = by_pal.get(str(individual_id))
+                if not pal:
+                    raise RuntimeError(f"写回后找不到未修改帕鲁 {individual_id}")
+                for key, expected in expected_fields.items():
+                    if pal.get(key) != expected:
+                        raise RuntimeError(f"未修改帕鲁字段发生变化 {individual_id}.{key}: {pal.get(key)!r} != {expected!r}")
             by_item = {}
             for player in payload.get("players", []):
                 for container_name, items in (player.get("items") or {}).items():
                     for item in items or []:
                         identity = (str(player.get("player_uid")), str(item.get("ContainerId") or container_name), int(item.get("SlotIndex") or 0))
+                        if identity in by_item:
+                            raise RuntimeError(f"写回后出现重复背包槽位 {identity[1]}:{identity[2]}")
                         by_item[identity] = item
             for operation in expected_patch.get("inventory", []):
                 identity = (str(operation.get("player_uid")), str(operation.get("container_id")), int(operation.get("slot_index") or 0))
@@ -281,7 +343,7 @@ class PlmCodecPlugin:
                 if file.is_file() and ".git" not in file.parts:
                     digest.update(file.relative_to(source).as_posix().encode("utf-8"))
                     digest.update(file.read_bytes())
-            self.manifest.write_text(json.dumps({"source_commit": PALWORLD_SAVE_TOOLS_COMMIT, "source_sha256": digest.hexdigest(), "reference_commit": REFERENCE_TOOL_COMMIT, "python": sys.version, "built_at": datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.manifest.write_text(json.dumps({"source_commit": PALWORLD_SAVE_TOOLS_COMMIT, "source_sha256": digest.hexdigest(), "reference_commit": REFERENCE_TOOL_COMMIT, "python": sys.version, "built_at": datetime.now().isoformat(timespec="seconds"), "helper_api_version": HELPER_API_VERSION, "patch_format": SAVE_PATCH_FORMAT, "helper_sha256": self.helper_sha256()}, ensure_ascii=False, indent=2), encoding="utf-8")
             ready, detail = self.probe()
             if not ready:
                 raise RuntimeError(detail)
@@ -318,10 +380,10 @@ class PluginParsedSave:
             fields = {key: player.get(key) for key in allowed if player.get(key) != before[uid].get(key)}
             if fields:
                 players.append({"player_uid": uid, "fields": fields})
-            old_pals = {str(pal.get("individual_id") or ""): pal for pal in before[uid].get("pals", []) if pal.get("individual_id")}
+            old_pals = {str(pal.get("individual_id") or ""): pal for pal in before[uid].get("pals", []) if pal.get("individual_id") and pal.get("stable_id_valid", True)}
             for pal in player.get("pals", []):
                 individual_id = str(pal.get("individual_id") or "")
-                if not individual_id or individual_id not in old_pals:
+                if not individual_id or not pal.get("stable_id_valid", True) or individual_id not in old_pals:
                     continue
                 changed = {key: pal.get(key) for key in pal_allowed if pal.get(key) != old_pals[individual_id].get(key)}
                 if changed:
@@ -338,12 +400,19 @@ class PluginParsedSave:
                     if old and item.get("StackCount") != old.get("StackCount"):
                         inventory.append({"player_uid": uid, "container_id": identity[0], "slot_index": identity[1], "fields": {"StackCount": item.get("StackCount")}})
         original_players = self.original.get("players", [])
+        changed_pal_ids = {str(operation["individual_id"]) for operation in pals}
+        original_pals = [pal for player in original_players for pal in player.get("pals", []) if pal.get("individual_id") and pal.get("stable_id_valid", True)]
         invariants = {
             "player_uids": sorted(str(player.get("player_uid")) for player in original_players if player.get("player_uid")),
             "pal_count": sum(len(player.get("pals", [])) for player in original_players),
             "inventory_count": sum(len(items) for player in original_players for items in (player.get("items") or {}).values()),
+            "pal_instance_ids": sorted(str(pal.get("individual_id")) for pal in original_pals),
+            "unchanged_pal_fields": {
+                str(pal.get("individual_id")): {key: pal.get(key) for key in pal_allowed}
+                for pal in original_pals if str(pal.get("individual_id")) not in changed_pal_ids
+            },
         }
-        return {"format": "palworld-console-save-patch-v2", "players": players, "pals": pals, "inventory": inventory, "guilds": [], "bases": [], "invariants": invariants}
+        return {"format": SAVE_PATCH_FORMAT, "players": players, "pals": pals, "inventory": inventory, "guilds": [], "bases": [], "invariants": invariants}
 
 
 PLM_HELPER = r'''from __future__ import annotations
@@ -368,6 +437,30 @@ def enum_value(prop, default=""):
     value=(prop or {}).get("value",default)
     if isinstance(value,dict): value=value.get("value",default)
     return str(value or default)
+def list_value(prop):
+    value=(prop or {}).get("value",{})
+    if isinstance(value,dict):value=value.get("values",[])
+    if not isinstance(value,(list,tuple)):return []
+    return [item.get("value",item) if isinstance(item,dict) else item for item in value]
+def container_id(entry):
+    key=(entry or {}).get("key",{})
+    if isinstance(key,str):return key
+    for candidate in (key.get("ID"),key.get("Id"),key):
+        if isinstance(candidate,dict) and candidate.get("value") is not None:return str(candidate.get("value"))
+    return ""
+def collect_container_ids(value,result=None,depth=0):
+    result=result if result is not None else set()
+    if depth>12:return result
+    if isinstance(value,dict):
+        for key,item in value.items():
+            lowered=str(key).lower()
+            if "container" in lowered and lowered.endswith(("id","ids")):
+                candidate=item.get("value") if isinstance(item,dict) and "value" in item else item
+                if isinstance(candidate,(str,int)) and str(candidate):result.add(str(candidate))
+            collect_container_ids(item,result,depth+1)
+    elif isinstance(value,list):
+        for item in value:collect_container_ids(item,result,depth+1)
+    return result
 def read_gvas(path):
     raw,save_type=decompress_sav_to_gvas(Path(path).read_bytes())
     gvas=GvasFile.read(raw,PALWORLD_TYPE_HINTS,PALWORLD_CUSTOM_PROPERTIES)
@@ -379,15 +472,26 @@ PLAYER_CONTAINER_KEYS=("CommonContainerId","DropSlotContainerId","EssentialConta
 def item_index(world):
     result={}
     for container in world.get("ItemContainerSaveData",{}).get("value",[]):
-        cid=str(container["key"]["ID"]["value"])
+        cid=container_id(container)
         result[cid]=container["value"]["Slots"]["value"].get("values",[])
+    return result
+def character_container_index(world):
+    result={}
+    for container in world.get("CharacterContainerSaveData",{}).get("value",[]):
+        cid=container_id(container)
+        slots=[]
+        for slot in container.get("value",{}).get("Slots",{}).get("value",{}).get("values",[]):
+            raw=slot.get("RawData",{}).get("value") or {}
+            instance_id=str(raw.get("instance_id") or "").lower()
+            if instance_id:slots.append(instance_id)
+        if cid:result[cid]=slots
     return result
 def player_items(level_path,raw_uid,containers):
     result={key:[] for key in PLAYER_CONTAINER_KEYS}
     player_path=Path(level_path).parent/"Players"/(str(raw_uid).upper().replace("-","")+".sav")
-    if not player_path.is_file():return result
+    if not player_path.is_file():return result,"partial","未找到对应 Players 存档文件"
     try: save=read_gvas(player_path)[0].properties["SaveData"]["value"]
-    except Exception:return result
+    except Exception as exc:return result,"partial","玩家背包存档解析失败："+str(exc)
     inventory=save.get("InventoryInfo",{}).get("value",{})
     for key in PLAYER_CONTAINER_KEYS:
         ref=inventory.get(key)
@@ -396,41 +500,76 @@ def player_items(level_path,raw_uid,containers):
         for slot in containers.get(cid,[]):
             raw=slot.get("RawData",{}).get("value")
             if not raw or not raw.get("item",{}).get("static_id"):continue
-            result[key].append({"ContainerId":cid,"SlotIndex":int(raw.get("slot_index",0)),"ItemId":str(raw["item"]["static_id"]).lower(),"StackCount":int(raw.get("count",0))})
-    return result
+            result[key].append({"ContainerId":cid,"SlotIndex":int(raw.get("slot_index",0)),"ItemId":str(raw["item"]["static_id"]).lower(),"StackCount":int(raw.get("count",0)),"data_status":"complete","read_only_reason":""})
+    return result,"complete",""
 def decode(path):
-    gvas,save_type,world=load(path); players=[]; pals=[]; containers=item_index(world)
+    gvas,save_type,world=load(path); players=[]; pals=[]; containers=item_index(world); character_containers=character_container_index(world)
     for entry in world.get("CharacterSaveParameterMap",{}).get("value",[]):
         raw_uid=entry["key"].get("PlayerUId",{}).get("value"); uid=uid_text(raw_uid); sp=save_parameter(entry)
         if sp.get("IsPlayer",{}).get("value"):
-            players.append({"player_uid":uid,"nickname":sp.get("NickName",{}).get("value","") ,"level":byte_value(sp.get("Level"),1),"exp":int(sp.get("Exp",{}).get("value",0)),"hp":fixed_value(sp.get("Hp")),"shield_hp":fixed_value(sp.get("ShieldHP")),"full_stomach":round(float(sp.get("FullStomach",{}).get("value",0)),2),"status_point":{x["StatusName"]["value"]:x["StatusPoint"]["value"] for x in sp.get("GotStatusPointList",{}).get("value",{}).get("values",[])},"pals":[],"items":player_items(path,raw_uid,containers)})
+            items,inventory_status,inventory_reason=player_items(path,raw_uid,containers)
+            players.append({"player_uid":uid,"nickname":sp.get("NickName",{}).get("value","") ,"level":byte_value(sp.get("Level"),1),"exp":int(sp.get("Exp",{}).get("value",0)),"hp":fixed_value(sp.get("Hp")),"shield_hp":fixed_value(sp.get("ShieldHP")),"full_stomach":round(float(sp.get("FullStomach",{}).get("value",0)),2),"status_point":{x["StatusName"]["value"]:x["StatusPoint"]["value"] for x in sp.get("GotStatusPointList",{}).get("value",{}).get("values",[])},"pals":[],"items":items,"inventory_status":inventory_status,"inventory_read_only_reason":inventory_reason,"inventory_containers":[{"key":key,"count":len(items.get(key,[])),"data_status":inventory_status} for key in PLAYER_CONTAINER_KEYS]})
         elif sp.get("OwnerPlayerUId"):
-            pals.append({"individual_id":str(entry["key"].get("InstanceId",{}).get("value","")).lower(),"owner":uid_text(sp["OwnerPlayerUId"]["value"]),"nickname":sp.get("NickName",{}).get("value","") ,"level":byte_value(sp.get("Level"),1),"exp":int(sp.get("Exp",{}).get("value",0)),"type":sp.get("CharacterID",{}).get("value",""),"gender":str(sp.get("Gender",{}).get("value",{}).get("value","Unknown")).split("::")[-1],"is_lucky":bool(sp.get("IsRarePal",{}).get("value",False)),"workspeed":byte_value(sp.get("CraftSpeed"),0),"melee":byte_value(sp.get("Talent_HP"),0),"ranged":byte_value(sp.get("Talent_Shot"),0),"defense":byte_value(sp.get("Talent_Defense"),0),"rank":byte_value(sp.get("Rank"),1),"rank_attack":byte_value(sp.get("Rank_Attack"),0),"rank_defence":byte_value(sp.get("Rank_Defence"),0),"rank_craftspeed":byte_value(sp.get("Rank_CraftSpeed"),0),"skills":sp.get("PassiveSkillList",{}).get("value",{}).get("values",[])})
+            passive=list_value(sp.get("PassiveSkillList"))
+            pals.append({"individual_id":str(entry["key"].get("InstanceId",{}).get("value","")).lower(),"owner":uid_text(sp["OwnerPlayerUId"]["value"]),"nickname":sp.get("NickName",{}).get("value","") ,"level":byte_value(sp.get("Level"),1),"exp":int(sp.get("Exp",{}).get("value",0)),"type":sp.get("CharacterID",{}).get("value",""),"gender":str(sp.get("Gender",{}).get("value",{}).get("value","Unknown")).split("::")[-1],"is_lucky":bool(sp.get("IsRarePal",{}).get("value",False)),"workspeed":byte_value(sp.get("CraftSpeed"),0),"melee":byte_value(sp.get("Talent_HP"),0),"ranged":byte_value(sp.get("Talent_Shot"),0),"defense":byte_value(sp.get("Talent_Defense"),0),"rank":byte_value(sp.get("Rank"),1),"rank_attack":byte_value(sp.get("Rank_Attack"),0),"rank_defence":byte_value(sp.get("Rank_Defence"),0),"rank_craftspeed":byte_value(sp.get("Rank_CraftSpeed"),0),"skills":passive,"passive_skills":passive,"active_skills":list_value(sp.get("EquipWaza")),"learned_skills":list_value(sp.get("MasteredWaza")),"data_status":"complete"})
+    pal_id_counts={}
+    for pal in pals:
+        identity=pal.get("individual_id","")
+        if identity:pal_id_counts[identity]=pal_id_counts.get(identity,0)+1
     by_uid={p["player_uid"]:p for p in players}
     for pal in pals:
+        identity=pal.get("individual_id","")
+        pal["stable_id_valid"]=bool(identity) and pal_id_counts.get(identity,0)==1
+        pal["read_only_reason"]="" if pal["stable_id_valid"] else ("帕鲁 InstanceId 重复，已禁止写回" if identity else "未检测到稳定帕鲁 InstanceId")
+        if not pal["stable_id_valid"]:pal["data_status"]="partial"
         owner=pal.pop("owner","")
         if owner in by_uid: by_uid[owner]["pals"].append(pal)
     guilds=[]
     for group in world.get("GroupSaveDataMap",{}).get("value",[]):
         if enum_value(group.get("value",{}).get("GroupType"))!="EPalGroupType::Guild":continue
         raw=group["value"]["RawData"]["value"]
-        guilds.append({"guild_id":str(raw.get("group_id","")),"name":raw.get("guild_name",""),"base_camp_level":raw.get("base_camp_level",0),"admin_player_uid":uid_text(raw.get("admin_player_uid")),"players":[{"player_uid":uid_text(x.get("player_uid")),"nickname":x.get("player_info",{}).get("player_name","")} for x in raw.get("players",[])]})
-    return {"format":"PlM1","save_type":save_type,"players":players,"guilds":guilds}
-def set_byte(prop,value):
-    if isinstance(prop.get("value"),dict): prop["value"]["value"]=int(value)
-    else: prop["value"]=int(value)
+        guild_id=str(raw.get("group_id",""))
+        guilds.append({"guild_id":guild_id,"name":raw.get("guild_name",""),"base_camp_level":raw.get("base_camp_level",0),"admin_player_uid":uid_text(raw.get("admin_player_uid")),"players":[{"player_uid":uid_text(x.get("player_uid")),"nickname":x.get("player_info",{}).get("player_name","")} for x in raw.get("players",[])],"base_ids":[],"data_status":"complete" if guild_id else "partial","read_only_reason":"" if guild_id else "公会缺少稳定 ID"})
+    guild_by_id={str(guild.get("guild_id")):guild for guild in guilds}
+    pal_by_id={str(pal.get("individual_id")):pal for pal in pals if pal.get("individual_id")}
+    bases=[]
+    for entry in world.get("BaseCampSaveData",{}).get("value",[]):
+        base_id=str(entry.get("key") or "")
+        value=entry.get("value",{});raw=value.get("RawData",{}).get("value") or {};worker_raw=value.get("WorkerDirector",{}).get("value",{}).get("RawData",{}).get("value") or {}
+        guild_id=str(raw.get("group_id_belong_to") or "");worker_container_id=str(worker_raw.get("container_id") or "")
+        worker_ids=list(character_containers.get(worker_container_id,[]));translation=(raw.get("transform") or {}).get("translation") or (worker_raw.get("spawn_transform") or {}).get("translation") or {}
+        related=collect_container_ids(value);related.discard(worker_container_id)
+        problems=[]
+        if not base_id:problems.append("基地缺少稳定 ID")
+        if not guild_id:problems.append("基地缺少公会归属")
+        if worker_container_id and worker_container_id not in character_containers:problems.append("工作帕鲁容器未找到")
+        unresolved_workers=[identity for identity in worker_ids if identity not in pal_by_id]
+        if unresolved_workers:problems.append("部分工作帕鲁无法关联")
+        base={"base_id":base_id,"name":raw.get("name") or "","guild_id":guild_id,"position":{"x":translation.get("x",0),"y":translation.get("y",0),"z":translation.get("z",0)},"worker_container_id":worker_container_id,"worker_pal_ids":worker_ids,"worker_pals":[{"individual_id":identity,"type":pal_by_id.get(identity,{}).get("type",""),"nickname":pal_by_id.get(identity,{}).get("nickname","")} for identity in worker_ids],"container_ids":sorted(related),"data_status":"complete" if not problems else "partial","read_only_reason":"；".join(problems)}
+        bases.append(base)
+        if guild_id in guild_by_id:guild_by_id[guild_id]["base_ids"].append(base_id)
+    return {"format":"PlM1","save_type":save_type,"players":players,"guilds":guilds,"bases":bases,"data_status":{"players":"complete","pals":"complete" if all(p.get("data_status")=="complete" for p in pals) else "partial","guilds":"complete","bases":"complete" if all(b.get("data_status")=="complete" for b in bases) else "partial"}}
+def set_byte(prop,value,field):
+    nested=(prop or {}).get("value")
+    if not isinstance(nested,dict) or "value" not in nested:
+        raise RuntimeError(field+" 不是受支持的 ByteProperty.value.value 结构")
+    nested["value"]=int(value)
 def set_fixed(prop,value): prop["value"]["Value"]["value"]=int(value)
 def patch(level,manifest,output):
-    gvas,save_type,world=load(level); operations={str(x["player_uid"]):x.get("fields",{}) for x in manifest.get("players",manifest.get("operations",[]))}
-    pal_operations={str(x["individual_id"]).lower():x.get("fields",{}) for x in manifest.get("pals",[])}
+    if manifest.get("format")!="palworld-console-save-patch-v2":raise RuntimeError("unsupported patch format")
+    if "operations" in manifest:raise RuntimeError("legacy operations patch is not supported")
+    gvas,save_type,world=load(level); operations={str(x["player_uid"]):x.get("fields",{}) for x in manifest.get("players",[])}
+    pal_entries=list(manifest.get("pals",[]));pal_ids=[str(x["individual_id"]).lower() for x in pal_entries]
+    if len(pal_ids)!=len(set(pal_ids)):raise RuntimeError("duplicate pal InstanceId in patch")
+    pal_operations={str(x["individual_id"]).lower():x.get("fields",{}) for x in pal_entries}
     item_operations={(str(x["container_id"]),int(x["slot_index"])):x.get("fields",{}) for x in manifest.get("inventory",[])}
-    found=set()
+    player_hits={key:0 for key in operations};pal_hits={key:0 for key in pal_operations};item_hits={key:0 for key in item_operations}
     for entry in world.get("CharacterSaveParameterMap",{}).get("value",[]):
         uid=uid_text(entry["key"].get("PlayerUId",{}).get("value")); sp=save_parameter(entry)
         if sp.get("IsPlayer",{}).get("value") and uid in operations:
-            found.add(uid); fields=operations[uid]
+            player_hits[uid]+=1; fields=operations[uid]
             if "nickname" in fields: sp["NickName"]["value"]=str(fields["nickname"])
-            if "level" in fields: set_byte(sp["Level"],fields["level"])
+            if "level" in fields: set_byte(sp.get("Level"),fields["level"],"Level")
             if "exp" in fields: sp["Exp"]["value"]=int(fields["exp"])
             if "hp" in fields: set_fixed(sp["Hp"],fields["hp"])
             if "shield_hp" in fields: set_fixed(sp["ShieldHP"],fields["shield_hp"])
@@ -442,20 +581,24 @@ def patch(level,manifest,output):
                     if name in wanted:item["StatusPoint"]["value"]=int(wanted[name])
         individual_id=str(entry["key"].get("InstanceId",{}).get("value","")).lower()
         if individual_id in pal_operations:
-            fields=pal_operations[individual_id]
+            pal_hits[individual_id]+=1;fields=pal_operations[individual_id]
             if "nickname" in fields: sp["NickName"]["value"]=str(fields["nickname"])
-            if "level" in fields:set_byte(sp["Level"],fields["level"])
+            if "level" in fields:set_byte(sp.get("Level"),fields["level"],"Level")
             if "exp" in fields:sp["Exp"]["value"]=int(fields["exp"])
             for key,prop in (("workspeed","CraftSpeed"),("melee","Talent_HP"),("ranged","Talent_Shot"),("defense","Talent_Defense"),("rank","Rank")):
-                if key in fields:set_byte(sp[prop],fields[key])
+                if key in fields:set_byte(sp.get(prop),fields[key],prop)
             if "skills" in fields:sp["PassiveSkillList"]["value"]["values"]=list(fields["skills"])
     for container in world.get("ItemContainerSaveData",{}).get("value",[]):
         cid=str(container["key"]["ID"]["value"])
         for slot in container["value"]["Slots"]["value"].get("values",[]):
             raw=slot.get("RawData",{}).get("value") or {}; identity=(cid,int(raw.get("slot_index",0)))
-            if identity in item_operations and "StackCount" in item_operations[identity]:raw["count"]=int(item_operations[identity]["StackCount"])
-    missing=set(operations)-found
-    if missing:raise RuntimeError("players not found: "+",".join(sorted(missing)))
+            if identity in item_operations and "StackCount" in item_operations[identity]:raw["count"]=int(item_operations[identity]["StackCount"]);item_hits[identity]+=1
+    invalid_players=[key for key,count in player_hits.items() if count!=1]
+    invalid_pals=[key for key,count in pal_hits.items() if count!=1]
+    invalid_items=[key for key,count in item_hits.items() if count!=1]
+    if invalid_players:raise RuntimeError("player targets must match exactly once: "+",".join(sorted(invalid_players)))
+    if invalid_pals:raise RuntimeError("pal InstanceId targets must match exactly once: "+",".join(sorted(invalid_pals)))
+    if invalid_items:raise RuntimeError("inventory targets must match exactly once: "+",".join(f"{x[0]}:{x[1]}" for x in invalid_items))
     output_data=compress_gvas_to_sav(gvas.write(PALWORLD_CUSTOM_PROPERTIES),save_type); Path(output).write_bytes(output_data)
 def main():
     parser=argparse.ArgumentParser(); sub=parser.add_subparsers(dest="cmd",required=True); sub.add_parser("probe")

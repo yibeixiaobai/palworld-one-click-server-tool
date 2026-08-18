@@ -39,3 +39,94 @@ def test_identity_service_deduplicates_exact_uid_and_groups_shared_user_id(tmp_p
     assert len(groups) == 1
     assert set(groups[0].aliases) == {"100", "200"}
     repository.close()
+
+
+def test_unique_save_name_links_platform_placeholder_without_deleting_history(tmp_path):
+    repository = PlayerRepository(tmp_path / "players.db")
+    repository.overlay_online("server-1", [PlayerRecord(name="江小白", account_name="江小白", user_id="steam_765", player_uid="")])
+    repository.upsert_save_snapshot("server-1", {"players": [{"player_uid": "1050661243", "nickname": "江小白", "level": 9}], "guilds": []})
+    groups = repository.list_identity_groups("server-1")
+    assert len(groups) == 1
+    assert set(groups[0].aliases) == {"steam_765", "1050661243"}
+    assert groups[0].role_uids == ("1050661243",)
+    assert len(repository.list_players("server-1")) == 2
+    repository.close()
+
+
+def test_first_combined_sync_overlays_online_state_on_real_save_uid(tmp_path):
+    repository = PlayerRepository(tmp_path / "players.db")
+    repository.upsert_save_snapshot("server-1", {"players": [{"player_uid": "1050661243", "nickname": "江小白", "level": 9}], "guilds": []})
+    repository.overlay_online("server-1", [PlayerRecord(name="江小白", user_id="steam_765", level=10)])
+    groups = repository.list_identity_groups("server-1")
+    assert len(groups) == 1
+    assert groups[0].primary.player_uid == "1050661243"
+    assert groups[0].primary.online is True
+    assert groups[0].primary.user_id == "steam_765"
+    assert groups[0].role_uids == ("1050661243",)
+    repository.close()
+
+
+def test_repository_startup_migrates_existing_duplicate_aliases(tmp_path):
+    path = tmp_path / "players.db"
+    repository = PlayerRepository(path)
+    now = repository._now()
+    repository.connection.execute("INSERT INTO players(instance_id,player_uid,nickname,first_seen,last_seen,save_status) VALUES(?,?,?,?,?,?)", ("server-1", "1050661243", "江小白", now, now, "active"))
+    repository.connection.execute("INSERT INTO players(instance_id,player_uid,user_id,account_name,nickname,first_seen,last_seen,save_status) VALUES(?,?,?,?,?,?,?,?)", ("server-1", "steam_765", "steam_765", "江小白", "江小白", now, now, "missing"))
+    repository.connection.execute("INSERT INTO player_aliases(instance_id,canonical_key,player_uid,user_id,first_seen,last_seen) VALUES(?,?,?,?,?,?)", ("server-1", "user:steam_765", "steam_765", "steam_765", now, now))
+    repository.connection.commit(); repository.close()
+    reopened = PlayerRepository(path)
+    groups = reopened.list_identity_groups("server-1")
+    assert len(groups) == 1
+    assert set(groups[0].aliases) == {"1050661243", "steam_765"}
+    assert groups[0].role_uids == ("1050661243",)
+    reopened.close()
+
+
+def test_ambiguous_duplicate_names_are_not_permanently_linked(tmp_path):
+    repository = PlayerRepository(tmp_path / "players.db")
+    repository.overlay_online("server-1", [PlayerRecord(name="Same", user_id="steam_1"), PlayerRecord(name="Same", user_id="steam_2")])
+    repository.upsert_save_snapshot("server-1", {"players": [{"player_uid": "100", "nickname": "Same"}], "guilds": []})
+    assert len(repository.list_identity_groups("server-1")) == 3
+    repository.close()
+
+
+def test_player_detail_persists_complete_guild_base_pal_and_inventory_snapshot(tmp_path):
+    repository = PlayerRepository(tmp_path / "players.db")
+    containers = {
+        key: ([{"ContainerId": f"container-{index}", "SlotIndex": 0, "ItemId": "wood", "StackCount": index + 1, "data_status": "complete"}] if index % 2 == 0 else [])
+        for index, key in enumerate(("CommonContainerId", "DropSlotContainerId", "EssentialContainerId", "FoodEquipContainerId", "PlayerEquipArmorContainerId", "WeaponLoadOutContainerId"))
+    }
+    payload = {
+        "players": [{
+            "player_uid": "200", "nickname": "Alice", "level": 20, "exp": 3000,
+            "inventory_status": "complete", "inventory_containers": [{"key": key, "count": len(items), "data_status": "complete"} for key, items in containers.items()],
+            "pals": [{"individual_id": "pal-1", "type": "SheepBall", "level": 10, "active_skills": ["FireBall"], "passive_skills": ["Lucky"], "data_status": "complete", "stable_id_valid": True}],
+            "items": containers,
+        }],
+        "guilds": [{"guild_id": "guild-1", "name": "Builders", "admin_player_uid": "200", "base_camp_level": 8, "players": [{"player_uid": "200", "nickname": "Alice"}, {"player_uid": "201", "nickname": "Bob"}], "data_status": "complete"}],
+        "bases": [{"base_id": "base-1", "name": "主基地", "guild_id": "guild-1", "position": {"x": 1, "y": 2, "z": 3}, "worker_container_id": "workers-1", "worker_pal_ids": ["pal-1"], "worker_pals": [{"individual_id": "pal-1", "type": "SheepBall"}], "container_ids": ["items-1"], "data_status": "complete"}],
+    }
+    assert repository.upsert_save_snapshot("server-1", payload) == 1
+    assert repository.upsert_save_snapshot("server-1", payload) == 1
+    detail = repository.player_detail("server-1", "200")
+    assert len(detail["pals"]) == 1
+    assert len(detail["items"]) == 3
+    assert detail["guild"]["name"] == "Builders"
+    assert [member["player_uid"] for member in detail["guild_members"]] == ["200", "201"]
+    assert detail["bases"][0]["worker_pal_ids"] == ["pal-1"]
+    assert len(detail["inventory_containers"]) == 6
+    assert detail["completeness"] == {"pals": "complete", "inventory": "complete", "guild": "complete", "bases": "complete"}
+    repository.close()
+
+
+def test_player_repository_migrates_legacy_pals_table_without_losing_rows(tmp_path):
+    path = tmp_path / "players.db"
+    connection = __import__("sqlite3").connect(path)
+    connection.execute("CREATE TABLE pals(instance_id TEXT NOT NULL,player_uid TEXT NOT NULL,pal_index INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(instance_id,player_uid,pal_index))")
+    connection.execute("INSERT INTO pals VALUES(?,?,?,?)", ("server-1", "200", 0, json.dumps({"individual_id": "legacy-pal"})))
+    connection.commit(); connection.close()
+    repository = PlayerRepository(path)
+    columns = {row["name"] for row in repository.connection.execute("PRAGMA table_info(pals)")}
+    assert "individual_id" in columns
+    assert repository.connection.execute("SELECT COUNT(*) FROM pals").fetchone()[0] == 1
+    repository.close()

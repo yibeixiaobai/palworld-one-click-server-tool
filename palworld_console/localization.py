@@ -35,6 +35,9 @@ BUILTIN_ZH_CN: dict[str, dict[str, str]] = {
     "containers": {
         "inventory": "普通背包", "common": "普通背包", "key_items": "重要物品",
         "equipment": "装备栏", "weapon": "武器栏", "food": "食物栏", "palbox": "帕鲁终端",
+        "CommonContainerId": "普通背包", "DropSlotContainerId": "掉落槽",
+        "EssentialContainerId": "重要物品", "FoodEquipContainerId": "食物栏",
+        "PlayerEquipArmorContainerId": "装备栏", "WeaponLoadOutContainerId": "武器栏",
     },
     "gender": {"Male": "雄性", "Female": "雌性", "Unknown": "未知"},
     "rarity": {"true": "幸运/稀有", "false": "普通"},
