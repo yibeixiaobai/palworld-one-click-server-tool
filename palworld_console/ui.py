@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 import platform
 import re
 import sys
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt
 from PySide6.QtGui import QAction, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow, QMessageBox, QPushButton, QPlainTextEdit, QProgressBar, QScrollArea, QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QLineEdit, QVBoxLayout, QWidget, QInputDialog, QAbstractItemView, QStackedWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QPushButton, QPlainTextEdit, QProgressBar, QScrollArea, QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QLineEdit, QVBoxLayout, QWidget, QInputDialog, QAbstractItemView, QStackedWidget)
 from PySide6.QtCore import QSettings
 
 from .config_ini import coerce_setting_value
@@ -24,6 +25,7 @@ from .mod_manager import LocalArchiveProvider, LocalPakProvider, ModEnvironment,
 from .wine_migration import WineMigrationPreflight, WineMigrationService
 from .settings_schema import CATEGORIES, PRESETS, SETTING_BY_KEY, SETTING_DEFINITIONS
 from .storage import AppStorage
+from .backup_packages import BackupPackageService, BackupRepository, RestoreTransaction
 
 
 class WorkerSignals(QObject):
@@ -63,6 +65,75 @@ class Worker(QRunnable):
             self.signals.finished.emit(result)
         except RuntimeError:
             pass
+
+
+class RestoreOptionsDialog(QDialog):
+    def __init__(self, plan, manifest, parent=None, player_uids=(), plugin_status=(False, "PlM 插件尚未检测")):
+        super().__init__(parent)
+        self.setWindowTitle("恢复向导：组件与风险确认")
+        self.resize(620, 460)
+        layout = QVBoxLayout(self)
+        title = QLabel("恢复预检结果")
+        title.setStyleSheet("font-size:18px;font-weight:650;")
+        layout.addWidget(title)
+        summary = QPlainTextEdit("\n".join(plan.summary))
+        summary.setReadOnly(True); summary.setMaximumHeight(180); layout.addWidget(summary)
+        components = QGroupBox("选择恢复组件")
+        component_layout = QVBoxLayout(components)
+        self.world = QCheckBox("世界与全部角色（Level.sav、Players 和世界必要文件）")
+        self.world.setChecked("world" in manifest.components); self.world.setEnabled("world" in manifest.components)
+        self.config = QCheckBox("服务器配置（密码将从目标实例重新注入）")
+        self.config.setChecked(False); self.config.setEnabled("config" in manifest.components)
+        self.player = QCheckBox("单个玩家角色（结构化合并玩家、帕鲁和现有背包槽位）")
+        plugin_ready, plugin_detail = plugin_status
+        self.player.setEnabled(bool(player_uids) and plugin_ready and "world" in manifest.components)
+        self.player_uid = QComboBox(); self.player_uid.addItems(tuple(player_uids)); self.player_uid.setEnabled(False)
+        self.player_hint = QLabel("选择后只合并稳定 UID 对应的已验证字段，不直接复制单个玩家文件。")
+        self.player_hint.setWordWrap(True)
+        if not self.player.isEnabled():
+            self.player_hint.setText(f"单玩家恢复不可用：{plugin_detail if not plugin_ready else '备份中没有可识别玩家'}")
+            self.player_hint.setStyleSheet("color:#8a4b08;")
+        component_layout.addWidget(self.world); component_layout.addWidget(self.player); component_layout.addWidget(self.player_uid); component_layout.addWidget(self.player_hint); component_layout.addWidget(self.config); layout.addWidget(components)
+        self.advanced = QCheckBox("我理解版本不一致或备份不完整的风险，并允许高级恢复")
+        self.advanced.setVisible(plan.requires_advanced_confirmation)
+        layout.addWidget(self.advanced)
+        warning = QLabel("恢复前会保存世界、停止服务并创建受保护恢复点。失败时自动回滚；目标实例的 SSH、安装目录、服务名、端口和凭据不会被来源包覆盖。")
+        warning.setWordWrap(True); warning.setStyleSheet("color:#8a4b08;"); layout.addWidget(warning)
+        self.blocked_reason = plan.blocked_reason
+        if self.blocked_reason:
+            blocked = QLabel("已阻止恢复：" + self.blocked_reason); blocked.setWordWrap(True); blocked.setStyleSheet("color:#b42318;font-weight:600;"); layout.addWidget(blocked)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("继续恢复")
+        self.buttons.accepted.connect(self.accept); self.buttons.rejected.connect(self.reject); layout.addWidget(self.buttons)
+        self.world.toggled.connect(self._world_toggled); self.player.toggled.connect(self._player_toggled); self.config.toggled.connect(self._update_enabled); self.advanced.toggled.connect(self._update_enabled)
+        self._update_enabled()
+
+    def _world_toggled(self, checked):
+        if checked and self.player.isChecked(): self.player.setChecked(False)
+        self._update_enabled()
+
+    def _player_toggled(self, checked):
+        if checked and self.world.isChecked(): self.world.setChecked(False)
+        self.player_uid.setEnabled(checked)
+        self._update_enabled()
+
+    def _update_enabled(self):
+        selected = self.world.isChecked() or self.player.isChecked() or self.config.isChecked()
+        world_selected = self.world.isChecked() or self.player.isChecked()
+        risk_ok = not world_selected or not self.advanced.isVisible() or self.advanced.isChecked()
+        blocked = bool(self.blocked_reason and world_selected)
+        player_ok = not self.player.isChecked() or bool(self.player_uid.currentText())
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(selected and risk_ok and player_ok and not blocked)
+
+    def selected_components(self) -> tuple[str, ...]:
+        result = []
+        if self.world.isChecked(): result.append("world")
+        if self.player.isChecked(): result.append("player")
+        if self.config.isChecked(): result.append("config")
+        return tuple(result)
+
+    def selected_player_uid(self) -> str:
+        return self.player_uid.currentText().strip() if self.player.isChecked() else ""
 
 
 class MainWindow(QMainWindow):
@@ -313,12 +384,25 @@ class MainWindow(QMainWindow):
 
     def _backup_tab(self):
         w = QWidget(); l = QVBoxLayout(w); row = QHBoxLayout()
-        for text, handler in (("立即备份", self.backup), ("恢复所选备份", self.restore), ("刷新列表", self.refresh_backup_list)):
-            b = QPushButton(text); b.clicked.connect(handler); row.addWidget(b)
+        self.backup_action_buttons = []
+        create = QPushButton("创建备份"); create_menu = QMenu(create)
+        create_menu.addAction("世界导出包", lambda: self.create_backup_package("world"))
+        create_menu.addAction("完整灾备包（配置脱敏）", lambda: self.create_backup_package("disaster"))
+        create.setMenu(create_menu); row.addWidget(create); self.backup_action_buttons.append(create)
+        import_button = QPushButton("导入"); import_menu = QMenu(import_button)
+        import_menu.addAction("导入文件", self.import_backup_file); import_menu.addAction("导入 Saved/SaveGames 目录", self.import_backup_directory)
+        import_button.setMenu(import_menu); row.addWidget(import_button); self.backup_action_buttons.append(import_button)
+        for text, handler in (("导出", self.export_selected_backup), ("校验报告", self.export_selected_backup_report), ("恢复", self.restore), ("校验", self.verify_selected_backup), ("添加备注", self.note_selected_backup), ("保护/解锁", self.toggle_selected_backup_protection), ("删除", self.delete_selected_backup), ("刷新", self.refresh_backup_list)):
+            b = QPushButton(text); b.clicked.connect(handler); row.addWidget(b); self.backup_action_buttons.append(b)
         row.addStretch(); l.addLayout(row)
-        self.backup_summary = QLabel("计划备份默认关闭；启用后默认每天 04:00，保留最近 14 份。")
+        self.backup_summary = QLabel("默认创建仅含 SaveGames 的世界导出包；完整灾备包会包含脱敏配置。计划备份默认关闭，启用后每天 04:00，保留最近 14 份。")
         self.backup_summary.setWordWrap(True); l.addWidget(self.backup_summary)
-        self.backup_table = QTableWidget(0, 4); self.backup_table.setHorizontalHeaderLabels(["备份文件", "大小", "修改时间", "校验"]); self.backup_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch); self.backup_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents); self.backup_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents); self.backup_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents); l.addWidget(self.backup_table); return w
+        split = QSplitter(Qt.Vertical)
+        self.backup_table = QTableWidget(0, 10); self.backup_table.setHorizontalHeaderLabels(["状态", "类型", "来源实例", "世界 ID", "游戏版本", "组件", "大小", "创建时间", "校验", "备注"])
+        self.backup_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.backup_table.setSelectionMode(QAbstractItemView.SingleSelection); self.backup_table.setSortingEnabled(True)
+        self.backup_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch); self.backup_table.horizontalHeader().setSectionResizeMode(9, QHeaderView.Stretch)
+        self.backup_table.itemSelectionChanged.connect(self.show_backup_details); split.addWidget(self.backup_table)
+        self.backup_details = QPlainTextEdit(); self.backup_details.setReadOnly(True); self.backup_details.setPlaceholderText("选择备份查看文件、校验和可恢复组件"); split.addWidget(self.backup_details); split.setSizes([420, 220]); l.addWidget(split); return w
 
     def _ops_tab(self):
         w = QWidget(); l = QVBoxLayout(w); row = QHBoxLayout(); self.log_filter = QLineEdit(); self.log_filter.setPlaceholderText("筛选日志和审计记录"); row.addWidget(self.log_filter)
@@ -854,38 +938,234 @@ class MainWindow(QMainWindow):
         if not self.selected: return
         message, ok = QInputDialog.getText(self, "广播", "消息")
         if ok and message: self.run_async(lambda: self._rest_client().announce(message), lambda _: self.append_log("广播已发送"))
-    def backup(self):
+    def _backup_repository(self, instance=None):
+        selected = instance or self.selected
+        if not selected: raise RuntimeError("未选择服务器实例")
+        return BackupRepository(Path(self.storage.root) / "backups", selected.id)
+
+    def backup(self): self.create_backup_package("world")
+
+    def create_backup_package(self, backup_type="world"):
         if not self.selected: return
-        selected = self.selected; destination = self._backup_destination(selected)
+        if self.install_task_active: return QMessageBox.information(self, "任务进行中", "当前服务器任务尚未结束。")
+        selected = self.selected; repository = self._backup_repository(selected)
+        self._begin_backup_task("创建世界导出包" if backup_type == "world" else "创建完整灾备包")
         if selected.kind == "remote":
-            client = self._remote_client(); admin = self.storage.get_secret(selected.admin_secret_ref); rest_user = self.rest_user_edit.text().strip() or "admin"; worker = Worker(lambda signals: self._run_remote_backup(signals, selected, client, destination, admin, rest_user), with_signals=True); worker.signals.log.connect(self.append_log); worker.signals.finished.connect(self._backup_done); worker.signals.error.connect(lambda e: QMessageBox.critical(self, "备份失败", e)); self.pool.start(worker)
+            client = self._remote_client(); admin = self.storage.get_secret(selected.admin_secret_ref); rest_user = self.rest_user_edit.text().strip() or "admin"
+            worker = Worker(lambda signals: self._run_remote_backup(signals, selected, client, repository, admin, rest_user, backup_type), with_signals=True)
         else:
-            self.run_async(lambda: BackupService().create_local(selected, destination), self._backup_done)
+            current_lifecycle = self.lifecycle if isinstance(self.lifecycle, LocalServerLifecycle) else LocalServerLifecycle(selected, self.ui_signals.log.emit)
+            worker = Worker(lambda signals: self._run_local_package_backup(signals, selected, repository, backup_type, current_lifecycle, lambda: self._rest_client().save()), with_signals=True)
+        worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress); worker.signals.finished.connect(self._backup_done); worker.signals.error.connect(self._backup_task_failed); self.pool.start(worker)
 
     @staticmethod
-    def _run_remote_backup(signals, selected, client, destination, admin_password, rest_user):
+    def _run_local_package_backup(signals, selected, repository, backup_type, lifecycle, save_world=None):
+        was_running = lifecycle.status() == "running"
+        signals.progress.emit(TaskProgress(10, "保存并停止", "正在创建一致性存档快照", True))
+        if was_running and save_world:
+            try: save_world(); signals.log.emit("备份前已请求服务器保存世界")
+            except Exception as exc: signals.log.emit(f"保存世界请求失败，将通过停服保证备份一致性：{exc}")
+        if was_running: lifecycle.stop()
+        try:
+            saved = Path(selected.install_dir) / "Pal" / "Saved"
+            signals.progress.emit(TaskProgress(45, "创建备份包", "正在计算文件 SHA-256 并脱敏配置", True))
+            package = BackupPackageService().create(selected, saved, repository.root, backup_type)
+            signals.progress.emit(TaskProgress(85, "校验备份", "正在重新读取 CRC、清单和 SHA-256", True))
+            BackupPackageService().validate(package)
+            return package
+        finally:
+            if was_running: lifecycle.start()
+
+    @staticmethod
+    def _run_remote_backup(signals, selected, client, repository, admin_password, rest_user, backup_type="world"):
         lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit)
         was_running = lifecycle.status() in {"active", "running"}
         tunnel = SSHTunnelManager(client)
+        raw = None
         try:
             try:
                 tunnel.start("127.0.0.1", int(selected.remote_profile.get("rest_port") or 8212)); PalworldRestClient(tunnel.base_url, admin_password, rest_user).save(); signals.log.emit("备份前已保存世界")
             except Exception as exc: signals.log.emit(f"保存世界请求失败，将通过停服保证备份一致性：{exc}")
             if was_running: lifecycle.stop()
-            return BackupService().create_remote(client, selected, destination, selected.install_dir)
+            signals.progress.emit(TaskProgress(35, "下载快照", "正在远程打包并通过 SFTP 下载", True))
+            raw = BackupService().create_remote(client, selected, repository.root, selected.install_dir)
+            if raw is None: raise RuntimeError("远程服务器没有可备份的 Saved 数据")
+            signals.progress.emit(TaskProgress(65, "转换备份包", "正在生成统一清单并脱敏配置", True))
+            package = repository.import_source(raw, selected, backup_type)
+            BackupPackageService().validate(package)
+            return package
         finally:
+            if raw: raw.unlink(missing_ok=True)
             tunnel.close()
             if was_running: lifecycle.start()
 
     def _backup_done(self, path):
         if self.selected and path:
+            self._backup_repository().mark_latest(Path(path))
             self.selected.last_backup = str(path); self.storage.save_instances(self.instances)
             if hasattr(self, "health_labels"): self.health_labels["backup"].setText(str(path))
+            AuditService.record(self.selected, "创建备份", str(path), detail="统一 .pwcbackup 已完成 CRC 与 SHA-256 校验")
+            self.storage.save_instances(self.instances); self._render_audit()
         self.append_log(f"备份完成：{path}" if path else "未发现需要备份的存档")
+        self._finish_backup_task(); self.refresh_backup_list()
+
+    def _begin_backup_task(self, label):
+        self.install_task_active = True; self.active_task_kind = "backup"; self._set_install_controls_enabled(False)
+        self.navigation.setEnabled(False)
+        for button in getattr(self, "backup_action_buttons", []): button.setEnabled(False)
+        self._set_install_progress(TaskProgress(0, label, "正在准备备份任务", True))
+
+    def _finish_backup_task(self, success=True):
+        self.install_task_active = False; self.active_task_kind = ""; self._set_install_controls_enabled(True)
+        self.navigation.setEnabled(True)
+        for button in getattr(self, "backup_action_buttons", []): button.setEnabled(True)
+        self.install_progress.setRange(0, 100)
+        if success:
+            self.install_progress.setValue(100); self.install_percent.setText("100%")
+
+    def _backup_task_failed(self, error):
+        self.append_log(f"备份任务失败：{error}"); self.install_stage.setText("备份失败"); self.install_message.setText(error); self._finish_backup_task(False); QMessageBox.critical(self, "备份失败", error)
+
+    def _selected_backup_path(self):
+        if not hasattr(self, "backup_table") or self.backup_table.currentRow() < 0: return None
+        item = self.backup_table.item(self.backup_table.currentRow(), 0)
+        return Path(str(item.data(Qt.UserRole))) if item and item.data(Qt.UserRole) else None
+
     def restore(self):
-        if not self.selected or self.selected.kind != "local": return
-        file, _ = QFileDialog.getOpenFileName(self, "选择备份", str(self._backup_destination(self.selected)), "Zip (*.zip)")
-        if file and QMessageBox.question(self, "确认恢复", "恢复前必须确保服务器已停止，继续吗？") == QMessageBox.Yes: self.run_async(lambda: BackupService().restore_local(self.selected, Path(file)), lambda _: self.append_log("恢复完成"))
+        if not self.selected: return
+        package = self._selected_backup_path()
+        if not package: return QMessageBox.information(self, "恢复", "请先在备份列表中选择一个备份。")
+        repository = self._backup_repository()
+        if package.suffix.lower() != ".pwcbackup":
+            if QMessageBox.question(self, "转换旧备份", "所选文件是旧格式，必须先转换并校验为 .pwcbackup。继续吗？") != QMessageBox.Yes: return
+            try: package = repository.import_source(package, self.selected)
+            except Exception as exc: return QMessageBox.critical(self, "旧备份转换失败", str(exc))
+            self.refresh_backup_list()
+        transaction = RestoreTransaction()
+        try:
+            manifest = BackupPackageService().validate(package); plan = transaction.plan(package, self.selected)
+        except Exception as exc: return QMessageBox.critical(self, "备份校验失败", str(exc))
+        plugin_status = PlmCodecPlugin().probe()
+        player_uids = ()
+        if plugin_status[0] and "world" in manifest.components:
+            try: player_uids = BackupPackageService().read_player_uids(package, structured=True)
+            except Exception as exc: plugin_status = (False, str(exc))
+        dialog = RestoreOptionsDialog(plan, manifest, self, player_uids, plugin_status)
+        if dialog.exec() != QDialog.Accepted: return
+        components = dialog.selected_components()
+        player_uid = dialog.selected_player_uid()
+        try:
+            selected_plan = transaction.plan(package, self.selected, components)
+            if selected_plan.blocked_reason: return QMessageBox.critical(self, "恢复预检失败", selected_plan.blocked_reason)
+        except Exception as exc: return QMessageBox.critical(self, "恢复预检失败", str(exc))
+        name, ok = QInputDialog.getText(self, "确认恢复", f"请输入目标实例名称“{self.selected.name}”：")
+        if not ok or name != self.selected.name: return
+        reason, ok = QInputDialog.getText(self, "恢复原因", "请输入恢复或迁服原因：")
+        if not ok or not reason.strip(): return
+        selected = self.selected; admin = self.storage.get_secret(selected.admin_secret_ref); server_password = self.storage.get_secret(selected.server_password_secret_ref)
+        self._begin_backup_task("恢复服务器存档")
+        worker = Worker(lambda signals: self._run_restore_transaction(signals, selected, package, repository, components, admin, server_password, player_uid), with_signals=True)
+        worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress)
+        worker.signals.finished.connect(lambda result: self._restore_done(result, reason)); worker.signals.error.connect(self._restore_failed); self.pool.start(worker)
+
+    def _run_restore_transaction(self, signals, selected, package, repository, components, admin_password, server_password, player_uid=""):
+        signals.progress.emit(TaskProgress(5, "恢复预检", "正在校验备份和目标实例", True))
+        try:
+            try: self._rest_client().save()
+            except Exception as exc: signals.log.emit(f"REST 保存世界失败，将通过停服保证一致性：{exc}")
+            transaction = RestoreTransaction()
+            if selected.kind == "remote":
+                lifecycle = _remote_lifecycle_for(selected, self._remote_client(), signals.log.emit)
+                signals.progress.emit(TaskProgress(20, "创建恢复点", "正在下载当前服务器完整恢复点", True))
+                return transaction.execute_remote(package, selected, self._remote_client(), repository, components, lifecycle.stop, lifecycle.start, lambda: self._remote_health_ok(selected), admin_password, server_password, player_uid)
+            lifecycle = self.lifecycle if isinstance(self.lifecycle, LocalServerLifecycle) else LocalServerLifecycle(selected, signals.log.emit)
+            signals.progress.emit(TaskProgress(20, "创建恢复点", "正在创建当前服务器受保护恢复点", True))
+            return transaction.execute_local(package, selected, repository, components, lifecycle.stop, lifecycle.start, lambda: lifecycle.status() == "running", admin_password, server_password, player_uid)
+        finally:
+            self._close_rest_tunnel()
+
+    def _restore_done(self, result, reason):
+        if self.selected:
+            self.selected.last_backup = result.restore_point
+            AuditService.record(self.selected, "恢复存档", result.package_path, result="成功", detail=f"组件={','.join(result.components)}；原因={reason}")
+            self.storage.save_instances(self.instances); self._render_audit()
+        self.append_log(f"恢复完成，恢复点：{result.restore_point}"); self._finish_backup_task(); self.refresh_backup_list(); self.refresh_status()
+        self.load_ini(); self.load_save_snapshot()
+
+    def _restore_failed(self, error):
+        if self.selected:
+            AuditService.record(self.selected, "恢复存档", str(self._selected_backup_path() or ""), result="失败", detail=error); self.storage.save_instances(self.instances); self._render_audit()
+        self.append_log(f"恢复失败：{error}"); self.install_stage.setText("恢复失败"); self.install_message.setText(error); self._finish_backup_task(False); self.refresh_backup_list(); QMessageBox.critical(self, "恢复失败", error)
+
+    def import_backup_file(self):
+        if not self.selected: return
+        file, _ = QFileDialog.getOpenFileName(self, "导入存档或备份", "", "备份与存档 (*.pwcbackup *.zip *.tar.gz *.tgz *.sav);;所有文件 (*)")
+        if file: self._import_backup_source(Path(file))
+
+    def import_backup_directory(self):
+        if not self.selected: return
+        directory = QFileDialog.getExistingDirectory(self, "选择 Saved 或 SaveGames 目录")
+        if directory: self._import_backup_source(Path(directory))
+
+    def _import_backup_source(self, source):
+        if self.install_task_active: return QMessageBox.information(self, "任务进行中", "当前服务器任务尚未结束。")
+        selected = self.selected; repository = self._backup_repository(); self._begin_backup_task("导入备份")
+        worker = Worker(lambda: repository.import_source(source, selected)); worker.signals.finished.connect(self._import_backup_done); worker.signals.error.connect(self._backup_task_failed); self.pool.start(worker)
+
+    def _import_backup_done(self, path):
+        self.append_log(f"备份已导入并校验：{path}"); self._finish_backup_task(); self.refresh_backup_list()
+
+    def export_selected_backup(self):
+        package = self._selected_backup_path()
+        if not package: return QMessageBox.information(self, "导出", "请先选择备份。")
+        if package.suffix.lower() != ".pwcbackup": return QMessageBox.warning(self, "导出", "旧格式请先转换为 .pwcbackup。")
+        manifest = BackupPackageService().read_manifest(package)
+        target, _ = QFileDialog.getSaveFileName(self, "导出备份", str(Path.home() / package.name), "Palworld Console Backup (*.pwcbackup)")
+        if not target: return
+        target_path = Path(target)
+        overwrite = target_path.exists()
+        if overwrite and QMessageBox.question(self, "覆盖导出文件", f"目标文件已存在，确认原子覆盖？\n{target_path}") != QMessageBox.Yes: return
+        world_only = manifest.backup_type != "world" and QMessageBox.question(self, "导出范围", "是否转换为仅含 SaveGames 的世界导出包？\n选择“否”将导出当前完整脱敏灾备包。") == QMessageBox.Yes
+        self.run_async(lambda: BackupPackageService().export(package, target_path, world_only, overwrite), lambda path: self.append_log(f"备份已导出：{path}"))
+
+    def export_selected_backup_report(self):
+        package = self._selected_backup_path()
+        if not package or package.suffix.lower() != ".pwcbackup": return QMessageBox.information(self, "校验报告", "请选择已转换并校验的 .pwcbackup 文件。")
+        target, _ = QFileDialog.getSaveFileName(self, "导出清单与 SHA-256 报告", str(Path.home() / f"{package.stem}-checksums.txt"), "文本报告 (*.txt)")
+        if not target: return
+        target_path = Path(target); overwrite = target_path.exists()
+        if overwrite and QMessageBox.question(self, "覆盖校验报告", f"目标文件已存在，确认覆盖？\n{target_path}") != QMessageBox.Yes: return
+        self.run_async(lambda: BackupPackageService().export_report(package, target_path, overwrite), lambda path: self.append_log(f"校验报告已导出：{path}"))
+
+    def verify_selected_backup(self):
+        package = self._selected_backup_path()
+        if not package or package.suffix.lower() != ".pwcbackup": return QMessageBox.information(self, "校验", "请选择 .pwcbackup 文件。")
+        self.run_async(lambda: BackupPackageService().validate(package), lambda _manifest: (self._backup_repository().set_metadata(package, verified_at=datetime.now().isoformat(timespec="seconds")), self.refresh_backup_list(), QMessageBox.information(self, "校验完成", "CRC、manifest 和全部 SHA-256 均通过。")))
+
+    def note_selected_backup(self):
+        package = self._selected_backup_path()
+        if not package: return
+        note, ok = QInputDialog.getText(self, "备份备注", "备注：")
+        if ok: self._backup_repository().set_metadata(package, note=note); self.refresh_backup_list()
+
+    def toggle_selected_backup_protection(self):
+        package = self._selected_backup_path()
+        if not package: return
+        record = next((item for item in getattr(self, "backup_records", []) if Path(item["path"]) == package), None)
+        protected = bool(record and record.get("protected"))
+        action = "解除保护" if protected else "保护"
+        if QMessageBox.question(self, action, f"确认{action}此备份？\n{package.name}") != QMessageBox.Yes: return
+        self._backup_repository().set_metadata(package, protected=not protected); self.refresh_backup_list()
+
+    def delete_selected_backup(self):
+        package = self._selected_backup_path()
+        if not package: return
+        if QMessageBox.warning(self, "删除备份", f"确认删除？\n{package}", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes: return
+        try:
+            self._backup_repository().delete(package)
+            if self.selected and self.selected.last_backup == str(package): self.selected.last_backup = ""; self.storage.save_instances(self.instances)
+            self.refresh_backup_list()
+        except Exception as exc: QMessageBox.critical(self, "删除失败", str(exc))
     def save_ini(self):
         if not self.selected or not self.selected.install_dir: return QMessageBox.warning(self, "提示", "请先填写本地安装目录")
         try:
@@ -1941,7 +2221,7 @@ class MainWindow(QMainWindow):
 
     def _remote_health_ok(self, selected):
         snapshot = ServerDiagnostics.collect_remote(self._remote_client(), selected, None)
-        return snapshot.service_state == "active" and snapshot.pid > 0 and bool(snapshot.game_endpoint and snapshot.game_endpoint.listening)
+        return snapshot.service_state.lower() in {"active", "running"} and snapshot.pid > 0 and bool(snapshot.game_endpoint and snapshot.game_endpoint.listening)
 
     def _save_apply_done(self, backup, reason, session_key=None):
         if session_key: self.player_edit_sessions.pop(session_key, None)
@@ -2058,7 +2338,7 @@ class MainWindow(QMainWindow):
             code, output, error = client.run(f"sudo -n install -d -m 700 /usr/local/lib/palworld-console /etc/palworld-console && sudo -n install -m 700 {self._shell_quote(helper_tmp)} /usr/local/lib/palworld-console/task.py && rm -f {self._shell_quote(helper_tmp)}")
             if code: raise RuntimeError(error.strip() or output.strip())
             for task in enabled:
-                config = {"action": task.action, "install_dir": selected.install_dir, "service": selected.remote_profile.get("service_name") or "palworld", "config_path": selected.remote_profile.get("config_path") or "", "rest_port": selected.remote_profile.get("rest_port") or 8212, "steamcmd": selected.remote_profile.get("steamcmd_path") or "steamcmd", "backup_dir": f"{selected.install_dir}/Pal/Saved/Backups", "retention": task.retention, "message": task.payload.get("message", "服务器计划通知"), "allowed": [item.player_uid for item in WhitelistService.normalize(selected.whitelist) if item.enabled], "policy": selected.whitelist_policy}
+                config = {"action": task.action, "install_dir": selected.install_dir, "service": selected.remote_profile.get("service_name") or "palworld", "config_path": selected.remote_profile.get("config_path") or "", "rest_port": selected.remote_profile.get("rest_port") or 8212, "steamcmd": selected.remote_profile.get("steamcmd_path") or "steamcmd", "backup_dir": f"{selected.install_dir}/_backups/palworld-console", "retention": task.retention, "message": task.payload.get("message", "服务器计划通知"), "allowed": [item.player_uid for item in WhitelistService.normalize(selected.whitelist) if item.enabled], "policy": selected.whitelist_policy}
                 config_tmp = f"/tmp/palworld-task-{task.id}.json"; client.upload_text(config_tmp, json.dumps(config, ensure_ascii=False))
                 service_name = f"palworld-console-{selected.id[:8]}-{task.id[:8]}"; config_path = f"/etc/palworld-console/{service_name}.json"
                 command = f"/usr/bin/python3 /usr/local/lib/palworld-console/task.py {config_path}"; service_text, timer_text = HostTaskDeployer.systemd_units(selected.id, task, command)
@@ -2087,16 +2367,46 @@ class MainWindow(QMainWindow):
 
     def refresh_backup_list(self):
         if not hasattr(self, "backup_table") or not self.selected: return
-        root = self._backup_destination(self.selected); files = sorted([p for p in root.glob("*") if p.is_file()], key=lambda p: p.stat().st_mtime, reverse=True) if root.exists() else []
-        self.backup_table.setRowCount(len(files))
-        from datetime import datetime
-        for row, path in enumerate(files):
-            valid = "待校验"
-            if path.suffix.lower() == ".zip":
-                try: BackupService.validate_zip(path); valid = "通过"
-                except Exception: valid = "失败"
-            values = (path.name, f"{path.stat().st_size / 1024 / 1024:.1f} MB", datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"), valid)
-            for column, value in enumerate(values): self.backup_table.setItem(row, column, QTableWidgetItem(value))
+        selected_path = self._selected_backup_path()
+        records = self._backup_repository().list(); self.backup_records = records
+        self.backup_table.setSortingEnabled(False); self.backup_table.setRowCount(len(records))
+        type_labels = {"world": "世界导出", "disaster": "完整灾备", "restore-point": "恢复点"}
+        for row, record in enumerate(records):
+            path, manifest = Path(record["path"]), record.get("manifest")
+            state = "受保护" if record.get("protected") else ("可用" if record["status"] == "通过" else "异常")
+            values = (
+                state, type_labels.get(manifest.backup_type, manifest.backup_type) if manifest else "旧格式",
+                manifest.source_instance_name if manifest else "未知", manifest.world_id or "-" if manifest else "-",
+                manifest.game_version or "未知" if manifest else "未知", ", ".join(manifest.components) if manifest else "待转换",
+                f"{record['size_bytes'] / 1024 / 1024:.1f} MB", manifest.created_at.replace("T", " ")[:19] if manifest else "未知",
+                record["status"], record.get("note") or "",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value)); item.setData(Qt.UserRole, str(path)); self.backup_table.setItem(row, column, item)
+        self.backup_table.setSortingEnabled(True)
+        if records:
+            selected_row = next((row for row, record in enumerate(records) if selected_path and Path(record["path"]) == selected_path), 0)
+            self.backup_table.selectRow(selected_row)
+        else: self.backup_details.clear()
+
+    def show_backup_details(self):
+        path = self._selected_backup_path()
+        if not path or not hasattr(self, "backup_details"): return
+        record = next((item for item in getattr(self, "backup_records", []) if Path(item["path"]) == path), None)
+        if not record: return
+        manifest = record.get("manifest")
+        if not manifest:
+            self.backup_details.setPlainText(f"旧格式备份：{path.name}\n状态：{record['status']}\n\n恢复前必须转换为统一 .pwcbackup 并完成 CRC、路径与 SHA-256 校验。")
+            return
+        entries = "\n".join(f"- {entry.component}: {entry.path} ({entry.size_bytes} bytes)" for entry in manifest.entries[:40])
+        if len(manifest.entries) > 40: entries += f"\n... 另有 {len(manifest.entries) - 40} 个文件"
+        text = (
+            f"文件：{path.name}\n包 ID：{manifest.package_id}\n来源平台：{manifest.source_platform}\n来源实例：{manifest.source_instance_name} ({manifest.source_instance_id})\n"
+            f"世界 ID：{manifest.world_id or '未知'}\n游戏版本：{manifest.game_version or '未知'}\n存档格式：{manifest.save_format}\n玩家数量：{manifest.player_count}\n"
+            f"可恢复组件：{', '.join(manifest.components)}\n配置脱敏：{', '.join(manifest.redacted_fields) or '不含配置'}\n完整性：{'信息不完整' if manifest.incomplete else '完整'}\n"
+            f"校验：{record['status']}\n备注：{record.get('note') or '-'}\n\n文件清单：\n{entries}"
+        )
+        self.backup_details.setPlainText(text)
 
     def export_logs(self):
         target, _ = QFileDialog.getSaveFileName(self, "导出日志", str(self.storage.root / "palworld-console.log"), "日志 (*.log);;文本 (*.txt)")
@@ -2145,12 +2455,28 @@ class MainWindow(QMainWindow):
         self._apply_discovery_profile(profile)
         self.append_log("SSH 连接和服务器检测完成")
         self.refresh_status()
+        if profile.get("installed"):
+            selected = self.selected; repository = self._backup_repository(selected); known = tuple(selected.remote_profile.get("scheduled_backups_imported") or ())
+            worker = Worker(lambda: (selected.id, repository.import_remote_scheduled(self._remote_client(), selected, known)))
+            worker.signals.finished.connect(self._scheduled_backups_synced)
+            worker.signals.error.connect(lambda error: self.append_log(f"计划备份同步跳过：{error}"))
+            self.pool.start(worker)
         if profile.get("config_path"):
             client = self._remote_client(); selected = self.selected
             worker = Worker(lambda signals: ServerConfigBootstrap.read_remote(client, selected), with_signals=True)
             worker.signals.finished.connect(lambda result: (self._apply_config_result(result), self.append_log("游戏配置已自动回填")))
             worker.signals.error.connect(lambda e: self.append_log(f"配置自动回填失败：{e}"))
             self.pool.start(worker)
+
+    def _scheduled_backups_synced(self, payload):
+        instance_id, names = payload
+        instance = next((item for item in self.instances if item.id == instance_id), None)
+        if not instance or not names: return
+        existing = list(instance.remote_profile.get("scheduled_backups_imported") or ())
+        instance.remote_profile["scheduled_backups_imported"] = (existing + list(names))[-200:]
+        self.storage.save_instances(self.instances)
+        self.append_log(f"已下载并校验 {len(names)} 个服务器计划备份")
+        if self.selected and self.selected.id == instance_id: self.refresh_backup_list()
 
     def _apply_discovery_profile(self, profile):
         self.selected.remote_profile = profile; self.selected.discovery_status = "ready" if profile.get("platform") in {"linux", "windows"} else "unknown"

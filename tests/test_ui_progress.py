@@ -8,6 +8,7 @@ import pytest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from palworld_console.models import ConfigSyncResult, PlayerRecord, ServerInstance, TaskProgress, UninstallResult
+from palworld_console.backup_packages import BackupPackageService, RestoreTransaction
 import palworld_console.ui as ui_module
 
 
@@ -84,6 +85,53 @@ def test_install_task_locks_and_restores_instance_controls(window, monkeypatch):
     assert window.install_progress.value() == 42
     assert window.install_stage.text() == "安装失败"
     assert window.install_button.isEnabled() is True
+
+
+def test_backup_page_uses_selected_verified_package_and_details(window, tmp_path):
+    window.storage.root = tmp_path / "storage"
+    install = tmp_path / "server"
+    world = install / "Pal" / "Saved" / "SaveGames" / "0" / "WORLD-UI"
+    players = world / "Players"; players.mkdir(parents=True)
+    (world / "Level.sav").write_bytes(b"save")
+    (players / "uid.sav").write_bytes(b"player")
+    window.selected.install_dir = str(install)
+    package = BackupPackageService().create(window.selected, install / "Pal" / "Saved", window._backup_repository().root, "world")
+
+    window.refresh_backup_list()
+
+    assert window.backup_table.columnCount() == 10
+    assert window.backup_table.rowCount() == 1
+    assert window._selected_backup_path() == package
+    assert "WORLD-UI" in window.backup_details.toPlainText()
+    assert "可恢复组件：world" in window.backup_details.toPlainText()
+
+
+def test_restore_dialog_requires_advanced_confirmation_for_incomplete_package(window, tmp_path, monkeypatch):
+    level = tmp_path / "Level.sav"; level.write_bytes(b"not-a-supported-save")
+    package = BackupPackageService().import_source(level, window.selected, tmp_path / "packages")
+    plan = RestoreTransaction().plan(package, window.selected)
+    manifest = BackupPackageService().validate(package)
+    dialog = ui_module.RestoreOptionsDialog(plan, manifest, window)
+    assert dialog.advanced.isVisible() is False or plan.requires_advanced_confirmation is True
+    assert plan.blocked_reason
+    assert dialog.buttons.button(ui_module.QDialogButtonBox.Ok).isEnabled() is False
+    dialog.close()
+
+
+def test_restore_dialog_single_player_is_mutually_exclusive_with_world(window, tmp_path):
+    saved = tmp_path / "server" / "Pal" / "Saved"; world = saved / "SaveGames" / "0" / "WORLD"
+    (world / "Players").mkdir(parents=True); (world / "Level.sav").write_bytes(b"save"); (world / "Players" / "42.sav").write_bytes(b"player")
+    package = BackupPackageService().create(window.selected, saved, tmp_path / "packages")
+    manifest = BackupPackageService().validate(package); plan = RestoreTransaction().plan(package, window.selected)
+    dialog = ui_module.RestoreOptionsDialog(plan, manifest, window, ("42",), (True, "ready"))
+    assert dialog.world.isChecked()
+    dialog.player.setChecked(True)
+    assert dialog.world.isChecked() is False
+    assert dialog.selected_components() == ("player",)
+    assert dialog.selected_player_uid() == "42"
+    dialog.world.setChecked(True)
+    assert dialog.player.isChecked() is False
+    dialog.close()
 
 
 def test_duplicate_install_is_rejected(window, monkeypatch):

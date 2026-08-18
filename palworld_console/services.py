@@ -259,6 +259,17 @@ Get-Service sshd
         finally:
             client.close()
 
+    def upload_file(self, local_path: Path, remote_path: str) -> None:
+        client = self._connect()
+        try:
+            sftp = client.open_sftp()
+            try:
+                sftp.put(str(local_path), self._sftp_path(remote_path))
+            finally:
+                sftp.close()
+        finally:
+            client.close()
+
     def upload_file_atomic(self, local_path: Path, remote_path: str, backup: bool = True) -> str:
         client = self._connect()
         temporary = f"{remote_path}.upload-{uuid.uuid4().hex}"

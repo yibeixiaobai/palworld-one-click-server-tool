@@ -183,6 +183,60 @@ class BackupArtifact:
 
 
 @dataclass(frozen=True)
+class BackupEntry:
+    path: str
+    sha256: str
+    size_bytes: int
+    component: str
+    required: bool = False
+
+
+@dataclass(frozen=True)
+class BackupManifest:
+    schema: str
+    package_id: str
+    backup_type: str
+    source_instance_id: str
+    source_instance_name: str
+    source_platform: str
+    created_at: str
+    world_id: str = ""
+    game_version: str = ""
+    save_format: str = "unknown"
+    components: tuple[str, ...] = ()
+    entries: tuple[BackupEntry, ...] = ()
+    redacted_fields: tuple[str, ...] = ()
+    player_count: int = 0
+    incomplete: bool = False
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class RestorePlan:
+    package_path: str
+    source_instance_id: str
+    target_instance_id: str
+    components: tuple[str, ...]
+    cross_instance: bool = False
+    version_mismatch: bool = False
+    world_mismatch: bool = False
+    requires_advanced_confirmation: bool = False
+    estimated_bytes: int = 0
+    summary: tuple[str, ...] = ()
+    blocked_reason: str = ""
+
+
+@dataclass(frozen=True)
+class RestoreResult:
+    restored: bool
+    package_path: str
+    restore_point: str = ""
+    components: tuple[str, ...] = ()
+    rolled_back: bool = False
+    detail: str = ""
+
+
+@dataclass(frozen=True)
 class PlayerProfile:
     player_uid: str
     name: str = ""

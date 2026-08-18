@@ -175,7 +175,10 @@ if action == "backup":
     except Exception: pass
     target = Path(cfg["backup_dir"]); target.mkdir(parents=True, exist_ok=True)
     archive = target / ("saved-%s.tar.gz" % datetime.now().strftime("%Y%m%d-%H%M%S"))
-    with tarfile.open(archive, "w:gz") as tar: tar.add(saved, arcname="Saved")
+    def include(info):
+        parts = {part.lower() for part in Path(info.name).parts}
+        return None if parts & {"backups", "backup", "logs", "cache", "crashes"} else info
+    with tarfile.open(archive, "w:gz") as tar: tar.add(saved, arcname="Saved", filter=include)
     files = sorted(target.glob("saved-*.tar.gz"), key=lambda p: p.stat().st_mtime, reverse=True)
     for old in files[int(cfg.get("retention", 14)):]: old.unlink()
 elif action == "save": rest("save", {})
