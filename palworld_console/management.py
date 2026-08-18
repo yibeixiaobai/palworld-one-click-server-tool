@@ -258,8 +258,8 @@ class SaveGameService:
     def _write_document(document, path: Path) -> None:
         if isinstance(document, PluginParsedSave):
             patch = document.patch_manifest()
-            if not patch["operations"]:
-                raise ValueError("没有可写回的受支持玩家字段")
+            if not any(patch.get(section) for section in ("players", "pals", "inventory", "guilds", "bases")):
+                raise ValueError("没有可写回的受支持存档字段")
             document.plugin.apply_patch(document.source_path, patch, path)
             document.plugin.verify_roundtrip(path, patch)
             return

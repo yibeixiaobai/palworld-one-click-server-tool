@@ -255,6 +255,10 @@ class ServerInstance:
     whitelist: list[dict[str, Any]] = field(default_factory=list)
     whitelist_policy: str = "log"
     player_history: dict[str, dict[str, Any]] = field(default_factory=dict)
+    mods: list[dict[str, Any]] = field(default_factory=list)
+    mod_environment: dict[str, Any] = field(default_factory=dict)
+    mod_profile: dict[str, Any] = field(default_factory=dict)
+    mod_last_sync: str = ""
     ui_preferences: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

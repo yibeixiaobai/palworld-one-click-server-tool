@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from palworld_console.models import ConfigSyncResult, ServerInstance, TaskProgress, UninstallResult
+from palworld_console.models import ConfigSyncResult, PlayerRecord, ServerInstance, TaskProgress, UninstallResult
 import palworld_console.ui as ui_module
 
 
@@ -203,9 +203,20 @@ def test_uninstall_success_keeps_instance_and_ssh_credentials(window):
 
 
 def test_main_window_exposes_ten_management_pages(window):
-    assert [window.tabs.tabText(i) for i in range(window.tabs.count())] == ["仪表盘", "连接与部署", "游戏配置", "玩家管理", "帕鲁与背包", "公会与基地", "RCON 与自动化", "备份与恢复", "日志与审计", "关于我们"]
+    assert [window.tabs.tabText(i) for i in range(window.tabs.count())] == ["仪表盘", "连接与部署", "游戏配置", "玩家中心", "公会与基地", "模组管理", "RCON 与自动化", "备份与恢复", "日志与审计", "关于我们"]
     assert len(window.ini_fields) >= 60
     assert not hasattr(window, "status_timer")
+
+
+def test_player_center_renders_one_row_for_shared_platform_identity(window):
+    window.current_players = [
+        PlayerRecord(name="Alice", user_id="steam-1", player_uid="100", level=10),
+        PlayerRecord(name="Alice", user_id="steam-1", player_uid="200", level=12),
+    ]
+    window._render_players()
+    assert window.players_table.rowCount() == 1
+    identity = window.players_table.item(0, 0).data(ui_module.Qt.UserRole)
+    assert set(identity["aliases"]) == {"100", "200"}
 
 
 def test_config_preset_updates_fields_without_saving(window):

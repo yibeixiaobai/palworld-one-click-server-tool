@@ -109,11 +109,40 @@ class PlmCodecPlugin:
         payload = self.decode(level_path)
         if expected_patch:
             by_uid = {str(item.get("player_uid")): item for item in payload.get("players", [])}
-            for operation in expected_patch.get("operations", []):
+            invariants = expected_patch.get("invariants", {})
+            expected_uids = {str(uid) for uid in invariants.get("player_uids", [])}
+            if expected_uids and set(by_uid) != expected_uids:
+                raise RuntimeError("写回后玩家 UID 集合发生变化")
+            pal_count = sum(len(player.get("pals", [])) for player in payload.get("players", []))
+            item_count = sum(len(items) for player in payload.get("players", []) for items in (player.get("items") or {}).values())
+            if "pal_count" in invariants and pal_count != int(invariants["pal_count"]):
+                raise RuntimeError("写回后帕鲁数量发生变化")
+            if "inventory_count" in invariants and item_count != int(invariants["inventory_count"]):
+                raise RuntimeError("写回后背包槽位数量发生变化")
+            operations = expected_patch.get("players", expected_patch.get("operations", []))
+            for operation in operations:
                 player = by_uid.get(str(operation.get("player_uid")))
                 if not player: raise RuntimeError(f"写回后找不到玩家 {operation.get('player_uid')}")
                 for key, expected in operation.get("fields", {}).items():
                     if player.get(key) != expected: raise RuntimeError(f"字段验证失败 {key}: {player.get(key)!r} != {expected!r}")
+            by_pal = {str(pal.get("individual_id")): pal for player in payload.get("players", []) for pal in player.get("pals", []) if pal.get("individual_id")}
+            for operation in expected_patch.get("pals", []):
+                pal = by_pal.get(str(operation.get("individual_id")))
+                if not pal: raise RuntimeError(f"写回后找不到帕鲁 {operation.get('individual_id')}")
+                for key, expected in operation.get("fields", {}).items():
+                    if pal.get(key) != expected: raise RuntimeError(f"帕鲁字段验证失败 {key}: {pal.get(key)!r} != {expected!r}")
+            by_item = {}
+            for player in payload.get("players", []):
+                for container_name, items in (player.get("items") or {}).items():
+                    for item in items or []:
+                        identity = (str(player.get("player_uid")), str(item.get("ContainerId") or container_name), int(item.get("SlotIndex") or 0))
+                        by_item[identity] = item
+            for operation in expected_patch.get("inventory", []):
+                identity = (str(operation.get("player_uid")), str(operation.get("container_id")), int(operation.get("slot_index") or 0))
+                item = by_item.get(identity)
+                if not item: raise RuntimeError(f"写回后找不到背包槽位 {identity[1]}:{identity[2]}")
+                for key, expected in operation.get("fields", {}).items():
+                    if item.get(key) != expected: raise RuntimeError(f"背包字段验证失败 {key}: {item.get(key)!r} != {expected!r}")
         return payload
 
     def _run_checked(self, command: list[str], on_log: Callable[[str], None], stage: str) -> None:
@@ -275,18 +304,46 @@ class PluginParsedSave:
         return cls(payload, source, copy.deepcopy(payload), plugin)
 
     def patch_manifest(self) -> dict[str, Any]:
-        """Return only supported player changes; reject arbitrary object writes."""
+        """Build a stable-identity patch; unknown and index-only objects remain read-only."""
         allowed = {"nickname", "level", "exp", "hp", "shield_hp", "full_stomach", "status_point"}
+        pal_allowed = {"nickname", "level", "exp", "workspeed", "melee", "ranged", "defense", "rank", "skills"}
         before = {str(item.get("player_uid")): item for item in self.original.get("players", [])}
-        operations = []
+        players = []
+        pals = []
+        inventory = []
         for player in self.properties.get("players", []):
             uid = str(player.get("player_uid") or "")
             if not uid or uid not in before:
                 continue
             fields = {key: player.get(key) for key in allowed if player.get(key) != before[uid].get(key)}
             if fields:
-                operations.append({"player_uid": uid, "fields": fields})
-        return {"format": "palworld-console-player-patch-v1", "operations": operations}
+                players.append({"player_uid": uid, "fields": fields})
+            old_pals = {str(pal.get("individual_id") or ""): pal for pal in before[uid].get("pals", []) if pal.get("individual_id")}
+            for pal in player.get("pals", []):
+                individual_id = str(pal.get("individual_id") or "")
+                if not individual_id or individual_id not in old_pals:
+                    continue
+                changed = {key: pal.get(key) for key in pal_allowed if pal.get(key) != old_pals[individual_id].get(key)}
+                if changed:
+                    pals.append({"individual_id": individual_id, "owner_uid": uid, "fields": changed})
+            old_items = {}
+            for container, items in (before[uid].get("items") or {}).items():
+                for item in items or []:
+                    stable_container = str(item.get("ContainerId") or container)
+                    old_items[(stable_container, int(item.get("SlotIndex") or 0))] = item
+            for container, items in (player.get("items") or {}).items():
+                for item in items or []:
+                    identity = (str(item.get("ContainerId") or container), int(item.get("SlotIndex") or 0))
+                    old = old_items.get(identity)
+                    if old and item.get("StackCount") != old.get("StackCount"):
+                        inventory.append({"player_uid": uid, "container_id": identity[0], "slot_index": identity[1], "fields": {"StackCount": item.get("StackCount")}})
+        original_players = self.original.get("players", [])
+        invariants = {
+            "player_uids": sorted(str(player.get("player_uid")) for player in original_players if player.get("player_uid")),
+            "pal_count": sum(len(player.get("pals", [])) for player in original_players),
+            "inventory_count": sum(len(items) for player in original_players for items in (player.get("items") or {}).values()),
+        }
+        return {"format": "palworld-console-save-patch-v2", "players": players, "pals": pals, "inventory": inventory, "guilds": [], "bases": [], "invariants": invariants}
 
 
 PLM_HELPER = r'''from __future__ import annotations
@@ -339,7 +396,7 @@ def player_items(level_path,raw_uid,containers):
         for slot in containers.get(cid,[]):
             raw=slot.get("RawData",{}).get("value")
             if not raw or not raw.get("item",{}).get("static_id"):continue
-            result[key].append({"SlotIndex":int(raw.get("slot_index",0)),"ItemId":str(raw["item"]["static_id"]).lower(),"StackCount":int(raw.get("count",0))})
+            result[key].append({"ContainerId":cid,"SlotIndex":int(raw.get("slot_index",0)),"ItemId":str(raw["item"]["static_id"]).lower(),"StackCount":int(raw.get("count",0))})
     return result
 def decode(path):
     gvas,save_type,world=load(path); players=[]; pals=[]; containers=item_index(world)
@@ -348,7 +405,7 @@ def decode(path):
         if sp.get("IsPlayer",{}).get("value"):
             players.append({"player_uid":uid,"nickname":sp.get("NickName",{}).get("value","") ,"level":byte_value(sp.get("Level"),1),"exp":int(sp.get("Exp",{}).get("value",0)),"hp":fixed_value(sp.get("Hp")),"shield_hp":fixed_value(sp.get("ShieldHP")),"full_stomach":round(float(sp.get("FullStomach",{}).get("value",0)),2),"status_point":{x["StatusName"]["value"]:x["StatusPoint"]["value"] for x in sp.get("GotStatusPointList",{}).get("value",{}).get("values",[])},"pals":[],"items":player_items(path,raw_uid,containers)})
         elif sp.get("OwnerPlayerUId"):
-            pals.append({"owner":uid_text(sp["OwnerPlayerUId"]["value"]),"nickname":sp.get("NickName",{}).get("value","") ,"level":byte_value(sp.get("Level"),1),"exp":int(sp.get("Exp",{}).get("value",0)),"type":sp.get("CharacterID",{}).get("value",""),"gender":str(sp.get("Gender",{}).get("value",{}).get("value","Unknown")).split("::")[-1],"is_lucky":bool(sp.get("IsRarePal",{}).get("value",False)),"workspeed":byte_value(sp.get("CraftSpeed"),0),"melee":byte_value(sp.get("Talent_HP"),0),"ranged":byte_value(sp.get("Talent_Shot"),0),"defense":byte_value(sp.get("Talent_Defense"),0),"rank":byte_value(sp.get("Rank"),1),"rank_attack":byte_value(sp.get("Rank_Attack"),0),"rank_defence":byte_value(sp.get("Rank_Defence"),0),"rank_craftspeed":byte_value(sp.get("Rank_CraftSpeed"),0),"skills":sp.get("PassiveSkillList",{}).get("value",{}).get("values",[])})
+            pals.append({"individual_id":str(entry["key"].get("InstanceId",{}).get("value","")).lower(),"owner":uid_text(sp["OwnerPlayerUId"]["value"]),"nickname":sp.get("NickName",{}).get("value","") ,"level":byte_value(sp.get("Level"),1),"exp":int(sp.get("Exp",{}).get("value",0)),"type":sp.get("CharacterID",{}).get("value",""),"gender":str(sp.get("Gender",{}).get("value",{}).get("value","Unknown")).split("::")[-1],"is_lucky":bool(sp.get("IsRarePal",{}).get("value",False)),"workspeed":byte_value(sp.get("CraftSpeed"),0),"melee":byte_value(sp.get("Talent_HP"),0),"ranged":byte_value(sp.get("Talent_Shot"),0),"defense":byte_value(sp.get("Talent_Defense"),0),"rank":byte_value(sp.get("Rank"),1),"rank_attack":byte_value(sp.get("Rank_Attack"),0),"rank_defence":byte_value(sp.get("Rank_Defence"),0),"rank_craftspeed":byte_value(sp.get("Rank_CraftSpeed"),0),"skills":sp.get("PassiveSkillList",{}).get("value",{}).get("values",[])})
     by_uid={p["player_uid"]:p for p in players}
     for pal in pals:
         owner=pal.pop("owner","")
@@ -364,23 +421,39 @@ def set_byte(prop,value):
     else: prop["value"]=int(value)
 def set_fixed(prop,value): prop["value"]["Value"]["value"]=int(value)
 def patch(level,manifest,output):
-    gvas,save_type,world=load(level); operations={str(x["player_uid"]):x.get("fields",{}) for x in manifest.get("operations",[])}
+    gvas,save_type,world=load(level); operations={str(x["player_uid"]):x.get("fields",{}) for x in manifest.get("players",manifest.get("operations",[]))}
+    pal_operations={str(x["individual_id"]).lower():x.get("fields",{}) for x in manifest.get("pals",[])}
+    item_operations={(str(x["container_id"]),int(x["slot_index"])):x.get("fields",{}) for x in manifest.get("inventory",[])}
     found=set()
     for entry in world.get("CharacterSaveParameterMap",{}).get("value",[]):
         uid=uid_text(entry["key"].get("PlayerUId",{}).get("value")); sp=save_parameter(entry)
-        if not sp.get("IsPlayer",{}).get("value") or uid not in operations:continue
-        found.add(uid); fields=operations[uid]
-        if "nickname" in fields: sp["NickName"]["value"]=str(fields["nickname"])
-        if "level" in fields: set_byte(sp["Level"],fields["level"])
-        if "exp" in fields: sp["Exp"]["value"]=int(fields["exp"])
-        if "hp" in fields: set_fixed(sp["Hp"],fields["hp"])
-        if "shield_hp" in fields: set_fixed(sp["ShieldHP"],fields["shield_hp"])
-        if "full_stomach" in fields: sp["FullStomach"]["value"]=float(fields["full_stomach"])
-        if "status_point" in fields:
-            wanted=fields["status_point"]
-            for item in sp.get("GotStatusPointList",{}).get("value",{}).get("values",[]):
-                name=item["StatusName"]["value"]
-                if name in wanted:item["StatusPoint"]["value"]=int(wanted[name])
+        if sp.get("IsPlayer",{}).get("value") and uid in operations:
+            found.add(uid); fields=operations[uid]
+            if "nickname" in fields: sp["NickName"]["value"]=str(fields["nickname"])
+            if "level" in fields: set_byte(sp["Level"],fields["level"])
+            if "exp" in fields: sp["Exp"]["value"]=int(fields["exp"])
+            if "hp" in fields: set_fixed(sp["Hp"],fields["hp"])
+            if "shield_hp" in fields: set_fixed(sp["ShieldHP"],fields["shield_hp"])
+            if "full_stomach" in fields: sp["FullStomach"]["value"]=float(fields["full_stomach"])
+            if "status_point" in fields:
+                wanted=fields["status_point"]
+                for item in sp.get("GotStatusPointList",{}).get("value",{}).get("values",[]):
+                    name=item["StatusName"]["value"]
+                    if name in wanted:item["StatusPoint"]["value"]=int(wanted[name])
+        individual_id=str(entry["key"].get("InstanceId",{}).get("value","")).lower()
+        if individual_id in pal_operations:
+            fields=pal_operations[individual_id]
+            if "nickname" in fields: sp["NickName"]["value"]=str(fields["nickname"])
+            if "level" in fields:set_byte(sp["Level"],fields["level"])
+            if "exp" in fields:sp["Exp"]["value"]=int(fields["exp"])
+            for key,prop in (("workspeed","CraftSpeed"),("melee","Talent_HP"),("ranged","Talent_Shot"),("defense","Talent_Defense"),("rank","Rank")):
+                if key in fields:set_byte(sp[prop],fields[key])
+            if "skills" in fields:sp["PassiveSkillList"]["value"]["values"]=list(fields["skills"])
+    for container in world.get("ItemContainerSaveData",{}).get("value",[]):
+        cid=str(container["key"]["ID"]["value"])
+        for slot in container["value"]["Slots"]["value"].get("values",[]):
+            raw=slot.get("RawData",{}).get("value") or {}; identity=(cid,int(raw.get("slot_index",0)))
+            if identity in item_operations and "StackCount" in item_operations[identity]:raw["count"]=int(item_operations[identity]["StackCount"])
     missing=set(operations)-found
     if missing:raise RuntimeError("players not found: "+",".join(sorted(missing)))
     output_data=compress_gvas_to_sav(gvas.write(PALWORLD_CUSTOM_PROPERTIES),save_type); Path(output).write_bytes(output_data)

@@ -1,7 +1,7 @@
 import json
 
 from palworld_console.models import PlayerRecord, ServerInstance
-from palworld_console.player_store import PlayerRepository
+from palworld_console.player_store import PlayerIdentityService, PlayerRepository
 
 
 def test_player_repository_migrates_history_and_retains_missing_players(tmp_path):
@@ -27,4 +27,15 @@ def test_online_overlay_persists_only_masked_ip_and_is_idempotent(tmp_path):
     assert json.loads(detail["masked_ips"]) == ["203.0.113.*"]
     assert "203.0.113.42" not in (tmp_path / "players.db").read_bytes().decode("latin1")
     assert repository.list_players("server-1")[0].online is True
+    repository.close()
+
+
+def test_identity_service_deduplicates_exact_uid_and_groups_shared_user_id(tmp_path):
+    duplicate = [PlayerRecord(name="Alice", user_id="steam-1", player_uid="100", level=5), PlayerRecord(name="Alice", user_id="steam-1", player_uid="100", level=6)]
+    assert len(PlayerIdentityService.deduplicate_online(duplicate)) == 1
+    repository = PlayerRepository(tmp_path / "players.db")
+    repository.overlay_online("server-1", [PlayerRecord(name="Alice A", user_id="steam-1", player_uid="100"), PlayerRecord(name="Alice B", user_id="steam-1", player_uid="200")])
+    groups = repository.list_identity_groups("server-1")
+    assert len(groups) == 1
+    assert set(groups[0].aliases) == {"100", "200"}
     repository.close()

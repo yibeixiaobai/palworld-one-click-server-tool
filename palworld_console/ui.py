@@ -14,8 +14,10 @@ from .config_ini import coerce_setting_value
 from .models import ConfigSyncResult, GuildSummary, PlayerRecord, ServerHealthSnapshot, ServerInstance, TaskProgress, UninstallResult, ScheduleDefinition
 from .services import BackupService, FirewallService, GuildSnapshotService, LocalServerLifecycle, NetworkDiagnostics, PalworldRestClient, PlayerAdminService, RemoteHostClient, RemoteServerInspector, RemoteServerLifecycle, ServerConfigBootstrap, ServerDiagnostics, SSHTunnelManager, SteamCmdInstaller, WindowsShortcutService
 from .management import AuditService, AutomationService, HostTaskDeployer, RconClient, SaveGameService, WhitelistService
-from .player_store import PlayerRepository
+from .player_store import PlayerIdentityGroup, PlayerIdentityService, PlayerRepository
 from .save_codec import PALWORLD_SAVE_TOOLS_COMMIT, PlmCodecPlugin, PluginParsedSave
+from .save_fields import CONTAINER_LABELS, display_field, resolve_path, validate_value
+from .mod_manager import LocalArchiveProvider, LocalPakProvider, ModEnvironment, ModManager, ModManifest, WorkshopProvider
 from .settings_schema import CATEGORIES, PRESETS, SETTING_BY_KEY, SETTING_DEFINITIONS
 from .storage import AppStorage
 
@@ -64,6 +66,7 @@ class MainWindow(QMainWindow):
         self.rest_tunnel: SSHTunnelManager | None = None
         self.rcon_tunnel: SSHTunnelManager | None = None
         self.current_players: list[PlayerRecord] = []
+        self.current_player_groups: list[PlayerIdentityGroup] = []
         self.current_guilds: list[GuildSummary] = []
         self.config_original: dict[str, object] = {}
         self.ui_signals = UiSignals()
@@ -96,8 +99,8 @@ class MainWindow(QMainWindow):
         self.navigation = QListWidget(); self.navigation.setObjectName("pageNavigation"); self.navigation.setFixedWidth(172); page_layout.addWidget(self.navigation)
         self.page_stack = QStackedWidget(); page_layout.addWidget(self.page_stack, 1); right_layout.addWidget(page_area)
         self.tabs = QTabWidget(); self.tabs.hide()
-        self.dashboard = self._dashboard_tab(); self.connection = self._connection_tab(); self.config = self._game_config_tab(); self.players_page = self._players_tab(); self.pals_page = self._pals_tab(); self.guilds_page = self._guilds_tab(); self.automation_page = self._automation_tab(); self.backups_page = self._backup_tab(); self.ops = self._ops_tab(); self.about_page = self._about_tab()
-        pages = ((self.dashboard, "仪表盘"), (self.connection, "连接与部署"), (self.config, "游戏配置"), (self.players_page, "玩家管理"), (self.pals_page, "帕鲁与背包"), (self.guilds_page, "公会与基地"), (self.automation_page, "RCON 与自动化"), (self.backups_page, "备份与恢复"), (self.ops, "日志与审计"), (self.about_page, "关于我们"))
+        self.dashboard = self._dashboard_tab(); self.connection = self._connection_tab(); self.config = self._game_config_tab(); self.players_page = self._players_tab(); self.guilds_page = self._guilds_tab(); self.mods_page = self._mods_tab(); self.automation_page = self._automation_tab(); self.backups_page = self._backup_tab(); self.ops = self._ops_tab(); self.about_page = self._about_tab()
+        pages = ((self.dashboard, "仪表盘"), (self.connection, "连接与部署"), (self.config, "游戏配置"), (self.players_page, "玩家中心"), (self.guilds_page, "公会与基地"), (self.mods_page, "模组管理"), (self.automation_page, "RCON 与自动化"), (self.backups_page, "备份与恢复"), (self.ops, "日志与审计"), (self.about_page, "关于我们"))
         for page, title in pages:
             self.tabs.addTab(QWidget(), title); self.navigation.addItem(title); self.page_stack.addWidget(page)
         self.navigation.currentRowChanged.connect(self.page_stack.setCurrentIndex); self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex); self.navigation.setCurrentRow(0)
@@ -205,34 +208,47 @@ class MainWindow(QMainWindow):
         self.config_diff_label = QLabel("尚无修改"); self.config_diff_label.setWordWrap(True); layout.addWidget(self.config_diff_label); return outer
 
     def _players_tab(self):
-        w = QWidget(); l = QVBoxLayout(w); controls = QHBoxLayout(); self.player_search = QLineEdit(); self.player_search.setPlaceholderText("搜索玩家、平台账号或 UID"); self.player_search.textChanged.connect(self._render_players); controls.addWidget(self.player_search)
+        w = QWidget(); l = QVBoxLayout(w); controls = QHBoxLayout(); self.player_search = QLineEdit(); self.player_search.setPlaceholderText("搜索玩家、平台账号或关联 UID"); self.player_search.textChanged.connect(self._render_players); controls.addWidget(self.player_search)
         self.player_state_filter = QComboBox(); self.player_state_filter.addItem("全部状态", "all"); self.player_state_filter.addItem("在线", "online"); self.player_state_filter.addItem("离线", "offline"); self.player_state_filter.addItem("存档缺失", "missing"); self.player_state_filter.currentIndexChanged.connect(self._render_players); controls.addWidget(self.player_state_filter)
-        for text, handler in (("刷新在线状态", self.refresh_players), ("同步完整存档", self.load_save_snapshot), ("广播", self.broadcast), ("踢出", self.kick_player), ("封禁", self.ban_player), ("按 ID 解封", self.unban_player)): b=QPushButton(text); b.clicked.connect(handler); controls.addWidget(b)
+        for text, handler in (("刷新在线状态", self.refresh_players), ("同步完整存档", self.load_save_snapshot)): b=QPushButton(text); b.clicked.connect(handler); controls.addWidget(b)
         l.addLayout(controls); split = QSplitter(Qt.Horizontal)
-        self.players_table = QTableWidget(0, 9); self.players_table.setHorizontalHeaderLabels(["状态", "玩家", "账号", "用户 ID", "玩家 UID", "等级", "经验", "最后出现", "存档"]); self.players_table.setAlternatingRowColors(True); self.players_table.setSortingEnabled(True); self.players_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.players_table.horizontalHeader().setStretchLastSection(True); self.players_table.currentCellChanged.connect(self._show_player_detail); split.addWidget(self.players_table)
-        detail = QWidget(); dl = QVBoxLayout(detail); self.player_detail_title = QLabel("选择玩家查看永久档案"); self.player_detail_title.setStyleSheet("font-size:16px;font-weight:650;"); dl.addWidget(self.player_detail_title); self.player_detail_text = QPlainTextEdit(); self.player_detail_text.setReadOnly(True); dl.addWidget(self.player_detail_text)
-        note_row = QHBoxLayout(); self.player_note = QLineEdit(); self.player_note.setPlaceholderText("玩家备注"); note_row.addWidget(self.player_note); note_button = QPushButton("保存备注"); note_button.clicked.connect(self.save_player_note); note_row.addWidget(note_button); edit_button = QPushButton("编辑玩家等级/属性"); edit_button.clicked.connect(self.edit_selected_player); note_row.addWidget(edit_button); dl.addLayout(note_row); split.addWidget(detail); split.setSizes([760, 360]); l.addWidget(split); return w
-
-    def _pals_tab(self):
-        w = QWidget(); l = QVBoxLayout(w)
-        plugin = QGroupBox("PlM/Oodle 存档插件"); pl = QHBoxLayout(plugin); self.plm_plugin_status = QLabel("正在检测插件状态"); self.plm_plugin_status.setWordWrap(True); pl.addWidget(self.plm_plugin_status, 1); install_plugin = QPushButton("安装/修复 PlM 插件"); install_plugin.clicked.connect(self.install_plm_plugin); pl.addWidget(install_plugin); l.addWidget(plugin)
-        row = QHBoxLayout(); self.save_path_label = QLabel("尚未载入 Level.sav"); row.addWidget(self.save_path_label); row.addStretch()
-        load = QPushButton("载入存档副本"); load.clicked.connect(self.load_save_snapshot); row.addWidget(load)
-        validate = QPushButton("验证存档"); validate.clicked.connect(self.validate_save_snapshot); row.addWidget(validate)
-        apply_btn = QPushButton("应用高级修改"); apply_btn.clicked.connect(self.apply_save_changes); apply_btn.setStyleSheet("color:#b42318;"); row.addWidget(apply_btn); l.addLayout(row)
-        notice = QLabel("PlM1 使用结构化玩家补丁，只允许已验证字段。写回必须停服、完整备份、二次解析并通过健康检查；插件不可用时自动保持只读。")
-        notice.setWordWrap(True); l.addWidget(notice)
-        search_row = QHBoxLayout(); self.save_scope = QComboBox(); self.save_scope.addItem("全部对象", "all"); self.save_scope.addItem("玩家字段", "player"); self.save_scope.addItem("帕鲁字段", "pal"); self.save_scope.addItem("背包与容器", "inventory"); self.save_scope.addItem("公会与基地", "guild"); self.save_scope.currentIndexChanged.connect(self._render_save_fields); search_row.addWidget(self.save_scope)
-        self.save_search = QLineEdit(); self.save_search.setPlaceholderText("搜索对象路径、玩家 UID、物品或帕鲁字段"); self.save_search.textChanged.connect(self._render_save_fields); search_row.addWidget(self.save_search)
-        self.save_changed_only = QCheckBox("仅看已修改"); self.save_changed_only.toggled.connect(self._render_save_fields); search_row.addWidget(self.save_changed_only); l.addLayout(search_row)
-        self.save_fields_table = QTableWidget(0, 3); self.save_fields_table.setHorizontalHeaderLabels(["对象路径", "原始值", "修改值"]); self.save_fields_table.setAlternatingRowColors(True); self.save_fields_table.setSortingEnabled(False); self.save_fields_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch); self.save_fields_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents); l.addWidget(self.save_fields_table)
-        self.save_document = None; self.save_scalar_values = {}; self.save_working_path = None
-        self._refresh_plm_plugin_status()
-        return w
+        self.players_table = QTableWidget(0, 6); self.players_table.setHorizontalHeaderLabels(["状态", "玩家", "平台账号", "等级", "最后出现", "存档"]); self.players_table.setAlternatingRowColors(True); self.players_table.setSortingEnabled(True); self.players_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.players_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.players_table.horizontalHeader().setStretchLastSection(True); self.players_table.currentCellChanged.connect(self._show_player_detail); split.addWidget(self.players_table)
+        detail = QWidget(); dl = QVBoxLayout(detail)
+        title_row = QHBoxLayout(); self.player_detail_title = QLabel("选择玩家查看永久档案"); self.player_detail_title.setStyleSheet("font-size:16px;font-weight:650;"); title_row.addWidget(self.player_detail_title); title_row.addStretch(); self.pending_save_label = QLabel("未保存修改 0 项"); title_row.addWidget(self.pending_save_label); dl.addLayout(title_row)
+        plugin_row = QHBoxLayout(); self.plm_plugin_status = QLabel("正在检测 PlM1/Oodle 插件"); self.plm_plugin_status.setWordWrap(True); plugin_row.addWidget(self.plm_plugin_status, 1); install_plugin = QPushButton("安装/修复插件"); install_plugin.clicked.connect(self.install_plm_plugin); plugin_row.addWidget(install_plugin); dl.addLayout(plugin_row)
+        self.player_detail_tabs = QTabWidget(); dl.addWidget(self.player_detail_tabs, 1)
+        overview = QWidget(); overview_l = QVBoxLayout(overview); self.player_detail_text = QPlainTextEdit(); self.player_detail_text.setReadOnly(True); overview_l.addWidget(self.player_detail_text); note_row = QHBoxLayout(); self.player_note = QLineEdit(); self.player_note.setPlaceholderText("玩家备注"); note_row.addWidget(self.player_note); note_button = QPushButton("保存备注"); note_button.clicked.connect(self.save_player_note); note_row.addWidget(note_button); overview_l.addLayout(note_row); self.player_detail_tabs.addTab(overview, "概览")
+        attributes = QWidget(); al = QVBoxLayout(attributes); attr_tools = QHBoxLayout(); self.save_path_label = QLabel("尚未同步 Level.sav"); attr_tools.addWidget(self.save_path_label, 1); validate = QPushButton("验证存档"); validate.clicked.connect(self.validate_save_snapshot); attr_tools.addWidget(validate); al.addLayout(attr_tools)
+        self.save_scope = QComboBox(); self.save_scope.addItem("玩家属性", "player"); self.save_scope.addItem("全部可识别字段", "all"); self.save_scope.currentIndexChanged.connect(self._render_save_fields); self.save_search = QLineEdit(); self.save_search.setPlaceholderText("搜索中文字段或当前值"); self.save_search.textChanged.connect(self._render_save_fields); self.save_changed_only = QCheckBox("仅看已修改"); self.save_changed_only.toggled.connect(self._render_save_fields); filter_row = QHBoxLayout(); filter_row.addWidget(self.save_scope); filter_row.addWidget(self.save_search, 1); filter_row.addWidget(self.save_changed_only); al.addLayout(filter_row)
+        self.save_fields_table = QTableWidget(0, 7); self.save_fields_table.setHorizontalHeaderLabels(["对象", "中文字段", "当前值", "修改值", "来源", "状态", "风险"]); self.save_fields_table.setAlternatingRowColors(True); self.save_fields_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch); self.save_fields_table.itemChanged.connect(self._save_edit_changed); al.addWidget(self.save_fields_table); self.player_detail_tabs.addTab(attributes, "玩家属性")
+        pals = QWidget(); pal_l = QVBoxLayout(pals); self.player_pals_table = QTableWidget(0, 7); self.player_pals_table.setHorizontalHeaderLabels(["帕鲁", "昵称", "等级", "经验", "性别", "星级", "稳定 ID"]); self.player_pals_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_pals_table.horizontalHeader().setStretchLastSection(True); pal_l.addWidget(self.player_pals_table); self.player_detail_tabs.addTab(pals, "帕鲁")
+        inventory = QWidget(); inv_l = QVBoxLayout(inventory); self.player_inventory_table = QTableWidget(0, 5); self.player_inventory_table.setHorizontalHeaderLabels(["容器", "槽位", "物品", "物品 ID", "数量"]); self.player_inventory_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_inventory_table.horizontalHeader().setStretchLastSection(True); inv_l.addWidget(self.player_inventory_table); self.player_detail_tabs.addTab(inventory, "背包")
+        relations = QWidget(); rel_l = QVBoxLayout(relations); self.player_relations_text = QPlainTextEdit(); self.player_relations_text.setReadOnly(True); rel_l.addWidget(self.player_relations_text); self.player_detail_tabs.addTab(relations, "公会与基地")
+        operations = QWidget(); op_l = QVBoxLayout(operations); operation_row = QHBoxLayout();
+        for text, handler in (("广播", self.broadcast), ("踢出", self.kick_player), ("封禁", self.ban_player), ("按 ID 解封", self.unban_player), ("保存世界", self.rest_save)): b=QPushButton(text); b.clicked.connect(handler); operation_row.addWidget(b)
+        operation_row.addStretch(); op_l.addLayout(operation_row); op_l.addWidget(QLabel("踢出、封禁和存档写回会记录审计；高风险写回必须输入实例名称与操作原因。")); op_l.addStretch(); self.player_detail_tabs.addTab(operations, "管理操作")
+        save_actions = QHBoxLayout(); preview = QPushButton("预览差异"); preview.clicked.connect(self.preview_save_changes); save_actions.addWidget(preview); revert = QPushButton("撤销修改"); revert.clicked.connect(self.revert_save_changes); save_actions.addWidget(revert); apply_btn = QPushButton("保存到服务器"); apply_btn.clicked.connect(self.apply_save_changes); apply_btn.setStyleSheet("color:#b42318;"); save_actions.addWidget(apply_btn); save_actions.addStretch(); dl.addLayout(save_actions)
+        split.addWidget(detail); split.setSizes([390, 700]); l.addWidget(split); self.save_document = None; self.save_scalar_values = {}; self.save_working_path = None; self._refresh_plm_plugin_status(); return w
 
     def _guilds_tab(self):
         w = QWidget(); l = QVBoxLayout(w); row = QHBoxLayout(); refresh = QPushButton("刷新公会与基地"); refresh.clicked.connect(self.refresh_guilds); row.addWidget(refresh); row.addWidget(QLabel("在线数据来自官方接口；改名、转移、合并和删除通过停服存档事务执行。")); row.addStretch(); l.addLayout(row)
         self.guilds_table = QTableWidget(0, 7); self.guilds_table.setHorizontalHeaderLabels(["公会", "公会 ID", "成员", "在线", "平均等级", "基地", "帕鲁"]); self.guilds_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.guilds_table.horizontalHeader().setStretchLastSection(True); l.addWidget(self.guilds_table); self.guild_members = QPlainTextEdit(); self.guild_members.setReadOnly(True); self.guild_members.setMaximumHeight(100); l.addWidget(self.guild_members); self.guilds_table.currentCellChanged.connect(self._show_guild_members); return w
+
+    def _mods_tab(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        environment = QGroupBox("服务端模组环境"); el = QGridLayout(environment)
+        self.mod_environment_status = QLabel("尚未检测"); self.mod_environment_status.setWordWrap(True); el.addWidget(QLabel("环境"), 0, 0); el.addWidget(self.mod_environment_status, 0, 1)
+        self.mod_paths_status = QLabel("Workshop / Mods / 配置路径：-"); self.mod_paths_status.setWordWrap(True); el.addWidget(QLabel("路径"), 1, 0); el.addWidget(self.mod_paths_status, 1, 1)
+        detect = QPushButton("检测环境"); detect.clicked.connect(self.detect_mod_environment); el.addWidget(detect, 0, 2, 2, 1); l.addWidget(environment)
+        actions = QGridLayout()
+        for index, (text, handler) in enumerate((("安装 Workshop 模组", self.import_workshop_mod), ("导入本地 ZIP", self.import_zip_mod), ("导入 PAK", self.import_pak_mod), ("启用", self.enable_selected_mod), ("禁用", self.disable_selected_mod), ("更新/修复", self.repair_selected_mod), ("移除", self.remove_selected_mod), ("回滚上次变更", self.rollback_last_mod_change), ("导出清单", self.export_mod_manifest))):
+            button = QPushButton(text); button.clicked.connect(handler); actions.addWidget(button, index // 5, index % 5)
+        actions.setColumnStretch(4, 1); l.addLayout(actions)
+        split = QSplitter(Qt.Horizontal)
+        self.mods_table = QTableWidget(0, 9); self.mods_table.setHorizontalHeaderLabels(["状态", "名称", "PackageName", "版本", "类型", "服务器兼容", "依赖", "冲突", "校验"]); self.mods_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.mods_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.mods_table.horizontalHeader().setStretchLastSection(True); self.mods_table.currentCellChanged.connect(self._show_mod_detail); split.addWidget(self.mods_table)
+        detail = QWidget(); dl = QVBoxLayout(detail); self.mod_detail_title = QLabel("选择模组查看详情"); self.mod_detail_title.setStyleSheet("font-size:16px;font-weight:650;"); dl.addWidget(self.mod_detail_title); self.mod_detail_text = QPlainTextEdit(); self.mod_detail_text.setReadOnly(True); dl.addWidget(self.mod_detail_text); self.mod_config_preview = QPlainTextEdit(); self.mod_config_preview.setReadOnly(True); self.mod_config_preview.setPlaceholderText("PalModSettings.ini 启用列表预览"); self.mod_config_preview.setMaximumHeight(120); dl.addWidget(self.mod_config_preview); split.addWidget(detail); split.setSizes([760, 360]); l.addWidget(split)
+        warning = QLabel("原生 Linux Dedicated Server 不支持官方服务端模组。仅在检测到 Wine、PalServer.exe、Wine systemd 启动命令及可写目录后，才启用实验性 Wine 模式。所有部署都应先停服并备份。")
+        warning.setWordWrap(True); l.addWidget(warning); return w
 
     def _automation_tab(self):
         w = QWidget(); l = QVBoxLayout(w)
@@ -279,7 +295,7 @@ class MainWindow(QMainWindow):
         form.addRow("PySide6", QLabel(qt_version)); form.addRow("数据目录", QLabel(str(self.storage.root))); form.addRow("备份目录", QLabel(str(self.storage.root / "backups"))); l.addWidget(info)
         privacy = QLabel("隐私与安全：SSH 密码、私钥口令和管理密码保存在 Windows Credential Manager；实例 JSON、日志和计划任务不保存凭据明文。远程 REST 与 RCON 默认仅通过 SSH 隧道访问。")
         privacy.setWordWrap(True); l.addWidget(privacy)
-        credits = QGroupBox("开源致谢与许可证"); cl = QVBoxLayout(credits); credit_text = QLabel("PySide6 · Paramiko · keyring · requests\nPlM 插件按需从固定提交构建，与主程序隔离。上游组件包含 Apache-2.0、GPL-3.0-or-later 及 Oodle 压缩源码授权警告，程序不随安装包再分发相关源码或二进制。\n功能流程参考 palworld-server-tool；本程序不包含地图功能，也不复制其界面或素材。"); credit_text.setWordWrap(True); cl.addWidget(credit_text); l.addWidget(credits); l.addStretch(); return w
+        credits = QGroupBox("开源致谢与许可证"); cl = QVBoxLayout(credits); credit_text = QLabel("PySide6 · Paramiko · keyring · requests\nPlM 插件按需从固定提交构建，与主程序隔离。上游组件包含 Apache-2.0、GPL-3.0-or-later 及 Oodle 压缩源码授权警告，程序不随安装包再分发相关源码或二进制。\n功能流程参考 palworld-server-tool；本程序不包含地图功能，也不复制其界面或素材。\n模组系统遵循官方 Windows Dedicated Server 安装规则；原生 Linux 不标记为支持，Linux Wine 功能属于实验模式，变更前必须备份并通过健康检查。"); credit_text.setWordWrap(True); cl.addWidget(credit_text); l.addWidget(credits); l.addStretch(); return w
 
     def _refresh_instances(self):
         self.instance_list.clear(); self.instance_list.addItems([f"{i.name}  ({'本机' if i.kind == 'local' else '远程'})" for i in self.instances])
@@ -288,10 +304,10 @@ class MainWindow(QMainWindow):
     def select_instance(self, row: int):
         if row < 0 or row >= len(self.instances): return
         self._close_rest_tunnel()
-        self.current_players = self.player_repository.list_players(self.instances[row].id); self.current_guilds = []
+        self.current_players = self.player_repository.list_players(self.instances[row].id); self.current_player_groups = self.player_repository.list_identity_groups(self.instances[row].id); self.current_guilds = []
         self.selected = self.instances[row]; self.title.setText(self.selected.name); self.name_edit.setText(self.selected.name); self.kind_combo.setCurrentIndex(0 if self.selected.kind == "local" else 1); self.path_edit.setText(self.selected.install_dir); self.host_edit.setText(self.selected.host); self.user_edit.setText(self.selected.remote_username); self.ssh_port_spin.setValue(self.selected.ssh_port); self.auth_combo.setCurrentIndex(0 if self.selected.ssh_auth_type == "password" else 1); self.key_path_edit.setText(self.selected.ssh_key_path); self.port_spin.setValue(self.selected.game_port); self.rest_edit.setText(self.selected.rest_url); self.rest_password_edit.setText(self.storage.get_secret(self.selected.admin_secret_ref)); self.public_edit.setText(self.selected.public_address); self.config_source_label.setText(f"配置状态：{self.selected.config_source or '尚未同步'}" + ("，需要重启" if self.selected.config_restart_required else "")); self.lifecycle = LocalServerLifecycle(self.selected, self.ui_signals.log.emit) if self.selected.kind == "local" else (self._remote_lifecycle() if self.selected.discovery_status == "ready" else None); self._toggle_remote_fields(); self._show_discovery(); self.refresh_status()
         self._render_players(); self._render_guilds()
-        self._render_schedules(); self._render_whitelist(); self._render_audit(); self.refresh_backup_list()
+        self._render_schedules(); self._render_whitelist(); self._render_audit(); self.refresh_backup_list(); self._render_mods(); self._show_mod_environment()
         self.header_address.setText(f"游戏地址：{self.selected.public_address or self.selected.host}:{self.selected.game_port}")
 
     def add_instance(self):
@@ -899,9 +915,11 @@ class MainWindow(QMainWindow):
 
     def _players_loaded(self, players):
         if not self.selected: return
+        players = PlayerIdentityService.deduplicate_online(players)
         self.player_repository.overlay_online(self.selected.id, players)
         self.current_players = self.player_repository.list_players(self.selected.id)
-        self._render_players(); self._enforce_whitelist(players); self.append_log(f"玩家列表已刷新：{len(players)} 人在线，永久档案 {len(self.current_players)} 人")
+        self.current_player_groups = self.player_repository.list_identity_groups(self.selected.id)
+        self._render_players(); self._enforce_whitelist(players); self.append_log(f"玩家列表已刷新：{len(players)} 个唯一在线身份，玩家中心 {len(self.current_player_groups)} 人")
 
     def _enforce_whitelist(self, players):
         if not self.selected or not self.selected.whitelist: return
@@ -915,42 +933,56 @@ class MainWindow(QMainWindow):
     def _render_players(self, *_args):
         if not hasattr(self, "players_table"): return
         query = self.player_search.text().strip().lower() if hasattr(self, "player_search") else ""; state = self.player_state_filter.currentData() if hasattr(self, "player_state_filter") else "all"
-        rows = [p for p in self.current_players if (not query or query in p.name.lower() or query in p.user_id.lower() or query in p.player_uid.lower() or query in p.account_name.lower()) and (state == "all" or (state == "online" and p.online) or (state == "offline" and not p.online and p.save_status != "missing") or (state == "missing" and p.save_status == "missing"))]
+        self.current_player_groups = PlayerIdentityService.group(self.current_players)
+        rows = [group for group in self.current_player_groups if (not query or query in group.primary.name.lower() or query in group.primary.user_id.lower() or query in group.primary.account_name.lower() or any(query in uid.lower() for uid in group.aliases)) and (state == "all" or (state == "online" and group.primary.online) or (state == "offline" and not group.primary.online and group.primary.save_status != "missing") or (state == "missing" and group.primary.save_status == "missing"))]
         self.players_table.setRowCount(len(rows))
-        for row, player in enumerate(rows):
-            values = ("在线" if player.online else "离线", player.name, player.account_name, player.user_id, player.player_uid, player.level, player.experience, player.last_seen or "-", "缺失" if player.save_status == "missing" else "存在")
-            for column, value in enumerate(values): self.players_table.setItem(row, column, QTableWidgetItem(str(value)))
+        for row, group in enumerate(rows):
+            player = group.primary; values = ("在线" if player.online else "离线", player.name or player.account_name or "未命名玩家", player.account_name or player.user_id, player.level, player.last_seen or "-", "缺失" if player.save_status == "missing" else "存在")
+            identity = {"player_uid": player.player_uid, "user_id": player.user_id, "aliases": list(group.aliases)}
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value)); item.setData(Qt.UserRole, identity); self.players_table.setItem(row, column, item)
 
     def _selected_player_id(self) -> str:
-        row = self.players_table.currentRow(); item = self.players_table.item(row, 3) if row >= 0 else None
-        return item.text() if item else ""
+        row = self.players_table.currentRow(); item = self.players_table.item(row, 0) if row >= 0 else None
+        data = item.data(Qt.UserRole) if item else {}; return str((data or {}).get("user_id") or (data or {}).get("player_uid") or "")
 
     def _selected_player_uid(self) -> str:
-        row = self.players_table.currentRow(); item = self.players_table.item(row, 4) if row >= 0 else None
-        return item.text() if item else ""
+        row = self.players_table.currentRow(); item = self.players_table.item(row, 0) if row >= 0 else None
+        data = item.data(Qt.UserRole) if item else {}; return str((data or {}).get("player_uid") or "")
 
     def _show_player_detail(self, row, _column=0, _previous_row=-1, _previous_column=-1):
         if not self.selected or row < 0: return
-        uid_item = self.players_table.item(row, 4)
+        uid_item = self.players_table.item(row, 0)
         if not uid_item: return
-        detail = self.player_repository.player_detail(self.selected.id, uid_item.text())
+        identity = uid_item.data(Qt.UserRole) or {}; uid = str(identity.get("player_uid") or "")
+        detail = self.player_repository.player_detail(self.selected.id, uid)
         player = detail.get("player", {}); pals = detail.get("pals", []); items = detail.get("items", []); guild = detail.get("guild", {})
-        self.player_detail_title.setText(player.get("nickname") or player.get("account_name") or uid_item.text())
+        self.player_detail_title.setText(player.get("nickname") or player.get("account_name") or uid)
         self.player_note.setText(player.get("note") or "")
         masked_ips = ", ".join(__import__("json").loads(player.get("masked_ips") or "[]")) or "无"
         self.player_detail_text.setPlainText(
-            f"玩家 UID：{uid_item.text()}\n平台用户 ID：{player.get('user_id') or '-'}\n"
+            f"关联角色 UID：{', '.join(identity.get('aliases') or [uid])}\n平台用户 ID：{player.get('user_id') or '-'}\n"
             f"状态：{'在线' if player.get('online') else '离线'} / 存档 {player.get('save_status')}\n"
             f"等级 / 经验：{player.get('level', 0)} / {player.get('experience', 0)}\n"
             f"首次 / 最后出现：{player.get('first_seen') or '-'} / {player.get('last_seen') or '-'}\n"
             f"历史 IP（脱敏）：{masked_ips}\n公会：{guild.get('guild_name') or '-'}\n"
             f"关联帕鲁：{len(pals)} 只\n背包记录：{len(items)} 项"
         )
+        self.player_pals_table.setRowCount(len(pals))
+        for pal_row, pal in enumerate(pals):
+            values = (pal.get("type") or "未知帕鲁", pal.get("nickname") or "-", pal.get("level", 0), pal.get("exp", 0), pal.get("gender", "未知"), pal.get("rank", 0), pal.get("individual_id") or "未检测到稳定 ID")
+            for column, value in enumerate(values): self.player_pals_table.setItem(pal_row, column, QTableWidgetItem(str(value)))
+        self.player_inventory_table.setRowCount(len(items))
+        for item_row, item in enumerate(items):
+            container = str(item.get("container") or ""); values = (CONTAINER_LABELS.get(container, container), item.get("SlotIndex", 0), item.get("ItemName") or item.get("ItemId") or "未知物品", item.get("ItemId") or "-", item.get("StackCount", 0))
+            for column, value in enumerate(values): self.player_inventory_table.setItem(item_row, column, QTableWidgetItem(str(value)))
+        self.player_relations_text.setPlainText(f"公会：{guild.get('guild_name') or '-'}\n公会 ID：{guild.get('guild_id') or '-'}\n身份：{'会长' if guild.get('is_admin') else '成员' if guild else '-'}\n\n公会转移、合并、删除和基地归属修改仅在完整关系校验通过后开放。")
+        self._render_save_fields()
 
     def save_player_note(self):
         if not self.selected or not self._selected_player_uid(): return
         self.player_repository.set_note(self.selected.id, self._selected_player_uid(), self.player_note.text().strip())
-        self.current_players = self.player_repository.list_players(self.selected.id); self._render_players(); self.append_log("玩家备注已保存")
+        self.current_players = self.player_repository.list_players(self.selected.id); self.current_player_groups = self.player_repository.list_identity_groups(self.selected.id); self._render_players(); self.append_log("玩家备注已保存")
 
     def edit_selected_player(self):
         uid = self._selected_player_uid()
@@ -967,9 +999,9 @@ class MainWindow(QMainWindow):
         player_index = players.index(player)
         wanted = {f"players[{player_index}].level": str(level), f"players[{player_index}].exp": str(experience)}
         for row in range(self.save_fields_table.rowCount()):
-            path_item = self.save_fields_table.item(row, 0)
-            if path_item and path_item.text() in wanted:
-                self.save_fields_table.item(row, 2).setText(wanted[path_item.text()])
+            path_item = self.save_fields_table.item(row, 0); path = str(path_item.data(Qt.UserRole) or "") if path_item else ""
+            if path in wanted:
+                self.save_fields_table.item(row, 3).setText(wanted[path])
         self.append_log(f"已暂存玩家 {uid} 的等级/经验修改，尚未写回服务器")
 
     def kick_player(self): self._confirm_player_action("踢出玩家", "kick")
@@ -998,7 +1030,13 @@ class MainWindow(QMainWindow):
         self.run_async(load, self._guilds_loaded)
 
     def _guilds_loaded(self, payload):
-        self.current_players, self.current_guilds = payload; self._render_guilds(); self.append_log(f"公会快照已刷新：{len(self.current_guilds)} 个公会")
+        online_players, self.current_guilds = payload
+        if self.selected:
+            self.player_repository.overlay_online(self.selected.id, online_players)
+            self.current_players = self.player_repository.list_players(self.selected.id)
+            self.current_player_groups = self.player_repository.list_identity_groups(self.selected.id)
+            self._render_players()
+        self._render_guilds(); self.append_log(f"公会快照已刷新：{len(self.current_guilds)} 个公会")
 
     def _render_guilds(self):
         if not hasattr(self, "guilds_table"): return
@@ -1009,6 +1047,204 @@ class MainWindow(QMainWindow):
 
     def _show_guild_members(self, row, _column=0, _previous_row=-1, _previous_column=-1):
         self.guild_members.setPlainText("\n".join(self.current_guilds[row].members) if 0 <= row < len(self.current_guilds) else "")
+
+    def _mod_manager(self) -> ModManager:
+        return ModManager(self.storage.root / "mod-cache")
+
+    def detect_mod_environment(self):
+        if not self.selected: return
+        selected = self.selected
+        if selected.kind == "local":
+            environment = ModManager.detect_local(Path(selected.install_dir), platform.system())
+            self._mod_environment_done(environment); return
+        def detect():
+            client = self._remote_client(); profile = dict(selected.remote_profile)
+            service = str(profile.get("service_name") or "palworld")
+            _code, wine, _error = client.run("command -v wine64 || command -v wine || true")
+            _code, version, _error = client.run(f"{self._shell_quote(wine.strip())} --version 2>/dev/null || true") if wine.strip() else (0, "", "")
+            _code, command, _error = client.run(f"systemctl show {self._shell_quote(service)} -p ExecStart --value 2>/dev/null || true")
+            install = selected.install_dir or str(profile.get("install_dir") or "")
+            _code, exe, _error = client.run(f"find {self._shell_quote(install)} -maxdepth 4 -type f -iname PalServer.exe -print -quit 2>/dev/null") if install else (0, "", "")
+            exe = exe.strip(); root = str(Path(exe).parent).replace("\\", "/") if exe else install
+            mods = f"{root}/Pal/Content/Mods" if root else ""; settings = f"{root}/Pal/Saved/Config/WindowsServer/PalModSettings.ini" if root else ""
+            writable = False
+            if root:
+                _code, out, _error = client.run(f"test -w {self._shell_quote(root)} && echo yes || true"); writable = out.strip() == "yes"
+            profile.update({"wine_path": wine.strip(), "wine_version": version.strip(), "service_exec": command.strip(), "palserver_exe": exe, "mods_dir": mods, "mod_settings_path": settings, "mods_writable": writable, "settings_writable": writable, "workshop_root": f"{root}/steamapps/workshop" if root else ""})
+            return ModManager.detect_remote(profile), profile
+        self.run_async(detect, lambda payload: self._mod_environment_done(payload[0], payload[1]))
+
+    def _mod_environment_done(self, environment: ModEnvironment, profile: dict | None = None):
+        if not self.selected: return
+        self.selected.mod_environment = environment.to_dict(); self.selected.mod_last_sync = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+        if profile: self.selected.remote_profile.update(profile)
+        self.storage.save_instances(self.instances); self._show_mod_environment(); self._render_mods(); self.append_log("模组环境检测完成：" + (environment.reason or environment.server_type))
+
+    def _show_mod_environment(self):
+        if not hasattr(self, "mod_environment_status") or not self.selected: return
+        data = self.selected.mod_environment or {}; environment = ModEnvironment(**{key: value for key, value in data.items() if key in ModEnvironment.__dataclass_fields__}) if data else None
+        if not environment:
+            self.mod_environment_status.setText("尚未检测，请先确认服务端类型和目录"); self.mod_paths_status.setText("Workshop / Mods / 配置路径：-"); return
+        mode = {"windows": "Windows Dedicated Server", "linux-native": "原生 Linux", "linux-wine": "Linux Wine（实验）"}.get(environment.server_type, environment.server_type)
+        state = "支持服务端模组" if environment.supported else "不可用"
+        self.mod_environment_status.setText(f"{mode} · {state} · {environment.reason or '环境检查通过'}" + (f" · Wine {environment.wine_version}" if environment.wine_version else ""))
+        self.mod_paths_status.setText(f"Workshop：{environment.workshop_root or '-'}\nMods：{environment.mods_dir or '-'}\n配置：{environment.settings_path or '-'}")
+
+    def _stored_mods(self) -> list[ModManifest]:
+        return [ModManifest.from_dict(item) for item in (self.selected.mods if self.selected else [])]
+
+    def _store_mods(self, mods: list[ModManifest]) -> None:
+        if not self.selected: return
+        self.selected.mods = [mod.to_dict() for mod in mods]; self.storage.save_instances(self.instances); self._render_mods()
+
+    def _render_mods(self):
+        if not hasattr(self, "mods_table") or not self.selected: return
+        mods = self._stored_mods(); self.mods_table.setRowCount(len(mods))
+        for row, mod in enumerate(mods):
+            values = ("已启用" if mod.enabled else "已禁用", mod.display_name or mod.package_name, mod.package_name, mod.version, mod.source, "是" if mod.server_supported else "否", "、".join(mod.dependencies) or "-", "、".join(mod.conflicts) or "-", "SHA-256 已记录" if mod.sha256 else "元数据不完整")
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value)); item.setData(Qt.UserRole, mod.package_name); self.mods_table.setItem(row, column, item)
+        enabled = [mod.package_name for mod in mods if mod.enabled]; self.mod_config_preview.setPlainText("[PalModSettings]\nEnabledMods=" + ",".join(enabled))
+
+    def _selected_mod(self) -> ModManifest | None:
+        row = self.mods_table.currentRow(); item = self.mods_table.item(row, 0) if row >= 0 else None; package = str(item.data(Qt.UserRole) or "") if item else ""
+        return next((mod for mod in self._stored_mods() if mod.package_name == package), None)
+
+    def _select_mod_package(self, package: str) -> None:
+        for row in range(self.mods_table.rowCount()):
+            item = self.mods_table.item(row, 0)
+            if item and item.data(Qt.UserRole) == package:
+                self.mods_table.setCurrentCell(row, 0); return
+
+    def _show_mod_detail(self, row, _column=0, _previous_row=-1, _previous_column=-1):
+        mod = self._selected_mod()
+        if not mod: self.mod_detail_title.setText("选择模组查看详情"); self.mod_detail_text.clear(); return
+        self.mod_detail_title.setText(mod.display_name or mod.package_name)
+        self.mod_detail_text.setPlainText(f"PackageName：{mod.package_name}\n版本：{mod.version}\n来源：{mod.source}\nWorkshop ID：{mod.workshop_id or '-'}\n服务器兼容：{'是' if mod.server_supported else '否'}\n安装规则：{', '.join(mod.install_rules) or '-'}\n依赖：{', '.join(mod.dependencies) or '-'}\n冲突：{', '.join(mod.conflicts) or '-'}\nSHA-256：{mod.sha256 or '-'}\n部署路径：{mod.install_path or '尚未部署'}\n\n风险：没有 Info.json 的 PAK 默认禁用；原生 Linux 不执行官方服务端模组安装。")
+
+    def _add_imported_mod(self, manifest: ModManifest):
+        mods = self._stored_mods(); existing = next((index for index, mod in enumerate(mods) if mod.package_name == manifest.package_name), None)
+        if existing is None: mods.append(manifest)
+        else: manifest.enabled = mods[existing].enabled; manifest.install_path = mods[existing].install_path; mods[existing] = manifest
+        self._store_mods(mods); self.append_log(f"模组已导入清单：{manifest.display_name}（默认不启用）")
+
+    def import_zip_mod(self):
+        path, _ = QFileDialog.getOpenFileName(self, "导入服务端模组 ZIP", "", "ZIP 模组包 (*.zip)")
+        if not path: return
+        try: self._add_imported_mod(LocalArchiveProvider().prepare(path, self.storage.root / "mod-cache" / "archives"))
+        except Exception as exc: QMessageBox.critical(self, "模组导入失败", str(exc))
+
+    def import_pak_mod(self):
+        path, _ = QFileDialog.getOpenFileName(self, "导入 PAK", "", "PAK 文件 (*.pak)")
+        if not path: return
+        try:
+            manifest = LocalPakProvider().prepare(path, self.storage.root / "mod-cache" / "archives"); self._add_imported_mod(manifest)
+            QMessageBox.warning(self, "PAK 已导入但保持禁用", "该 PAK 没有 Info.json，元数据和服务器兼容性无法确认。程序不会自动启用。")
+        except Exception as exc: QMessageBox.critical(self, "PAK 导入失败", str(exc))
+
+    def import_workshop_mod(self):
+        value, ok = QInputDialog.getText(self, "Workshop 模组", "Workshop ID 或链接：")
+        if not ok or not value.strip(): return
+        steamcmd, _ = QFileDialog.getOpenFileName(self, "选择本机 SteamCMD", "", "SteamCMD (steamcmd.exe;steamcmd)")
+        if not steamcmd: return
+        self.run_async(lambda: WorkshopProvider(Path(steamcmd)).prepare(value, self.storage.root / "mod-cache"), self._add_imported_mod)
+
+    def enable_selected_mod(self):
+        mod = self._selected_mod()
+        if not mod or not self.selected: return QMessageBox.information(self, "模组", "请先选择模组")
+        data = self.selected.mod_environment or {}
+        if not data: return QMessageBox.warning(self, "需要检测", "请先检测模组环境")
+        environment = ModEnvironment(**{key: value for key, value in data.items() if key in ModEnvironment.__dataclass_fields__})
+        try: self._mod_manager().validate_enable(mod, self._stored_mods())
+        except Exception as exc: return QMessageBox.warning(self, "无法启用", str(exc))
+        if QMessageBox.question(self, "启用模组", f"启用 {mod.display_name} 将停服、备份、部署并重启。继续？") != QMessageBox.Yes: return
+        selected = self.selected
+        def run():
+            manager = self._mod_manager(); mods = self._stored_mods(); lifecycle = self._remote_lifecycle() if selected.kind == "remote" else self.lifecycle
+            if not lifecycle: raise RuntimeError("服务器生命周期不可用")
+            backup_root = self._backup_destination(selected)
+            if selected.kind == "remote":
+                BackupService().create_remote(self._remote_client(), selected, backup_root, selected.install_dir)
+                return manager.install_remote(mod, environment, mods, self._remote_client(), lifecycle.stop, lifecycle.start, lambda: self._remote_health_ok(selected))
+            BackupService().create_local(selected, backup_root)
+            return manager.install_local(mod, environment, mods, lifecycle.stop, lifecycle.start, lambda: lifecycle.status() == "running")
+        self.run_async(run, self._mod_enabled)
+
+    def _mod_enabled(self, updated: ModManifest):
+        mods = self._stored_mods(); index = next(i for i, mod in enumerate(mods) if mod.package_name == updated.package_name); mods[index] = updated; self._store_mods(mods); self.append_log(f"模组已启用：{updated.display_name}")
+
+    def disable_selected_mod(self): self._change_selected_mod(False)
+    def remove_selected_mod(self): self._change_selected_mod(False, remove=True)
+
+    def repair_selected_mod(self):
+        mod = self._selected_mod()
+        if not mod: return QMessageBox.information(self, "模组", "请先选择模组")
+        if mod.source == "workshop" and mod.workshop_id:
+            steamcmd, _ = QFileDialog.getOpenFileName(self, "选择本机 SteamCMD 以获取最新版本", "", "SteamCMD (steamcmd.exe;steamcmd)")
+            if not steamcmd: return
+            def prepared(updated):
+                updated.enabled = mod.enabled; updated.install_path = mod.install_path; self._add_imported_mod(updated)
+                self._select_mod_package(updated.package_name)
+                if updated.enabled: self.enable_selected_mod()
+            self.run_async(lambda: WorkshopProvider(Path(steamcmd)).prepare(mod.workshop_id, self.storage.root / "mod-cache"), prepared); return
+        if mod.source == "local-zip":
+            path, _ = QFileDialog.getOpenFileName(self, "选择新版服务端模组 ZIP", "", "ZIP 模组包 (*.zip)")
+            if not path: return
+            try:
+                updated = LocalArchiveProvider().prepare(path, self.storage.root / "mod-cache" / "archives")
+                if updated.package_name != mod.package_name: return QMessageBox.warning(self, "PackageName 不匹配", "新版 ZIP 的 PackageName 与当前模组不同，已拒绝覆盖。")
+                updated.enabled = mod.enabled; updated.install_path = mod.install_path; self._add_imported_mod(updated); self._select_mod_package(updated.package_name)
+                if updated.enabled: self.enable_selected_mod()
+            except Exception as exc: QMessageBox.critical(self, "模组更新失败", str(exc))
+            return
+        if not mod.metadata_complete:
+            return QMessageBox.warning(self, "无法自动修复", "缺少 Info.json 的 PAK 无法自动确认安装规则，请重新导入并人工核对。")
+        self.enable_selected_mod()
+
+    def _change_selected_mod(self, enabled: bool, remove: bool = False):
+        mod = self._selected_mod()
+        if not mod or not self.selected: return
+        action = "移除" if remove else "禁用"
+        if QMessageBox.question(self, action + "模组", f"{action} {mod.display_name} 将停服、备份并重启。继续？") != QMessageBox.Yes: return
+        data = self.selected.mod_environment or {}; environment = ModEnvironment(**{key: value for key, value in data.items() if key in ModEnvironment.__dataclass_fields__}); selected = self.selected
+        def run():
+            manager = self._mod_manager(); mods = self._stored_mods(); lifecycle = self._remote_lifecycle() if selected.kind == "remote" else self.lifecycle
+            if not lifecycle: raise RuntimeError("服务器生命周期不可用")
+            backup_root = self._backup_destination(selected)
+            if selected.kind == "remote":
+                BackupService().create_remote(self._remote_client(), selected, backup_root, selected.install_dir); manager.change_remote(mod, environment, mods, self._remote_client(), remove, lifecycle.stop, lifecycle.start, lambda: self._remote_health_ok(selected))
+            else:
+                BackupService().create_local(selected, backup_root); manager.change_local(mod, environment, mods, remove, lifecycle.stop, lifecycle.start, lambda: lifecycle.status() == "running")
+            return mod.package_name
+        self.run_async(run, lambda package: self._mod_changed(package, remove))
+
+    def _mod_changed(self, package: str, remove: bool):
+        mods = self._stored_mods()
+        if remove: mods = [mod for mod in mods if mod.package_name != package]
+        else:
+            for mod in mods:
+                if mod.package_name == package: mod.enabled = False
+        self._store_mods(mods); self.append_log(("模组已移除：" if remove else "模组已禁用：") + package)
+
+    def rollback_last_mod_change(self):
+        if not self.selected: return
+        if self.selected.kind == "remote":
+            return QMessageBox.information(self, "远程模组回滚", "远程 Wine 模式请在“备份与恢复”页面恢复最近一次完整服务器备份；不会自动猜测远程 /tmp 回滚包。")
+        data = self.selected.mod_environment or {}
+        if not data: return QMessageBox.warning(self, "需要检测", "请先检测模组环境")
+        environment = ModEnvironment(**{key: value for key, value in data.items() if key in ModEnvironment.__dataclass_fields__}); lifecycle = self.lifecycle
+        if not lifecycle: return QMessageBox.warning(self, "无法回滚", "服务器生命周期不可用")
+        if QMessageBox.question(self, "回滚模组变更", "将停服并恢复最近一次本机模组事务的文件与启用清单。继续？") != QMessageBox.Yes: return
+        def done(states):
+            mods = self._stored_mods()
+            for mod in mods: mod.enabled = bool(states.get(mod.package_name, False))
+            self._store_mods(mods); self.append_log("已回滚最近一次本机模组变更")
+        self.run_async(lambda: self._mod_manager().rollback_latest_local(environment, lifecycle.stop, lifecycle.start, lambda: lifecycle.status() == "running"), done)
+
+    def export_mod_manifest(self):
+        if not self.selected: return
+        target, _ = QFileDialog.getSaveFileName(self, "导出模组清单", f"{self.selected.name}-mods.json", "JSON (*.json)")
+        if target: Path(target).write_text(__import__("json").dumps(self.selected.mods, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _find_save_path(self):
         if not self.selected or not self.selected.install_dir:
@@ -1050,7 +1286,7 @@ class MainWindow(QMainWindow):
             try:
                 count = self.player_repository.upsert_save_snapshot(self.selected.id, self.save_document.properties)
                 self.player_repository.finish_sync(run_id, "success", count)
-                self.current_players = self.player_repository.list_players(self.selected.id); self._render_players()
+                self.current_players = self.player_repository.list_players(self.selected.id); self.current_player_groups = self.player_repository.list_identity_groups(self.selected.id); self._render_players()
             except Exception as exc:
                 self.player_repository.finish_sync(run_id, "failed", detail=str(exc)); raise
         self.save_path_label.setText(f"已载入：{remote_path} · {len(self.save_scalar_values)} 个结构化字段")
@@ -1074,21 +1310,59 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "save_fields_table"): return
         query = self.save_search.text().strip().lower() if hasattr(self, "save_search") else ""
         scope = self.save_scope.currentData() if hasattr(self, "save_scope") else "all"
-        scope_terms = {"player": ("player", "individualid"), "pal": ("pal", "charactercontainer"), "inventory": ("item", "inventory", "container", "slot"), "guild": ("guild", "group", "basecamp")}
         old_edits = {}
         for row in range(self.save_fields_table.rowCount()):
-            path = self.save_fields_table.item(row, 0); changed = self.save_fields_table.item(row, 2)
-            if path and changed: old_edits[path.text()] = changed.text()
+            identity = self.save_fields_table.item(row, 0); changed = self.save_fields_table.item(row, 3)
+            if identity and changed: old_edits[str(identity.data(Qt.UserRole) or "")] = changed.text()
+        selected_uid = self._selected_player_uid()
+        selected_index = None
+        if isinstance(self.save_document, PluginParsedSave) and selected_uid:
+            selected_index = next((index for index, player in enumerate(self.save_document.properties.get("players", [])) if str(player.get("player_uid")) == selected_uid), None)
+        prefix = f"players[{selected_index}]" if selected_index is not None else ""
         rows = []
         for path, value in self.save_scalar_values.items():
+            if prefix and not (path == prefix or path.startswith(prefix + ".")):
+                continue
+            if selected_uid and not prefix:
+                continue
+            info = display_field(path, value)
             edit = old_edits.get(path, str(value))
             changed = edit != str(value)
-            scoped = scope == "all" or any(term in path.lower() for term in scope_terms.get(scope, ()))
-            if scoped and (not query or query in path.lower() or query in str(value).lower()) and (not self.save_changed_only.isChecked() or changed): rows.append((path, value, edit))
+            scoped = scope == "all" or info["object_type"] == scope
+            searchable = f"{info['object']} {info['label']} {value}".lower()
+            if scoped and (not query or query in searchable) and (not self.save_changed_only.isChecked() or changed): rows.append((path, value, edit, info))
+        self.save_fields_table.blockSignals(True)
         self.save_fields_table.setRowCount(len(rows))
-        for row, (path, value, edit) in enumerate(rows):
-            path_item = QTableWidgetItem(path); path_item.setFlags(path_item.flags() & ~Qt.ItemIsEditable); original = QTableWidgetItem(str(value)); original.setFlags(original.flags() & ~Qt.ItemIsEditable)
-            self.save_fields_table.setItem(row, 0, path_item); self.save_fields_table.setItem(row, 1, original); self.save_fields_table.setItem(row, 2, QTableWidgetItem(edit))
+        for row, (path, value, edit, info) in enumerate(rows):
+            values = (info["object"], info["label"], value, edit, info["source"], info["status"], info["risk"])
+            for column, cell_value in enumerate(values):
+                item = QTableWidgetItem(str(cell_value)); item.setToolTip(info["tooltip"]); item.setData(Qt.UserRole, path)
+                if column != 3 or not info["definition"].writable: item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.save_fields_table.setItem(row, column, item)
+        self.save_fields_table.blockSignals(False)
+        self._save_edit_changed()
+
+    def _save_edit_changed(self, *_args):
+        if not hasattr(self, "save_fields_table"): return
+        changed = 0
+        for row in range(self.save_fields_table.rowCount()):
+            current, edited = self.save_fields_table.item(row, 2), self.save_fields_table.item(row, 3)
+            if current and edited and current.text() != edited.text(): changed += 1
+        if hasattr(self, "pending_save_label"): self.pending_save_label.setText(f"未保存修改 {changed} 项")
+
+    def preview_save_changes(self):
+        changes = []
+        for row in range(self.save_fields_table.rowCount()):
+            label, current, edited = self.save_fields_table.item(row, 1), self.save_fields_table.item(row, 2), self.save_fields_table.item(row, 3)
+            if label and current and edited and current.text() != edited.text(): changes.append(f"{label.text()}：{current.text()} -> {edited.text()}")
+        QMessageBox.information(self, "存档修改预览", "\n".join(changes[:30]) if changes else "当前没有未保存修改。")
+
+    def revert_save_changes(self):
+        self.save_fields_table.blockSignals(True)
+        for row in range(self.save_fields_table.rowCount()):
+            current, edited = self.save_fields_table.item(row, 2), self.save_fields_table.item(row, 3)
+            if current and edited: edited.setText(current.text())
+        self.save_fields_table.blockSignals(False); self._save_edit_changed()
 
     def validate_save_snapshot(self):
         if not self.save_working_path: return QMessageBox.information(self, "存档", "请先载入存档副本")
@@ -1109,14 +1383,13 @@ class MainWindow(QMainWindow):
         if not self.selected or not self.save_document: return QMessageBox.information(self, "存档", "请先载入存档副本")
         edits = []
         for row in range(self.save_fields_table.rowCount()):
-            path, original, changed = (self.save_fields_table.item(row, c) for c in range(3))
-            if path and original and changed and original.text() != changed.text(): edits.append((path.text(), changed.text()))
+            identity, original, changed = self.save_fields_table.item(row, 0), self.save_fields_table.item(row, 2), self.save_fields_table.item(row, 3)
+            if identity and original and changed and original.text() != changed.text():
+                path = str(identity.data(Qt.UserRole) or ""); field = resolve_path(path)
+                try: validate_value(field, changed.text())
+                except Exception as exc: return QMessageBox.warning(self, "字段值无效", str(exc))
+                edits.append((path, changed.text()))
         if not edits: return QMessageBox.information(self, "存档", "没有需要写回的修改")
-        if isinstance(self.save_document, PluginParsedSave):
-            allowed = re.compile(r"^players\[\d+\]\.(nickname|level|exp|hp|shield_hp|full_stomach|status_point(?:\.[^.\[]+|\[[0-9]+\])*)$")
-            rejected = [path for path, _text in edits if not allowed.match(path)]
-            if rejected:
-                return QMessageBox.warning(self, "不支持的 PlM 修改", "为保护存档，以下字段当前只读：\n" + "\n".join(rejected[:12]))
         name, ok = QInputDialog.getText(self, "高风险存档操作", f"将修改 {len(edits)} 个字段。请输入实例名称“{self.selected.name}”确认：")
         if not ok or name != self.selected.name: return
         reason, ok = QInputDialog.getText(self, "操作原因", "请输入本次修改原因：")
