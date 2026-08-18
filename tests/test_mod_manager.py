@@ -49,6 +49,22 @@ def test_install_plan_maps_ue4ss_native_and_pak(tmp_path):
     assert Path(ModManager.build_install_plan(ModManifest("C", mod_type="pak", archive_path="C:/C.pak"), env, allow_unverified=True).target).parts[-2:] == ("Paks", "C.pak")
 
 
+def test_detected_environment_is_ue4ss_only_and_legacy_mods_are_read_only(tmp_path):
+    root = tmp_path / "server"; (root / "UE4SS" / "Mods").mkdir(parents=True); (root / "UE4SS" / "NativeMods").mkdir(); (root / "PalServer.exe").write_bytes(b"exe")
+    environment = ModManager.detect_local(root)
+    assert environment.ue4ss_only is True
+    assert ModManager.build_install_plan(ModManifest("Legacy", mod_type="official"), environment).read_only is True
+
+
+def test_ue4ss_local_install_uses_enabled_marker_without_palmodsettings(tmp_path):
+    root = tmp_path / "server"; (root / "UE4SS" / "Mods").mkdir(parents=True); (root / "UE4SS" / "NativeMods").mkdir(); (root / "PalServer.exe").write_bytes(b"exe")
+    source = tmp_path / "source"; source.mkdir(); (source / "main.lua").write_text("return {}", encoding="utf-8")
+    env = ModManager.detect_local(root); manifest = ModManifest("Demo", mod_type="ue4ss", ue4ss_kind="script", archive_path=str(source), server_supported=True)
+    ModManager(tmp_path / "cache").install_local(manifest, env, [], lambda: None, lambda: None, lambda: True)
+    assert (root / "UE4SS" / "Mods" / "Demo" / "enabled.txt").exists()
+    assert not (root / "Mods" / "PalModSettings.ini").exists()
+
+
 def test_url_import_uses_content_type_when_url_has_no_extension(tmp_path, monkeypatch):
     class Response:
         headers = {"Content-Type": "application/zip"}

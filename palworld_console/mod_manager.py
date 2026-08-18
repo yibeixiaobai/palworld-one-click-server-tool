@@ -44,6 +44,12 @@ class ModManifest:
     last_operation: str = ""
     last_operation_at: str = ""
     risk: str = "中"
+    ue4ss_kind: str = ""
+    legacy_mode: bool = False
+    enabled_marker: str = "enabled.txt"
+    disabled_path: str = ""
+    runtime_version: str = ""
+    migration_status: str = "none"
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -80,6 +86,14 @@ class ModEnvironment:
     ue4ss_config_path: str = ""
     writable_paths: tuple[str, ...] = ()
     detected_at: str = ""
+    ue4ss_only: bool = False
+    runtime_ready: bool = False
+    legacy_mods_dir: str = ""
+    legacy_settings_path: str = ""
+
+    @property
+    def can_deploy(self) -> bool:
+        return bool(self.supported and (not self.ue4ss_only or self.runtime_ready) and self.server_type in {"windows", "linux-wine"})
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -265,6 +279,7 @@ def parse_info_json(payload: dict[str, Any], source: str, digest: str = "", arch
     if declared_type in {"official", "ue4ss", "native", "pak", "unknown"}:
         mod_type = declared_type
     requires_ue4ss = bool(payload.get("RequiresUE4SS", requires_ue4ss))
+    ue4ss_kind = "native" if mod_type == "native" else ("script" if mod_type == "ue4ss" else "")
     return ModManifest(
         package_name=package,
         display_name=str(payload.get("Name") or payload.get("DisplayName") or package),
@@ -283,6 +298,9 @@ def parse_info_json(payload: dict[str, Any], source: str, digest: str = "", arch
         source_url=str(payload.get("SourceUrl") or payload.get("URL") or ""),
         requires_ue4ss=requires_ue4ss,
         risk="高" if mod_type in {"native", "pak", "unknown"} else "中",
+        ue4ss_kind=ue4ss_kind,
+        legacy_mode=mod_type == "official",
+        migration_status="legacy-readonly" if mod_type == "official" else "none",
     )
 
 
@@ -510,12 +528,11 @@ class ModManager:
 
     @staticmethod
     def build_install_plan(manifest: ModManifest, environment: ModEnvironment, allow_unverified: bool = False) -> ModInstallPlan:
-        if not environment.supported:
+        if not environment.can_deploy:
             return ModInstallPlan(manifest.mod_type, "", "", manifest.requires_ue4ss, False, True, environment.reason or "当前服务端环境不支持模组")
         mod_type = manifest.mod_type or "unknown"
-        if mod_type == "official":
-            root = Path(environment.mods_dir); target = root / (manifest.workshop_id or manifest.package_name)
-            return ModInstallPlan(mod_type, str(target), str(root), False, True)
+        if environment.ue4ss_only and mod_type in {"official", "pak"}:
+            return ModInstallPlan(mod_type, "", "", True, False, True, "纯 UE4SS 模式不部署官方 Mods 或独立 PAK；请迁移为 UE4SS 模组")
         if mod_type == "ue4ss":
             if not environment.ue4ss_mods_dir:
                 return ModInstallPlan(mod_type, "", "", True, False, True, "未检测到 UE4SS/Mods 目录")
@@ -554,8 +571,11 @@ class ModManager:
             ue4ss = next((candidate for candidate in (root / "UE4SS", root / "ue4ss") if candidate.exists()), root / "UE4SS")
             mods = root / "Mods" / "Workshop"
             paks = root / "Pal" / "Content" / "Paks"
-            writable = tuple(str(path) for path in (root, mods, paks, ue4ss) if path.exists() and _is_writable(path))
-            return ModEnvironment(system_name, "windows", workshop_root=str(mods), mods_dir=str(mods), settings_path=str(root / "Mods" / "PalModSettings.ini"), palserver_exe=str(exe), supported=supported, reason="" if supported else "未找到 PalServer.exe", managed_mods_dir=str(root / "Mods" / "ManagedMods"), ue4ss_root=str(ue4ss), ue4ss_mods_dir=str(ue4ss / "Mods"), native_mods_dir=str(ue4ss / "NativeMods"), paks_dir=str(paks), ue4ss_config_path=str(ue4ss / "UE4SS-settings.ini"), writable_paths=writable, detected_at=datetime.now().isoformat(timespec="seconds"))
+            ue4ss_dll = next((candidate for candidate in (root / "UE4SS.dll", root / "ue4ss" / "UE4SS.dll", ue4ss / "UE4SS.dll") if candidate.is_file()), None)
+            writable = tuple(str(path) for path in (root, mods, paks, ue4ss, ue4ss / "Mods", ue4ss / "NativeMods") if path.exists() and _is_writable(path))
+            runtime_ready = bool(ue4ss.exists() and (ue4ss_dll or (ue4ss / "Mods").exists() or (ue4ss / "NativeMods").exists()))
+            reason = "" if supported and runtime_ready else ("未找到 PalServer.exe" if not supported else "未检测到 UE4SS 运行环境，请先安装/修复")
+            return ModEnvironment(system_name, "windows", workshop_root="", mods_dir="", settings_path="", palserver_exe=str(exe), supported=supported, reason=reason, managed_mods_dir="", ue4ss_root=str(ue4ss), ue4ss_mods_dir=str(ue4ss / "Mods"), native_mods_dir=str(ue4ss / "NativeMods"), paks_dir=str(paks), ue4ss_config_path=str(ue4ss / "UE4SS-settings.ini"), writable_paths=writable, detected_at=datetime.now().isoformat(timespec="seconds"), ue4ss_only=True, runtime_ready=runtime_ready, legacy_mods_dir=str(root / "Mods" / "ManagedMods"), legacy_settings_path=str(root / "Mods" / "PalModSettings.ini"))
         return ModEnvironment(system_name, "linux-native", supported=False, reason="官方服务端模组不支持原生 Linux Dedicated Server")
 
     @staticmethod
@@ -567,8 +587,10 @@ class ModManager:
         writable = bool(profile.get("mods_writable") and profile.get("settings_writable"))
         wine_mode = bool(wine and exe and re.search(r"\bwine(?:64)?\b", command, re.I))
         if wine_mode:
+            runtime_ready = bool(profile.get("ue4ss_root") or profile.get("ue4ss_mods_dir") or profile.get("native_mods_dir"))
             supported = writable
-            return ModEnvironment(system_name, "linux-wine", wine_path=wine, wine_version=str(profile.get("wine_version") or ""), workshop_root=str(profile.get("workshop_root") or ""), mods_dir=str(profile.get("mods_dir") or ""), settings_path=str(profile.get("mod_settings_path") or ""), palserver_exe=exe, supported=supported, experimental=True, reason="实验性 Wine 模式" if supported else "Wine 服务已检测到，但模组目录或配置不可写", managed_mods_dir=str(profile.get("managed_mods_dir") or ""), ue4ss_root=str(profile.get("ue4ss_root") or ""), ue4ss_mods_dir=str(profile.get("ue4ss_mods_dir") or ""), native_mods_dir=str(profile.get("native_mods_dir") or ""), paks_dir=str(profile.get("paks_dir") or ""), ue4ss_config_path=str(profile.get("ue4ss_config_path") or ""), writable_paths=tuple(profile.get("writable_paths") or ()), detected_at=datetime.now().isoformat(timespec="seconds"))
+            reason = "实验性 Wine 模式" if supported and runtime_ready else ("Wine 服务已检测到，但模组目录或配置不可写" if not writable else "未检测到 UE4SS 运行环境，请先安装/修复")
+            return ModEnvironment(system_name, "linux-wine", wine_path=wine, wine_version=str(profile.get("wine_version") or ""), workshop_root="", mods_dir="", settings_path="", palserver_exe=exe, supported=supported, experimental=True, reason=reason, managed_mods_dir="", ue4ss_root=str(profile.get("ue4ss_root") or ""), ue4ss_mods_dir=str(profile.get("ue4ss_mods_dir") or ""), native_mods_dir=str(profile.get("native_mods_dir") or ""), paks_dir=str(profile.get("paks_dir") or ""), ue4ss_config_path=str(profile.get("ue4ss_config_path") or ""), writable_paths=tuple(profile.get("writable_paths") or ()), detected_at=datetime.now().isoformat(timespec="seconds"), ue4ss_only=True, runtime_ready=runtime_ready, legacy_mods_dir=str(profile.get("mods_dir") or ""), legacy_settings_path=str(profile.get("mod_settings_path") or ""))
         return ModEnvironment(system_name, "linux-native", supported=False, reason="官方服务端模组不支持原生 Linux Dedicated Server")
 
     @staticmethod
@@ -587,6 +609,8 @@ class ModManager:
             raise ValueError("模组冲突：" + "、".join(dict.fromkeys([*conflicts, *reverse])))
 
     def install_local(self, manifest: ModManifest, environment: ModEnvironment, installed: list[ModManifest], stop, start, health, allow_unverified: bool = False) -> ModManifest:
+        if environment.ue4ss_only:
+            return self._install_ue4ss_local(manifest, environment, installed, stop, start, health)
         if not environment.supported:
             raise RuntimeError(environment.reason or "当前服务端环境不支持模组")
         self.validate_enable(manifest, installed, allow_unverified)
@@ -664,7 +688,38 @@ class ModManager:
             finally:
                 raise
 
+    def _install_ue4ss_local(self, manifest: ModManifest, environment: ModEnvironment, installed: list[ModManifest], stop, start, health) -> ModManifest:
+        if manifest.mod_type not in {"ue4ss", "native"}:
+            raise RuntimeError("纯 UE4SS 模式只允许 UE4SS Mods 或 NativeMods")
+        self.validate_enable(manifest, installed)
+        plan = self.build_install_plan(manifest, environment)
+        if plan.read_only: raise RuntimeError(plan.reason or "UE4SS 安装计划不可执行")
+        root = Path(environment.ue4ss_root); backup = self.cache_dir / "transactions" / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / "UE4SS"
+        backup.parent.mkdir(parents=True, exist_ok=True); existed = root.exists()
+        stop()
+        try:
+            if existed: shutil.copytree(root, backup)
+            target = Path(plan.target); target.parent.mkdir(parents=True, exist_ok=True)
+            source = Path(manifest.archive_path)
+            if target.exists(): shutil.rmtree(target)
+            if source.is_dir(): shutil.copytree(source, target)
+            elif source.suffix.lower() == ".zip": self._extract_zip_safe(source, target)
+            else: shutil.copy2(source, target / source.name)
+            if manifest.mod_type == "ue4ss":
+                marker = target / (manifest.enabled_marker or "enabled.txt"); temporary = marker.with_suffix(marker.suffix + ".tmp"); temporary.write_text("1\n", encoding="utf-8"); temporary.replace(marker)
+            manifest.install_path = str(target); manifest.enabled = True; manifest.legacy_mode = False; manifest.migration_status = "deployed"; manifest.validation_status = "deployed"
+            start()
+            if not health(): raise RuntimeError("UE4SS 模组部署后服务器健康检查失败")
+            return manifest
+        except Exception:
+            if root.exists(): shutil.rmtree(root)
+            if existed and backup.exists(): shutil.copytree(backup, root)
+            try: start()
+            finally: raise
+
     def install_remote(self, manifest: ModManifest, environment: ModEnvironment, installed: list[ModManifest], client, stop, start, health, allow_unverified: bool = False) -> ModManifest:
+        if environment.ue4ss_only:
+            return self._install_ue4ss_remote(manifest, environment, installed, client, stop, start, health)
         if not environment.supported or environment.server_type != "linux-wine":
             raise RuntimeError(environment.reason or "远程主机未通过实验性 Wine 模组环境检测")
         self.validate_enable(manifest, installed, allow_unverified=allow_unverified)
@@ -733,6 +788,44 @@ class ModManager:
         finally:
             if temporary: temporary.cleanup()
 
+    def _install_ue4ss_remote(self, manifest: ModManifest, environment: ModEnvironment, installed: list[ModManifest], client, stop, start, health) -> ModManifest:
+        if manifest.mod_type not in {"ue4ss", "native"}:
+            raise RuntimeError("纯 UE4SS 模式只允许 UE4SS Mods 或 NativeMods")
+        self.validate_enable(manifest, installed)
+        plan = self.build_install_plan(manifest, environment)
+        if plan.read_only: raise RuntimeError(plan.reason or "UE4SS 远程安装计划不可执行")
+        source = Path(manifest.archive_path); temporary: tempfile.TemporaryDirectory | None = None
+        if source.is_dir() or source.suffix.lower() != ".zip":
+            temporary = tempfile.TemporaryDirectory(prefix="palworld-ue4ss-"); archive = Path(temporary.name) / "mod.zip"
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+                if source.is_dir():
+                    for file in source.rglob("*"):
+                        if file.is_file(): bundle.write(file, file.relative_to(source))
+                else: bundle.write(source, source.name)
+            source = archive
+        root = str(PurePosixPath(environment.ue4ss_root)); target = str(PurePosixPath(plan.target)); token = datetime.now().strftime("%Y%m%d-%H%M%S-%f"); upload = f"/tmp/palworld-ue4ss-{token}.zip"; backup = f"/tmp/palworld-ue4ss-{token}.tar.gz"
+        q = shlex.quote
+        stop()
+        try:
+            code, _out, error = client.run(f"set -e; test -d {q(root)}; tar -czf {q(backup)} -C {q(root)} .")
+            if code: raise RuntimeError(error.strip() or "创建远程 UE4SS 回滚包失败")
+            client.upload_file(source, upload)
+            code, _out, error = client.run(f"set -e; mkdir -p {q(str(PurePosixPath(target).parent))}; rm -rf {q(target)}; mkdir -p {q(target)}; unzip -oq {q(upload)} -d {q(target)}; rm -f {q(upload)}")
+            if code: raise RuntimeError(error.strip() or "远程 UE4SS 模组部署失败")
+            if manifest.mod_type == "ue4ss":
+                code, _out, error = client.run(f"printf '1\\n' > {q(target + '/enabled.txt')}")
+                if code: raise RuntimeError(error.strip() or "远程 UE4SS 启用标记写入失败")
+            start()
+            if not health(): raise RuntimeError("远程 UE4SS 模组部署后健康检查失败")
+            manifest.install_path = target; manifest.enabled = True; manifest.validation_status = "deployed"; manifest.migration_status = "deployed"; return manifest
+        except Exception as exc:
+            restore_code, _out, restore_error = client.run(f"rm -rf {q(root)}; mkdir -p {q(root)}; tar -xzf {q(backup)} -C {q(root)}; rm -f {q(upload)} {q(backup)}")
+            if restore_code: raise RuntimeError(f"远程 UE4SS 部署失败且回滚失败：{restore_error.strip() or '未知错误'}；原错误：{exc}") from exc
+            try: start()
+            finally: raise
+        finally:
+            if temporary: temporary.cleanup()
+
     @staticmethod
     def _enabled_text(installed: list[ModManifest], excluded: str = "") -> str:
         enabled = [mod.package_name for mod in installed if mod.enabled and mod.package_name != excluded]
@@ -745,6 +838,8 @@ class ModManager:
         return "\n".join(lines) + "\n"
 
     def change_local(self, manifest: ModManifest, environment: ModEnvironment, installed: list[ModManifest], remove: bool, stop, start, health) -> None:
+        if environment.ue4ss_only:
+            return self._change_ue4ss_local(manifest, environment, remove, stop, start, health)
         if not environment.supported: raise RuntimeError(environment.reason or "当前环境不支持模组")
         settings = Path(environment.settings_path); target = Path(manifest.install_path) if manifest.install_path else Path(environment.mods_dir) / (manifest.workshop_id or manifest.package_name)
         transaction = self.cache_dir / "transactions" / datetime.now().strftime("%Y%m%d-%H%M%S-%f"); transaction.mkdir(parents=True, exist_ok=True)
@@ -763,6 +858,28 @@ class ModManager:
             if remove and backup_target.exists():
                 if target.exists(): shutil.rmtree(target)
                 shutil.copytree(backup_target, target)
+            try: start()
+            finally: raise
+
+    def _change_ue4ss_local(self, manifest: ModManifest, environment: ModEnvironment, remove: bool, stop, start, health) -> None:
+        target = Path(manifest.install_path or (Path(environment.ue4ss_mods_dir if manifest.mod_type == "ue4ss" else environment.native_mods_dir) / manifest.package_name))
+        if not target.exists(): raise FileNotFoundError("找不到 UE4SS 模组目录")
+        root = Path(environment.ue4ss_root); backup = self.cache_dir / "transactions" / datetime.now().strftime("%Y%m%d-%H%M%S-%f") / "UE4SS"; backup.parent.mkdir(parents=True, exist_ok=True); shutil.copytree(root, backup)
+        disabled = root / "_disabled" / ("Mods" if manifest.mod_type == "ue4ss" else "NativeMods") / manifest.package_name
+        stop()
+        try:
+            if remove:
+                shutil.rmtree(target)
+            elif manifest.mod_type == "ue4ss":
+                marker = target / (manifest.enabled_marker or "enabled.txt")
+                if marker.exists(): marker.unlink()
+            else:
+                disabled.parent.mkdir(parents=True, exist_ok=True); shutil.rmtree(disabled, ignore_errors=True); target.replace(disabled)
+            start()
+            if not health(): raise RuntimeError("UE4SS 模组变更后服务器健康检查失败")
+        except Exception:
+            if root.exists(): shutil.rmtree(root)
+            if backup.exists(): shutil.copytree(backup, root)
             try: start()
             finally: raise
 
@@ -799,6 +916,8 @@ class ModManager:
             finally: raise
 
     def change_remote(self, manifest: ModManifest, environment: ModEnvironment, installed: list[ModManifest], client, remove: bool, stop, start, health) -> None:
+        if environment.ue4ss_only:
+            return self._change_ue4ss_remote(manifest, environment, client, remove, stop, start, health)
         if not environment.supported or environment.server_type != "linux-wine": raise RuntimeError(environment.reason or "远程 Wine 模组环境不可用")
         settings = environment.settings_path; target = manifest.install_path or str(PurePosixPath(environment.mods_dir) / (manifest.workshop_id or manifest.package_name))
         backup = f"/tmp/palworld-mod-change-{datetime.now().strftime('%Y%m%d-%H%M%S')}.tar.gz"
@@ -818,3 +937,27 @@ class ModManager:
             client.run(f"tar -xzf {shlex.quote(backup)} -C / 2>/dev/null || true")
             try: start()
             finally: raise
+
+    def _change_ue4ss_remote(self, manifest: ModManifest, environment: ModEnvironment, client, remove: bool, stop, start, health) -> None:
+        target = manifest.install_path or str(PurePosixPath(environment.ue4ss_mods_dir if manifest.mod_type == "ue4ss" else environment.native_mods_dir) / manifest.package_name)
+        root = str(PurePosixPath(environment.ue4ss_root)); disabled = str(PurePosixPath(root) / "_disabled" / ("Mods" if manifest.mod_type == "ue4ss" else "NativeMods") / manifest.package_name); backup = f"/tmp/palworld-ue4ss-change-{datetime.now():%Y%m%d-%H%M%S}.tar.gz"
+        q = shlex.quote; stop()
+        try:
+            code, _out, error = client.run(f"set -e; tar -czf {q(backup)} -C {q(root)} .")
+            if code: raise RuntimeError(error.strip() or "创建远程 UE4SS 变更回滚包失败")
+            if remove: command = f"rm -rf {q(target)}"
+            elif manifest.mod_type == "ue4ss": command = f"rm -f {q(target + '/enabled.txt')}"
+            else: command = f"mkdir -p {q(str(PurePosixPath(disabled).parent))}; rm -rf {q(disabled)}; mv {q(target)} {q(disabled)}"
+            code, _out, error = client.run(command)
+            if code: raise RuntimeError(error.strip() or "远程 UE4SS 模组变更失败")
+            start()
+            if not health(): raise RuntimeError("远程 UE4SS 模组变更后健康检查失败")
+        except Exception as exc:
+            restore_code, _out, restore_error = client.run(f"rm -rf {q(root)}; mkdir -p {q(root)}; tar -xzf {q(backup)} -C {q(root)}; rm -f {q(backup)}")
+            if restore_code: raise RuntimeError(f"远程 UE4SS 变更失败且回滚失败：{restore_error.strip() or '未知错误'}；原错误：{exc}") from exc
+            try: start()
+            finally: raise
+
+
+Ue4ssModEnvironment = ModEnvironment
+Ue4ssModTransaction = ModManager
