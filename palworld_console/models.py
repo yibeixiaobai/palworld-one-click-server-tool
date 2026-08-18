@@ -252,6 +252,7 @@ class ServerInstance:
     rest_url: str = ""
     public_address: str = ""
     admin_secret_ref: str = ""
+    server_password_secret_ref: str = ""
     ssh_secret_ref: str = ""
     ssh_auth_type: str = "password"
     ssh_key_path: str = ""
@@ -265,6 +266,7 @@ class ServerInstance:
     config_source: str = ""
     config_synced_at: str = ""
     config_restart_required: bool = False
+    config_cache_state: dict[str, Any] = field(default_factory=dict)
     operation_history: list[dict[str, Any]] = field(default_factory=list)
     last_diagnostic: dict[str, Any] = field(default_factory=dict)
     rcon_port: int = 25575
@@ -282,6 +284,7 @@ class ServerInstance:
     mod_source_preference: str = "workshop"
     local_steamcmd_state: dict[str, Any] = field(default_factory=dict)
     mod_environment_version: int = 1
+    wine_migration: dict[str, Any] = field(default_factory=dict)
     ui_preferences: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

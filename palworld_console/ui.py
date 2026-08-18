@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
 from PySide6.QtCore import QSettings
 
 from .config_ini import coerce_setting_value
+from .config_cache import ConfigCacheRepository
+from .localization import GameLocalizationService
 from .models import ConfigSyncResult, GuildSummary, PlayerRecord, ServerHealthSnapshot, ServerInstance, TaskProgress, UninstallResult, ScheduleDefinition
 from .services import BackupService, FirewallService, GuildSnapshotService, LocalServerLifecycle, LocalSteamCmdManager, NetworkDiagnostics, PalworldRestClient, PlayerAdminService, RemoteHostClient, RemoteServerInspector, RemoteServerLifecycle, ServerConfigBootstrap, ServerDiagnostics, SSHTunnelManager, SteamCmdInstaller, WindowsShortcutService
 from .management import AuditService, AutomationService, HostTaskDeployer, RconClient, SaveGameService, WhitelistService
@@ -19,6 +21,7 @@ from .player_edit import PlayerEditSession
 from .save_codec import PALWORLD_SAVE_TOOLS_COMMIT, PlmCodecPlugin, PluginParsedSave
 from .save_fields import CONTAINER_LABELS, display_field, resolve_path, validate_value
 from .mod_manager import LocalArchiveProvider, LocalPakProvider, ModEnvironment, ModManager, ModManifest, ModPackageService, WorkshopCatalogPage, WorkshopCatalogService, WorkshopProvider
+from .wine_migration import WineMigrationPreflight, WineMigrationService
 from .settings_schema import CATEGORIES, PRESETS, SETTING_BY_KEY, SETTING_DEFINITIONS
 from .storage import AppStorage
 
@@ -59,6 +62,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("幻兽帕鲁服务器控制台")
         self.resize(1180, 760)
         self.storage = AppStorage()
+        self.config_cache = ConfigCacheRepository(self.storage.root)
+        self.localization = GameLocalizationService(self.storage.root)
         self.instances = self.storage.load_instances()
         if not self.instances:
             self.instances = [ServerInstance()]
@@ -82,6 +87,7 @@ class MainWindow(QMainWindow):
         self.active_player_uid = ""
         self.current_guilds: list[GuildSummary] = []
         self.config_original: dict[str, object] = {}
+        self.config_secret_presence: dict[str, bool] = {}
         self.ui_signals = UiSignals()
         self.ui_signals.log.connect(self.append_log)
         self.pool = QThreadPool.globalInstance()
@@ -216,8 +222,8 @@ class MainWindow(QMainWindow):
             widget.setProperty("setting_key", definition.key); self.ini_fields[definition.key] = widget
             range_text = f" [{definition.minimum:g}–{definition.maximum:g}]" if definition.minimum is not None and definition.maximum is not None else ""
             self.config_forms[definition.category].addRow(definition.label + range_text, widget)
-        actions = QHBoxLayout(); load_btn = QPushButton("从服务器读取"); load_btn.clicked.connect(self.load_ini); save_btn = QPushButton("保存配置（自动备份）"); save_btn.clicked.connect(self.save_ini); reset_btn = QPushButton("恢复当前分组默认值"); reset_btn.clicked.connect(self.reset_config_category)
-        actions.addWidget(load_btn); actions.addWidget(save_btn); actions.addWidget(reset_btn); actions.addStretch(); layout.addLayout(actions)
+        actions = QHBoxLayout(); load_btn = QPushButton("从服务器读取"); load_btn.clicked.connect(self.load_ini); draft_btn = QPushButton("保存离线草稿"); draft_btn.clicked.connect(self.save_config_draft); save_btn = QPushButton("推送配置（自动备份）"); save_btn.clicked.connect(self.save_ini); reset_btn = QPushButton("恢复当前分组默认值"); reset_btn.clicked.connect(self.reset_config_category)
+        actions.addWidget(load_btn); actions.addWidget(draft_btn); actions.addWidget(save_btn); actions.addWidget(reset_btn); actions.addStretch(); layout.addLayout(actions)
         self.config_diff_label = QLabel("尚无修改"); self.config_diff_label.setWordWrap(True); layout.addWidget(self.config_diff_label); return outer
 
     def _players_tab(self):
@@ -229,6 +235,7 @@ class MainWindow(QMainWindow):
         detail = QWidget(); dl = QVBoxLayout(detail)
         title_row = QHBoxLayout(); self.player_detail_title = QLabel("选择玩家查看永久档案"); self.player_detail_title.setStyleSheet("font-size:16px;font-weight:650;"); title_row.addWidget(self.player_detail_title); title_row.addWidget(QLabel("角色")); self.player_role_combo = QComboBox(); self.player_role_combo.setMinimumWidth(180); self.player_role_combo.currentIndexChanged.connect(self._role_uid_changed); title_row.addWidget(self.player_role_combo); title_row.addStretch(); self.player_sync_label = QLabel("尚未同步存档"); title_row.addWidget(self.player_sync_label); self.pending_save_label = QLabel("未保存修改 0 项"); title_row.addWidget(self.pending_save_label); dl.addLayout(title_row)
         plugin_row = QHBoxLayout(); self.plm_plugin_status = QLabel("正在检测 PlM1/Oodle 插件"); self.plm_plugin_status.setWordWrap(True); plugin_row.addWidget(self.plm_plugin_status, 1); install_plugin = QPushButton("安装/修复插件"); install_plugin.clicked.connect(self.install_plm_plugin); plugin_row.addWidget(install_plugin); dl.addLayout(plugin_row)
+        localization_row = QHBoxLayout(); self.localization_status = QLabel("中文资源：内置词典"); self.localization_status.setWordWrap(True); localization_row.addWidget(self.localization_status, 1); detect_client = QPushButton("检测游戏资源"); detect_client.clicked.connect(self.detect_localization_source); localization_row.addWidget(detect_client); import_names = QPushButton("导入中文资源"); import_names.clicked.connect(self.import_localization_source); localization_row.addWidget(import_names); dl.addLayout(localization_row)
         self.player_detail_tabs = QTabWidget(); dl.addWidget(self.player_detail_tabs, 1)
         overview = QWidget(); overview_l = QVBoxLayout(overview); self.player_detail_text = QPlainTextEdit(); self.player_detail_text.setReadOnly(True); overview_l.addWidget(self.player_detail_text); note_row = QHBoxLayout(); self.player_note = QLineEdit(); self.player_note.setPlaceholderText("玩家备注"); note_row.addWidget(self.player_note); note_button = QPushButton("保存备注"); note_button.clicked.connect(self.save_player_note); note_row.addWidget(note_button); overview_l.addLayout(note_row); self.player_detail_tabs.addTab(overview, "概览")
         attributes = QWidget(); al = QVBoxLayout(attributes); attr_tools = QHBoxLayout(); self.save_path_label = QLabel("尚未同步 Level.sav"); attr_tools.addWidget(self.save_path_label, 1); validate = QPushButton("验证存档"); validate.clicked.connect(self.validate_save_snapshot); attr_tools.addWidget(validate); al.addLayout(attr_tools)
@@ -246,7 +253,7 @@ class MainWindow(QMainWindow):
         for text, handler in (("广播", self.broadcast), ("踢出", self.kick_player), ("封禁", self.ban_player), ("按 ID 解封", self.unban_player), ("保存世界", self.rest_save)): b=QPushButton(text); b.clicked.connect(handler); operation_row.addWidget(b)
         operation_row.addStretch(); op_l.addLayout(operation_row); op_l.addWidget(QLabel("踢出、封禁和存档写回会记录审计；高风险写回必须输入实例名称与操作原因。")); op_l.addStretch(); self.player_detail_tabs.addTab(operations, "管理操作")
         save_actions = QHBoxLayout(); preview = QPushButton("预览差异"); preview.clicked.connect(self.preview_save_changes); save_actions.addWidget(preview); revert = QPushButton("撤销修改"); revert.clicked.connect(self.revert_save_changes); save_actions.addWidget(revert); apply_btn = QPushButton("保存到服务器"); apply_btn.clicked.connect(self.apply_save_changes); apply_btn.setStyleSheet("color:#b42318;"); save_actions.addWidget(apply_btn); save_actions.addStretch(); dl.addLayout(save_actions)
-        split.addWidget(detail); split.setSizes([390, 700]); l.addWidget(split); self.save_document = None; self.save_scalar_values = {}; self.save_working_path = None; self._refresh_plm_plugin_status(); return w
+        split.addWidget(detail); split.setSizes([390, 700]); l.addWidget(split); self.save_document = None; self.save_scalar_values = {}; self.save_working_path = None; self._refresh_plm_plugin_status(); self._refresh_localization_status(); return w
 
     def _guilds_tab(self):
         w = QWidget(); l = QVBoxLayout(w); row = QHBoxLayout(); refresh = QPushButton("刷新公会与基地"); refresh.clicked.connect(self.refresh_guilds); row.addWidget(refresh); row.addWidget(QLabel("在线数据来自官方接口；改名、转移、合并和删除通过停服存档事务执行。")); row.addStretch(); l.addLayout(row)
@@ -257,15 +264,19 @@ class MainWindow(QMainWindow):
         environment = QGroupBox("服务端模组环境"); el = QGridLayout(environment)
         self.mod_environment_status = QLabel("尚未检测"); self.mod_environment_status.setWordWrap(True); el.addWidget(QLabel("环境"), 0, 0); el.addWidget(self.mod_environment_status, 0, 1)
         self.mod_paths_status = QLabel("Workshop / Mods / UE4SS / Paks 路径：-"); self.mod_paths_status.setWordWrap(True); el.addWidget(QLabel("路径"), 1, 0); el.addWidget(self.mod_paths_status, 1, 1)
-        detect = QPushButton("检测环境"); detect.clicked.connect(self.detect_mod_environment); el.addWidget(detect, 0, 2, 2, 1); l.addWidget(environment)
+        detect = QPushButton("检测环境"); detect.clicked.connect(self.detect_mod_environment); el.addWidget(detect, 0, 2)
+        migrate = QPushButton("迁移到隔离 Wine 实例"); migrate.clicked.connect(self.start_wine_migration); el.addWidget(migrate, 1, 2)
+        restore_native = QPushButton("恢复原生 Linux 服务"); restore_native.clicked.connect(self.restore_native_server); el.addWidget(restore_native, 2, 2)
+        l.addWidget(environment)
         self.mod_views = QTabWidget(); l.addWidget(self.mod_views, 1)
         catalog = QWidget(); catalog_l = QVBoxLayout(catalog); catalog_tools = QHBoxLayout(); self.workshop_search = QLineEdit(); self.workshop_search.setPlaceholderText("搜索 Steam Workshop 模组"); self.workshop_search.returnPressed.connect(self.search_workshop_catalog); catalog_tools.addWidget(self.workshop_search, 1); self.workshop_sort = QComboBox(); self.workshop_sort.addItem("热门", "trend"); self.workshop_sort.addItem("最新更新", "mostrecent"); self.workshop_sort.addItem("订阅最多", "totaluniquesubscribers"); catalog_tools.addWidget(self.workshop_sort); search = QPushButton("搜索"); search.clicked.connect(self.search_workshop_catalog); catalog_tools.addWidget(search); refresh = QPushButton("刷新"); refresh.clicked.connect(lambda: self.load_workshop_catalog(force=True)); catalog_tools.addWidget(refresh); catalog_l.addLayout(catalog_tools)
         catalog_split = QSplitter(Qt.Horizontal); self.workshop_table = QTableWidget(0, 5); self.workshop_table.setHorizontalHeaderLabels(["模组", "作者", "Workshop ID", "安装状态", "服务器兼容"]); self.workshop_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.workshop_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.workshop_table.horizontalHeader().setStretchLastSection(True); self.workshop_table.currentCellChanged.connect(self._show_workshop_detail); catalog_split.addWidget(self.workshop_table)
-        catalog_detail = QWidget(); cdl = QVBoxLayout(catalog_detail); self.workshop_preview = QLabel("选择模组查看详情"); self.workshop_preview.setAlignment(Qt.AlignCenter); self.workshop_preview.setMinimumHeight(140); cdl.addWidget(self.workshop_preview); self.workshop_detail = QPlainTextEdit(); self.workshop_detail.setReadOnly(True); cdl.addWidget(self.workshop_detail); install_catalog = QPushButton("安装到当前服务器"); install_catalog.clicked.connect(self.install_selected_workshop); cdl.addWidget(install_catalog); catalog_split.addWidget(catalog_detail); catalog_split.setSizes([760, 340]); catalog_l.addWidget(catalog_split, 1)
+        catalog_detail = QWidget(); cdl = QVBoxLayout(catalog_detail); self.workshop_preview = QLabel("选择模组查看详情"); self.workshop_preview.setAlignment(Qt.AlignCenter); self.workshop_preview.setMinimumHeight(140); cdl.addWidget(self.workshop_preview); self.workshop_detail = QPlainTextEdit(); self.workshop_detail.setReadOnly(True); cdl.addWidget(self.workshop_detail); self.install_catalog_button = QPushButton("安装到当前服务器"); self.install_catalog_button.clicked.connect(self.install_selected_workshop); cdl.addWidget(self.install_catalog_button); catalog_split.addWidget(catalog_detail); catalog_split.setSizes([760, 340]); catalog_l.addWidget(catalog_split, 1)
         paging = QHBoxLayout(); previous = QPushButton("上一页"); previous.clicked.connect(lambda: self.change_workshop_page(-1)); paging.addWidget(previous); self.workshop_page_label = QLabel("第 1 页"); paging.addWidget(self.workshop_page_label); next_page = QPushButton("下一页"); next_page.clicked.connect(lambda: self.change_workshop_page(1)); paging.addWidget(next_page); paging.addStretch(); self.workshop_cache_label = QLabel("尚未加载目录"); paging.addWidget(self.workshop_cache_label); catalog_l.addLayout(paging); self.mod_views.addTab(catalog, "创意工坊")
         installed = QWidget(); installed_l = QVBoxLayout(installed); actions = QGridLayout()
+        self.mod_action_buttons = {}
         for index, (text, handler) in enumerate((("按 ID 安装", self.import_workshop_mod), ("导入本地 ZIP", self.import_zip_mod), ("导入 PAK", self.import_pak_mod), ("导入 URL/GitHub", self.import_url_mod), ("导入目录", self.import_directory_mod), ("启用", self.enable_selected_mod), ("禁用", self.disable_selected_mod), ("更新/修复", self.repair_selected_mod), ("移除", self.remove_selected_mod), ("回滚上次变更", self.rollback_last_mod_change), ("导出清单", self.export_mod_manifest))):
-            button = QPushButton(text); button.clicked.connect(handler); actions.addWidget(button, index // 5, index % 5)
+            button = QPushButton(text); button.clicked.connect(handler); self.mod_action_buttons[text] = button; actions.addWidget(button, index // 5, index % 5)
         actions.setColumnStretch(4, 1); installed_l.addLayout(actions)
         filter_row = QHBoxLayout(); filter_row.addWidget(QLabel("类型筛选")); self.mod_type_filter = QComboBox(); self.mod_type_filter.addItem("全部", "all"); self.mod_type_filter.addItem("官方 Mods", "official"); self.mod_type_filter.addItem("UE4SS", "ue4ss"); self.mod_type_filter.addItem("NativeMods", "native"); self.mod_type_filter.addItem("PAK", "pak"); self.mod_type_filter.addItem("未知/只读", "unknown"); self.mod_type_filter.currentIndexChanged.connect(self._render_mods); filter_row.addWidget(self.mod_type_filter); filter_row.addStretch(); installed_l.addLayout(filter_row)
         split = QSplitter(Qt.Horizontal)
@@ -333,6 +344,7 @@ class MainWindow(QMainWindow):
             self.player_sync_label.setText("尚未同步存档")
         self.current_players = self.player_repository.list_players(self.instances[row].id); self.current_player_groups = self.player_repository.list_identity_groups(self.instances[row].id); self.current_guilds = []
         self.selected = self.instances[row]; self.title.setText(self.selected.name); self.name_edit.setText(self.selected.name); self.kind_combo.setCurrentIndex(0 if self.selected.kind == "local" else 1); self.path_edit.setText(self.selected.install_dir); self.host_edit.setText(self.selected.host); self.user_edit.setText(self.selected.remote_username); self.ssh_port_spin.setValue(self.selected.ssh_port); self.auth_combo.setCurrentIndex(0 if self.selected.ssh_auth_type == "password" else 1); self.key_path_edit.setText(self.selected.ssh_key_path); self.port_spin.setValue(self.selected.game_port); self.rest_edit.setText(self.selected.rest_url); self.rest_password_edit.setText(self.storage.get_secret(self.selected.admin_secret_ref)); self.public_edit.setText(self.selected.public_address); self.config_source_label.setText(f"配置状态：{self.selected.config_source or '尚未同步'}" + ("，需要重启" if self.selected.config_restart_required else "")); self.lifecycle = LocalServerLifecycle(self.selected, self.ui_signals.log.emit) if self.selected.kind == "local" else (self._remote_lifecycle() if self.selected.discovery_status == "ready" else None); self._toggle_remote_fields(); self._show_discovery(); self.refresh_status()
+        self._load_cached_config()
         self._render_players(); self._render_guilds()
         self._render_schedules(); self._render_whitelist(); self._render_audit(); self.refresh_backup_list(); self._render_mods(); self._show_mod_environment()
         self.header_address.setText(f"游戏地址：{self.selected.public_address or self.selected.host}:{self.selected.game_port}")
@@ -344,7 +356,8 @@ class MainWindow(QMainWindow):
         if not self.selected: return
         if self.selected.kind == "local" and self.lifecycle and self.lifecycle.status() == "running": return QMessageBox.warning(self, "无法删除", "请先停止正在运行的本机服务器。")
         if QMessageBox.question(self, "确认删除", f"删除“{self.selected.name}”的控制台记录和保存的凭据？\n不会删除服务器文件。") != QMessageBox.Yes: return
-        for ref in (self.selected.ssh_secret_ref, self.selected.ssh_key_passphrase_ref, self.selected.admin_secret_ref): self.storage.delete_secret(ref)
+        for ref in (self.selected.ssh_secret_ref, self.selected.ssh_key_passphrase_ref, self.selected.admin_secret_ref, self.selected.server_password_secret_ref): self.storage.delete_secret(ref)
+        self.config_cache.remove_instance(self.selected.id)
         index = self.instances.index(self.selected); self.instances.pop(index)
         if not self.instances: self.instances.append(ServerInstance())
         self.storage.save_instances(self.instances); self._refresh_instances(); self.instance_list.setCurrentRow(max(0, index - 1)); self.append_log("实例已删除")
@@ -844,7 +857,7 @@ class MainWindow(QMainWindow):
     def save_ini(self):
         if not self.selected or not self.selected.install_dir: return QMessageBox.warning(self, "提示", "请先填写本地安装目录")
         try:
-            values = {key: coerce_setting_value(key, self._setting_text(edit)) for key, edit in self.ini_fields.items() if self._setting_text(edit) != ""}
+            values = self._collect_config_values()
             for key, value in values.items():
                 definition = SETTING_BY_KEY.get(key)
                 if definition and definition.minimum is not None and isinstance(value, (int, float)) and not (definition.minimum <= value <= definition.maximum):
@@ -856,19 +869,62 @@ class MainWindow(QMainWindow):
             return QMessageBox.critical(self, "配置错误", str(exc))
         if self.selected.kind == "remote":
             client = self._remote_client(); selected = self.selected
-            worker = Worker(lambda signals: ServerConfigBootstrap.update_remote(client, selected, values), with_signals=True)
+            worker = Worker(lambda signals: self._update_remote_config_checked(client, selected, values), with_signals=True)
             worker.signals.finished.connect(self._config_saved); worker.signals.error.connect(lambda e: QMessageBox.critical(self, "配置错误", e)); self.pool.start(worker)
         else:
-            try: self._config_saved(ServerConfigBootstrap.update_local(self.selected, values))
+            try: self._config_saved(self._update_local_config_checked(self.selected, values))
             except Exception as exc: QMessageBox.critical(self, "配置错误", str(exc))
 
     def _config_saved(self, result):
         self._apply_config_result(result)
+        self.config_cache.clear_draft(self.selected.id)
         self.selected.config_source = "用户修改"
         self.selected.config_restart_required = True
         self.config_source_label.setText("配置状态：用户修改，需要重启")
         self.storage.save_instances(self.instances)
         self.append_log("配置已保存并创建备份，需要重启服务器后生效")
+
+    def _collect_config_values(self) -> dict[str, object]:
+        values = {}
+        for key, edit in self.ini_fields.items():
+            text = self._setting_text(edit)
+            if text != "":
+                values[key] = coerce_setting_value(key, text)
+        return values
+
+    def save_config_draft(self):
+        if not self.selected:
+            return
+        try:
+            values = self._collect_config_values()
+        except Exception as exc:
+            return QMessageBox.critical(self, "草稿错误", str(exc))
+        server_password = str(values.get("ServerPassword") or "")
+        if server_password:
+            self.selected.server_password_secret_ref = self.selected.server_password_secret_ref or f"server-password-{self.selected.id}"
+            self.storage.set_secret(self.selected.server_password_secret_ref, server_password)
+        snapshot = self.config_cache.load_snapshot(self.selected.id)
+        draft = self.config_cache.save_draft(self.selected.id, values, snapshot.content_hash if snapshot else "")
+        self.selected.config_cache_state = {"draft_saved_at": draft.saved_at, "has_draft": True}
+        self.storage.save_instances(self.instances)
+        self.config_source_label.setText(f"配置状态：离线草稿，保存于 {draft.saved_at}，尚未推送")
+        self.append_log("游戏配置已保存为本地草稿，不会自动写入服务器")
+
+    def _update_local_config_checked(self, selected, values):
+        snapshot = self.config_cache.load_snapshot(selected.id)
+        if snapshot:
+            current = ServerConfigBootstrap.read_local(selected)
+            if self.config_cache.hash_values(current.values) != snapshot.content_hash:
+                raise RuntimeError("服务器配置已被外部修改，请先重新读取并处理差异")
+        return ServerConfigBootstrap.update_local(selected, values)
+
+    def _update_remote_config_checked(self, client, selected, values):
+        snapshot = self.config_cache.load_snapshot(selected.id)
+        if snapshot:
+            current = ServerConfigBootstrap.read_remote(client, selected)
+            if self.config_cache.hash_values(current.values) != snapshot.content_hash:
+                raise RuntimeError("远程配置已被外部修改，请先重新读取并处理差异")
+        return ServerConfigBootstrap.update_remote(client, selected, values)
 
     def load_ini(self):
         if not self.selected or not self.selected.install_dir: return QMessageBox.warning(self, "提示", "请先填写本地安装目录")
@@ -881,7 +937,30 @@ class MainWindow(QMainWindow):
                 self._apply_config_result(ServerConfigBootstrap.read_local(self.selected)); self.append_log("已读取配置文件")
             except Exception as exc: QMessageBox.critical(self, "配置错误", str(exc))
 
-    def _apply_config_result(self, result: ConfigSyncResult):
+    def _load_cached_config(self):
+        if not self.selected:
+            return
+        snapshot = self.config_cache.load_snapshot(self.selected.id)
+        if not snapshot:
+            self.config_original = {}
+            return
+        self._apply_config_result(ConfigSyncResult(snapshot.values, snapshot.config_path, "本地缓存", False, snapshot.synced_at), persist_cache=False)
+        self.config_secret_presence = dict(snapshot.secret_presence)
+        server_password = self.storage.get_secret(self.selected.server_password_secret_ref)
+        if server_password and "ServerPassword" in self.ini_fields:
+            self._set_setting_widget(self.ini_fields["ServerPassword"], server_password)
+            self.config_original["ServerPassword"] = server_password
+        draft = self.config_cache.load_draft(self.selected.id)
+        if draft:
+            for key, value in draft.values.items():
+                if key in self.ini_fields:
+                    self._set_setting_widget(self.ini_fields[key], value)
+            self.config_source_label.setText(f"配置状态：离线草稿，保存于 {draft.saved_at}，尚未推送")
+        else:
+            self.config_source_label.setText(f"配置状态：本地缓存，服务器同步于 {snapshot.synced_at}")
+        self._config_changed()
+
+    def _apply_config_result(self, result: ConfigSyncResult, persist_cache: bool = True):
         if not self.selected:
             return
         for key, edit in self.ini_fields.items():
@@ -893,6 +972,11 @@ class MainWindow(QMainWindow):
             self.selected.admin_secret_ref = self.selected.admin_secret_ref or f"rest-{self.selected.id}"
             self.storage.set_secret(self.selected.admin_secret_ref, admin_password)
             self.rest_password_edit.setText(admin_password)
+        server_password = str(result.values.get("ServerPassword") or "")
+        if server_password:
+            self.selected.server_password_secret_ref = self.selected.server_password_secret_ref or f"server-password-{self.selected.id}"
+            self.storage.set_secret(self.selected.server_password_secret_ref, server_password)
+            self.config_secret_presence["ServerPassword"] = True
         game_port = result.values.get("PublicPort")
         if isinstance(game_port, (int, float)) or str(game_port).isdigit():
             self.selected.game_port = int(game_port); self.port_spin.setValue(int(game_port))
@@ -914,6 +998,9 @@ class MainWindow(QMainWindow):
             self.selected.remote_profile["config_path"] = result.config_path
             self.selected.remote_profile["config_synced_at"] = result.synced_at
             self.selected.remote_profile["config_status"] = result.source
+        if persist_cache:
+            record = self.config_cache.save_snapshot(self.selected.id, result)
+            self.selected.config_cache_state = {"snapshot_hash": record.content_hash, "snapshot_synced_at": record.synced_at, "has_draft": False}
         self.storage.save_instances(self.instances)
         self._config_changed()
 
@@ -1032,10 +1119,15 @@ class MainWindow(QMainWindow):
         )
         self.player_pals_table.setRowCount(len(pals))
         for pal_row, pal in enumerate(pals):
-            values = (pal.get("type") or "未知帕鲁", pal.get("nickname") or "-", pal.get("level", 0), pal.get("exp", 0), pal.get("gender", "未知"), pal.get("rank", 0), pal.get("individual_id") or "未检测到稳定 ID")
+            pal_id = str(pal.get("type") or "")
+            pal_name = self.localization.display("pals", pal_id)
+            gender_id = str(pal.get("gender") or "Unknown")
+            values = (pal_name, pal.get("nickname") or "-", pal.get("level", 0), pal.get("exp", 0), self.localization.display("gender", gender_id), pal.get("rank", 0), pal.get("individual_id") or "未检测到稳定 ID")
             metadata = {"individual_id": pal.get("individual_id") or "", "pal": pal}
             for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value)); item.setData(Qt.UserRole, metadata); self.player_pals_table.setItem(pal_row, column, item)
+                item = QTableWidgetItem(str(value)); item.setData(Qt.UserRole, metadata)
+                if column in {0, 4}: item.setToolTip(f"游戏内部 ID：{pal_id if column == 0 else gender_id}")
+                self.player_pals_table.setItem(pal_row, column, item)
         self._render_inventory_for_active_player(items)
         self.player_relations_text.setPlainText(f"公会：{guild.get('guild_name') or '-'}\n公会 ID：{guild.get('guild_id') or '-'}\n身份：{'会长' if guild.get('is_admin') else '成员' if guild else '-'}\n\n公会转移、合并、删除和基地归属修改仅在完整关系校验通过后开放。")
         self._render_save_fields()
@@ -1112,14 +1204,20 @@ class MainWindow(QMainWindow):
             container = str(item.get("container") or ""); quantity = item.get("StackCount", 0); document_items = (player.get("items") or {}).get(container, []) if player else []
             item_index = next((index for index, current in enumerate(document_items) if str(current.get("ContainerId") or "") == str(item.get("ContainerId") or "") and int(current.get("SlotIndex") or 0) == int(item.get("SlotIndex") or 0)), None)
             path = f"players[{player_index}].items.{container}[{item_index}].StackCount" if player_index is not None and item_index is not None else ""; quantity = session.value_for(path, quantity) if session and path else quantity
-            values = (CONTAINER_LABELS.get(container, container), item.get("SlotIndex", 0), item.get("ItemName") or item.get("ItemId") or "未知物品", item.get("ItemId") or "-", quantity)
+            item_id = str(item.get("ItemId") or "")
+            container_name = self.localization.display("containers", container)
+            localized_item = self.localization.display("items", item_id) if item_id else (item.get("ItemName") or "未知物品")
+            values = (container_name, item.get("SlotIndex", 0), localized_item, item_id or "-", quantity)
             for column, value in enumerate(values):
-                cell = QTableWidgetItem(str(value)); cell.setData(Qt.UserRole, item | {"edit_path": path}); self.player_inventory_table.setItem(row, column, cell)
+                cell = QTableWidgetItem(str(value)); cell.setData(Qt.UserRole, item | {"edit_path": path})
+                if column in {0, 2}: cell.setToolTip(f"游戏内部 ID：{container if column == 0 else item_id}")
+                self.player_inventory_table.setItem(row, column, cell)
 
     def _show_inventory_editor(self, row, _column=0, _previous_row=-1, _previous_column=-1):
         item = self.player_inventory_table.item(row, 0) if row >= 0 else None; raw = dict(item.data(Qt.UserRole) or {}) if item else {}
         self.selected_inventory_edit = raw
-        self.inventory_selected_label.setText(f"{CONTAINER_LABELS.get(str(raw.get('container') or ''), raw.get('container') or '容器')} · 槽位 {raw.get('SlotIndex', '-')} · {raw.get('ItemId') or '未知物品'}")
+        container = str(raw.get("container") or ""); item_id = str(raw.get("ItemId") or "")
+        self.inventory_selected_label.setText(f"{self.localization.display('containers', container)} · 槽位 {raw.get('SlotIndex', '-')} · {self.localization.display('items', item_id)}")
         session = self._active_edit_session(create=False); value = session.value_for(str(raw.get("edit_path") or ""), int(raw.get("StackCount") or 0)) if session else int(raw.get("StackCount") or 0); self.inventory_quantity.setValue(int(value))
 
     def stage_selected_inventory(self):
@@ -1299,6 +1397,82 @@ class MainWindow(QMainWindow):
             return ModManager.detect_remote(profile), profile
         self.run_async(detect, lambda payload: self._mod_environment_done(payload[0], payload[1]))
 
+    def start_wine_migration(self):
+        if not self.selected or self.selected.kind != "remote":
+            return QMessageBox.information(self, "Wine 迁移", "Wine 迁移仅用于远程原生 Linux 实例。")
+        data = self.selected.mod_environment or {}
+        if data.get("server_type") == "linux-wine":
+            return QMessageBox.information(self, "Wine 迁移", "当前实例已经是 Linux Wine 模式。")
+        target, ok = QInputDialog.getText(self, "隔离 Wine 安装目录", "远程绝对路径或 $HOME 相对路径：", text="$HOME/palworld-wine-server")
+        if not ok or not target.strip():
+            return
+        selected = self.selected
+        def inspect():
+            service = WineMigrationService(self._remote_client(), selected, self.ui_signals.log.emit, self._set_install_progress)
+            return service.inspect(target.strip())
+        self.run_async(inspect, self._wine_preflight_done)
+
+    def _wine_preflight_done(self, preflight: WineMigrationPreflight):
+        if not self.selected:
+            return
+        self.selected.wine_migration = {"preflight": preflight.to_dict(), "status": "ready" if preflight.ready else "blocked"}
+        self.storage.save_instances(self.instances)
+        detail = (f"系统：{preflight.distribution} ({preflight.architecture})\n目标目录：{preflight.target_dir}\n"
+                  f"Wine：{preflight.wine_path or '缺失'}\nSteamCMD：{preflight.steamcmd_path or '缺失'}\n"
+                  f"可用空间：{preflight.free_kb // 1024} MB\n缺少：{'、'.join(preflight.missing) or '无'}")
+        if not preflight.ready:
+            return QMessageBox.warning(self, "Wine 迁移条件不完整", detail + "\n\n" + "\n".join(preflight.suggestions))
+        if QMessageBox.question(self, "准备隔离 Wine 实例", detail + "\n\n下一步将创建完整备份、安装独立 Windows 服务端并在临时端口验证；不会停止原生服务。继续？") != QMessageBox.Yes:
+            return
+        selected = self.selected
+        def prepare(signals):
+            backup = BackupService().create_remote(self._remote_client(), selected, self._backup_destination(selected), selected.install_dir)
+            signals.log.emit(f"Wine 迁移前备份：{backup}")
+            return WineMigrationService(self._remote_client(), selected, signals.log.emit, signals.progress.emit).prepare(preflight), str(backup or "")
+        worker = Worker(prepare, with_signals=True); worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress); worker.signals.finished.connect(self._wine_prepared); worker.signals.error.connect(lambda error: QMessageBox.critical(self, "Wine 实例准备失败", error)); self.pool.start(worker)
+
+    def _wine_prepared(self, payload):
+        if not self.selected:
+            return
+        migration, backup = payload; migration["backup_path"] = backup
+        self.selected.wine_migration = migration; self.storage.save_instances(self.instances)
+        typed, ok = QInputDialog.getText(self, "确认切换到 Wine", f"隔离 Wine 服务已在临时端口验证。\n切换会停止原生服务。请输入实例名称“{self.selected.name}”确认：")
+        if not ok or typed.strip() != self.selected.name:
+            self.append_log("Wine 实例已准备完成，未切换生产服务")
+            return
+        selected = self.selected
+        def activate(signals):
+            return WineMigrationService(self._remote_client(), selected, signals.log.emit, signals.progress.emit).activate(migration)
+        worker = Worker(activate, with_signals=True); worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress); worker.signals.finished.connect(self._wine_activated); worker.signals.error.connect(lambda error: QMessageBox.critical(self, "Wine 切换失败", error)); self.pool.start(worker)
+
+    def _wine_activated(self, migration: dict):
+        if not self.selected:
+            return
+        self.selected.wine_migration = migration
+        self.selected.install_dir = str(migration.get("target_dir") or self.selected.install_dir)
+        self.selected.remote_profile.update({"install_dir": self.selected.install_dir, "service_name": migration.get("wine_service"), "palserver_exe": f"{self.selected.install_dir}/PalServer.exe"})
+        self.storage.save_instances(self.instances); self.append_log("Wine 迁移完成，正在重新检测模组环境"); self.detect_mod_environment()
+
+    def restore_native_server(self):
+        if not self.selected or self.selected.kind != "remote" or not self.selected.wine_migration:
+            return QMessageBox.information(self, "恢复原生服务", "当前实例没有可恢复的 Wine 迁移记录。")
+        if QMessageBox.question(self, "恢复原生 Linux 服务", "将停止 Wine 服务并重新启动原生 Linux 服务。继续？") != QMessageBox.Yes:
+            return
+        selected = self.selected; migration = dict(selected.wine_migration)
+        self.run_async(lambda: WineMigrationService(self._remote_client(), selected, self.ui_signals.log.emit).restore_native(migration), self._native_restored)
+
+    def _native_restored(self, migration: dict):
+        if not self.selected:
+            return
+        self.selected.wine_migration = migration
+        preflight = dict(migration.get("preflight") or self.selected.wine_migration.get("preflight") or {})
+        source_dir = str(migration.get("source_dir") or preflight.get("source_dir") or "")
+        source_service = str(migration.get("source_service") or preflight.get("source_service") or "palworld")
+        if source_dir:
+            self.selected.install_dir = source_dir; self.selected.remote_profile["install_dir"] = source_dir
+        self.selected.remote_profile["service_name"] = source_service
+        self.storage.save_instances(self.instances); self.append_log("已恢复原生 Linux 服务"); self.detect_mod_environment()
+
     def _mod_environment_done(self, environment: ModEnvironment, profile: dict | None = None):
         if not self.selected: return
         self.selected.mod_environment = environment.to_dict(); self.selected.mod_last_sync = __import__("datetime").datetime.now().isoformat(timespec="seconds")
@@ -1312,7 +1486,18 @@ class MainWindow(QMainWindow):
             self.mod_environment_status.setText("尚未检测，请先确认服务端类型和目录"); self.mod_paths_status.setText("Workshop / Mods / 配置路径：-"); return
         mode = {"windows": "Windows Dedicated Server", "linux-native": "原生 Linux", "linux-wine": "Linux Wine（实验）"}.get(environment.server_type, environment.server_type)
         state = "支持服务端模组" if environment.supported else "不可用"
-        self.mod_environment_status.setText(f"{mode} · {state} · {environment.reason or '环境检查通过'}" + (f" · Wine {environment.wine_version}" if environment.wine_version else ""))
+        if environment.server_type == "linux-native":
+            migration = self.selected.wine_migration or {}
+            migration_state = {"prepared": "隔离 Wine 实例已准备，可确认切换", "active": "Wine 实例已启用", "blocked": "Wine 迁移条件不完整"}.get(str(migration.get("status") or ""), "可迁移到隔离的 Linux Wine 实例")
+            self.mod_environment_status.setText(f"服务器可正常管理 · {mode} 不支持官方服务端模组 · {migration_state}")
+            self.install_catalog_button.setText("下载并校验模组包")
+            for label in ("启用", "禁用", "更新/修复", "移除"):
+                if label in self.mod_action_buttons: self.mod_action_buttons[label].setEnabled(False)
+        else:
+            self.mod_environment_status.setText(f"{mode} · {state} · {environment.reason or '环境检查通过'}" + (f" · Wine {environment.wine_version}" if environment.wine_version else ""))
+            self.install_catalog_button.setText("安装到当前服务器")
+            for label in ("启用", "禁用", "更新/修复", "移除"):
+                if label in self.mod_action_buttons: self.mod_action_buttons[label].setEnabled(environment.supported)
         self.mod_paths_status.setText(f"Workshop：{environment.workshop_root or '-'}\nManagedMods：{environment.managed_mods_dir or '-'}\nUE4SS：{environment.ue4ss_root or '-'} · Mods：{environment.ue4ss_mods_dir or '-'} · NativeMods：{environment.native_mods_dir or '-'}\nPAK：{environment.paks_dir or '-'}\n配置：{environment.settings_path or '-'}\n可写目录：{len(environment.writable_paths)} 个")
 
     def _stored_mods(self) -> list[ModManifest]:
@@ -1421,7 +1606,6 @@ class MainWindow(QMainWindow):
         data = self.selected.mod_environment or {}
         if not data: return QMessageBox.warning(self, "需要检测", "请先检测当前服务器的模组环境")
         environment = ModEnvironment(**{key: item for key, item in data.items() if key in ModEnvironment.__dataclass_fields__})
-        if not environment.supported: return QMessageBox.warning(self, "当前服务器不支持模组", environment.reason or "模组环境不可用")
         selected = self.selected
         def prepare(signals):
             if selected.kind == "remote":
@@ -1440,6 +1624,10 @@ class MainWindow(QMainWindow):
         existing = next((mod for mod in self._stored_mods() if mod.package_name == manifest.package_name), None)
         if existing: manifest.enabled, manifest.install_path = existing.enabled, existing.install_path
         self._add_imported_mod(manifest); self.mod_views.setCurrentIndex(1); self._select_mod_package(manifest.package_name)
+        data = self.selected.mod_environment if self.selected else {}
+        if data.get("server_type") == "linux-native":
+            QMessageBox.information(self, "模组已下载", "模组包已下载并完成清单校验。原生 Linux 不支持部署，可在完成 Wine 迁移后启用。")
+            return
         self.enable_selected_mod()
 
     def enable_selected_mod(self):
@@ -1731,6 +1919,34 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "plm_plugin_status"): return
         ready, detail = PlmCodecPlugin(self.storage.root).probe()
         self.plm_plugin_status.setText(("可用" if ready else "只读") + f" · 固定提交 {PALWORLD_SAVE_TOOLS_COMMIT[:12]} · {detail}")
+
+    def _refresh_localization_status(self):
+        if not hasattr(self, "localization_status"):
+            return
+        catalog = self.localization.catalog
+        counts = sum(len(values) for values in catalog.entries.values())
+        source = "内置与本地缓存" if catalog.build_id == "builtin" else f"游戏/导入资源 {catalog.build_id}"
+        self.localization_status.setText(f"中文资源：{source} · {counts} 条映射")
+
+    def detect_localization_source(self):
+        path = self.localization.detect_palworld_client()
+        if path:
+            QMessageBox.information(self, "检测到 Palworld 客户端", f"客户端目录：{path}\n\n程序只读取本地化资源，不修改或上传游戏文件。若已有提取后的 JSON 目录，可点击“导入中文资源”。")
+        else:
+            QMessageBox.information(self, "未检测到客户端", "没有在本机 Steam 库中检测到 Palworld 客户端。当前继续使用内置及已缓存中文词典，也可手动导入提取后的中文资源目录。")
+
+    def import_localization_source(self):
+        path = QFileDialog.getExistingDirectory(self, "选择中文资源目录（pal.json / items.json 等）")
+        if not path:
+            return
+        try:
+            catalog = self.localization.import_asset_directory(Path(path))
+        except Exception as exc:
+            return QMessageBox.critical(self, "中文资源导入失败", str(exc))
+        self._refresh_localization_status()
+        if self.active_player_uid:
+            self._load_player_role(self.active_player_uid, [str(self.player_role_combo.itemData(index)) for index in range(self.player_role_combo.count())])
+        QMessageBox.information(self, "中文资源已更新", f"版本：{catalog.build_id}\n帕鲁：{len(catalog.entries.get('pals', {}))}\n物品：{len(catalog.entries.get('items', {}))}")
 
     def install_plm_plugin(self):
         plugin = PlmCodecPlugin(self.storage.root)
