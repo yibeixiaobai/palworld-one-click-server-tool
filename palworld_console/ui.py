@@ -507,7 +507,9 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             self.update_status.setText(f"更新已下载：{installer}")
             return
-        if not QProcess.startDetached(str(installer), []):
+        started = QProcess.startDetached(str(installer), [])
+        started_ok = started[0] if isinstance(started, tuple) else started
+        if not started_ok:
             QMessageBox.warning(self, "启动安装器失败", "安装器无法启动，请在更新目录中手动运行。")
             return
         QApplication.quit()
@@ -1127,7 +1129,8 @@ class MainWindow(QMainWindow):
             self.install_progress.setValue(100); self.install_percent.setText("100%")
 
     def _backup_task_failed(self, error):
-        self.append_log(f"备份任务失败：{error}"); self.install_stage.setText("备份失败"); self.install_message.setText(error); self._finish_backup_task(False); QMessageBox.critical(self, "备份失败", error)
+        message = self._friendly_backup_error(error)
+        self.append_log(f"备份任务失败：{message}"); self.install_stage.setText("备份失败"); self.install_message.setText(message); self._finish_backup_task(False); QMessageBox.critical(self, "备份失败", message)
 
     def _selected_backup_path(self):
         if not hasattr(self, "backup_table") or self.backup_table.currentRow() < 0: return None
@@ -1138,11 +1141,17 @@ class MainWindow(QMainWindow):
         if not self.selected: return
         package = self._selected_backup_path()
         if not package: return QMessageBox.information(self, "恢复", "请先在备份列表中选择一个备份。")
+        package = Path(package).expanduser().resolve()
+        if not package.exists():
+            return QMessageBox.critical(self, "恢复前预检失败", f"备份文件已被移动或删除，请重新导入：\n{package}")
+        if not package.is_file():
+            return QMessageBox.critical(self, "恢复前预检失败", f"所选备份不是文件：\n{package}")
         repository = self._backup_repository()
         if package.suffix.lower() != ".pwcbackup":
             if QMessageBox.question(self, "转换旧备份", "所选文件是旧格式，必须先转换并校验为 .pwcbackup。继续吗？") != QMessageBox.Yes: return
             try: package = repository.import_source(package, self.selected)
             except Exception as exc: return QMessageBox.critical(self, "旧备份转换失败", str(exc))
+            package = Path(package).resolve()
             self.refresh_backup_list()
         transaction = RestoreTransaction()
         try:
@@ -1166,6 +1175,10 @@ class MainWindow(QMainWindow):
         reason, ok = QInputDialog.getText(self, "恢复原因", "请输入恢复或迁服原因：")
         if not ok or not reason.strip(): return
         selected = self.selected; admin = self.storage.get_secret(selected.admin_secret_ref); server_password = self.storage.get_secret(selected.server_password_secret_ref)
+        if selected.kind == "local":
+            saved = Path(selected.install_dir).expanduser().resolve() / "Pal" / "Saved"
+            if not saved.is_dir():
+                return QMessageBox.critical(self, "恢复前预检失败", f"目标服务器尚未安装或未检测到 Saved 目录：\n{saved}")
         self._begin_backup_task("恢复服务器存档")
         worker = Worker(lambda signals: self._run_restore_transaction(signals, selected, package, repository, components, admin, server_password, player_uid), with_signals=True)
         worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress)
@@ -1198,7 +1211,8 @@ class MainWindow(QMainWindow):
     def _restore_failed(self, error):
         if self.selected:
             AuditService.record(self.selected, "恢复存档", str(self._selected_backup_path() or ""), result="失败", detail=error); self.storage.save_instances(self.instances); self._render_audit()
-        self.append_log(f"恢复失败：{error}"); self.install_stage.setText("恢复失败"); self.install_message.setText(error); self._finish_backup_task(False); self.refresh_backup_list(); QMessageBox.critical(self, "恢复失败", error)
+        message = self._friendly_backup_error(error)
+        self.append_log(f"恢复失败：{message}"); self.install_stage.setText("恢复失败"); self.install_message.setText(message); self._finish_backup_task(False); self.refresh_backup_list(); QMessageBox.critical(self, "恢复失败", message)
 
     def import_backup_file(self):
         if not self.selected: return
@@ -1212,11 +1226,22 @@ class MainWindow(QMainWindow):
 
     def _import_backup_source(self, source):
         if self.install_task_active: return QMessageBox.information(self, "任务进行中", "当前服务器任务尚未结束。")
+        source = Path(source).expanduser().resolve()
+        if not source.exists(): return QMessageBox.warning(self, "导入前检查失败", f"待导入文件或目录不存在：\n{source}")
         selected = self.selected; repository = self._backup_repository(); self._begin_backup_task("导入备份")
-        worker = Worker(lambda: repository.import_source(source, selected)); worker.signals.finished.connect(self._import_backup_done); worker.signals.error.connect(self._backup_task_failed); self.pool.start(worker)
+        def import_task(signals):
+            return repository.import_source(source, selected, on_progress=lambda percent, message: signals.progress.emit(TaskProgress(percent, "导入备份", message)))
+        worker = Worker(import_task, with_signals=True); worker.signals.progress.connect(self._set_install_progress); worker.signals.finished.connect(self._import_backup_done); worker.signals.error.connect(self._backup_task_failed); self.pool.start(worker)
 
     def _import_backup_done(self, path):
-        self.append_log(f"备份已导入并校验：{path}"); self._finish_backup_task(); self.refresh_backup_list()
+        self.append_log(f"备份已导入并校验：{path}"); self._finish_backup_task(); self.refresh_backup_list(Path(path))
+
+    @staticmethod
+    def _friendly_backup_error(error) -> str:
+        text = str(error)
+        if "[Errno 2]" in text or "No such file" in text:
+            return f"恢复所需的文件或目录不存在。请重新导入备份并确认服务器已完成安装。\n原始信息：{text}"
+        return text
 
     def export_selected_backup(self):
         package = self._selected_backup_path()
@@ -2621,9 +2646,9 @@ class MainWindow(QMainWindow):
         for row, item in enumerate(rows):
             for column, value in enumerate((item.player_uid, item.player_name, item.platform, item.note)): self.whitelist_table.setItem(row, column, QTableWidgetItem(str(value)))
 
-    def refresh_backup_list(self):
+    def refresh_backup_list(self, preferred_path: Path | None = None):
         if not hasattr(self, "backup_table") or not self.selected: return
-        selected_path = self._selected_backup_path()
+        selected_path = preferred_path.resolve() if preferred_path else self._selected_backup_path()
         records = self._backup_repository().list(); self.backup_records = records
         self.backup_table.setSortingEnabled(False); self.backup_table.setRowCount(len(records))
         type_labels = {"world": "世界导出", "disaster": "完整灾备", "restore-point": "恢复点"}

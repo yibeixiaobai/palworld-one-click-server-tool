@@ -61,6 +61,41 @@ def test_progress_widget_supports_indeterminate_and_determinate_states(window):
     assert window.install_percent.text() == "64%"
 
 
+def test_update_check_states_and_automatic_failure(window, monkeypatch):
+    messages = []
+    logs = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: messages.append(args) or QMessageBox.Ok)
+    monkeypatch.setattr(window, "append_log", logs.append)
+
+    window.update_check_active = True
+    window.update_button.setEnabled(False)
+    window._update_check_done(None, automatic=False)
+    assert window.update_check_active is False
+    assert window.update_button.isEnabled()
+    assert "最新" in window.update_status.text()
+    assert messages
+
+    message_count = len(messages)
+    window._update_check_failed("offline", automatic=True)
+    assert len(messages) == message_count
+    assert logs == ["自动更新检查失败：offline"]
+
+
+def test_installer_start_failure_does_not_quit(window, tmp_path, monkeypatch):
+    installer = tmp_path / "setup.exe"; installer.write_bytes(b"setup")
+    warnings = []
+    quit_calls = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.Yes)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args) or QMessageBox.Ok)
+    monkeypatch.setattr(ui_module.QProcess, "startDetached", lambda *_args: (False, -1))
+    monkeypatch.setattr(ui_module.QApplication, "quit", lambda: quit_calls.append(True))
+
+    window._update_download_done(installer)
+
+    assert warnings
+    assert quit_calls == []
+
+
 def test_install_task_locks_and_restores_instance_controls(window, monkeypatch):
     window.selected = None
     window._begin_install_task("正在安装…")
@@ -104,6 +139,24 @@ def test_backup_page_uses_selected_verified_package_and_details(window, tmp_path
     assert window._selected_backup_path() == package
     assert "WORLD-UI" in window.backup_details.toPlainText()
     assert "可恢复组件：world" in window.backup_details.toPlainText()
+
+
+def test_imported_backup_is_selected_after_refresh(window, tmp_path):
+    install = tmp_path / "server"
+    saved = install / "Pal" / "Saved"
+    world = saved / "SaveGames" / "0" / "WORLD-IMPORT"
+    (world / "Players").mkdir(parents=True)
+    (world / "Level.sav").write_bytes(b"save")
+    source = tmp_path / "upload.zip"
+    import zipfile
+    with zipfile.ZipFile(source, "w") as archive:
+        for path in saved.rglob("*"):
+            if path.is_file():
+                archive.write(path, Path("Saved") / path.relative_to(saved))
+    window.selected.install_dir = str(install)
+    imported = window._backup_repository().import_source(source, window.selected)
+    window.refresh_backup_list(imported)
+    assert window._selected_backup_path() == imported
 
 
 def test_restore_dialog_requires_advanced_confirmation_for_incomplete_package(window, tmp_path, monkeypatch):

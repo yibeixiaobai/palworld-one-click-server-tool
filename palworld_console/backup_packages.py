@@ -29,6 +29,28 @@ MAX_COMPRESSION_RATIO = 250
 SECRET_FIELDS = ("AdminPassword", "ServerPassword")
 
 
+def _require_file(path: Path, label: str) -> Path:
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"{label}不存在：{resolved}")
+    if not resolved.is_file():
+        raise ValueError(f"{label}不是文件：{resolved}")
+    try:
+        with resolved.open("rb"):
+            pass
+    except OSError as exc:
+        raise RuntimeError(f"无法读取{label}：{resolved}；{exc}") from exc
+    return resolved
+
+
+def _stage_error(stage: str, exc: Exception) -> RuntimeError:
+    if isinstance(exc, FileNotFoundError):
+        path = getattr(exc, "filename", None)
+        detail = f"路径：{path}" if path else str(exc)
+        return RuntimeError(f"{stage}失败：找不到所需文件或目录。{detail}")
+    return RuntimeError(f"{stage}失败：{exc}")
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -243,8 +265,12 @@ class BackupPackageService:
                 target.write_bytes(archive.read(entry.path))
         return manifest
 
-    def import_source(self, source: Path, instance: ServerInstance, destination: Path, backup_type: str = "world") -> Path:
-        source = source.resolve()
+    def import_source(self, source: Path, instance: ServerInstance, destination: Path, backup_type: str = "world", on_progress: Callable[[int, str], None] | None = None) -> Path:
+        source = Path(source).expanduser().resolve()
+        if not source.exists():
+            raise FileNotFoundError(f"待导入文件或目录不存在：{source}")
+        if on_progress:
+            on_progress(10, "正在读取本地备份文件")
         if source.is_file() and source.suffix.lower() == ".pwcbackup":
             self.validate(source)
             destination.mkdir(parents=True, exist_ok=True)
@@ -253,6 +279,8 @@ class BackupPackageService:
                 target = destination / f"{source.stem}-{uuid.uuid4().hex[:8]}.pwcbackup"
             shutil.copy2(source, target)
             self.validate(target)
+            if on_progress:
+                on_progress(100, "备份包已校验并导入")
             return target
         with tempfile.TemporaryDirectory(prefix="palworld-import-") as temp_name:
             temp = Path(temp_name)
@@ -265,16 +293,27 @@ class BackupPackageService:
                 shutil.copy2(source, world / "Level.sav")
                 incomplete = True
             elif zipfile.is_zipfile(source):
+                if on_progress:
+                    on_progress(30, "正在安全解包 ZIP 压缩包")
                 self._extract_legacy_zip(source, temp)
             elif tarfile.is_tarfile(source):
+                if on_progress:
+                    on_progress(30, "正在安全解包 TAR 压缩包")
                 self._extract_legacy_tar(source, temp)
             else:
                 raise ValueError("仅支持 .pwcbackup、ZIP、TAR.GZ、Saved/SaveGames 目录或 Level.sav")
+            if on_progress:
+                on_progress(55, "正在定位 Saved/SaveGames 目录")
             saved = self._locate_saved_root(temp)
             players = list((saved / "SaveGames").rglob("Players/*.sav")) if (saved / "SaveGames").exists() else []
             if not players:
                 incomplete = True
-            return self.create(instance, saved, destination, backup_type, "从旧备份或外部存档导入", incomplete)
+            if on_progress:
+                on_progress(75, "正在生成统一 .pwcbackup 并校验 SHA-256")
+            result = self.create(instance, saved, destination, backup_type, "从旧备份或外部存档导入", incomplete)
+            if on_progress:
+                on_progress(100, "压缩包已导入并完成校验")
+            return result
 
     @staticmethod
     def _copy_directory_safe(source: Path, destination: Path) -> None:
@@ -410,8 +449,8 @@ class BackupRepository:
         self._write_index(records)
         return records
 
-    def import_source(self, source: Path, instance: ServerInstance, backup_type: str = "world") -> Path:
-        path = self.service.import_source(source, instance, self.root, backup_type)
+    def import_source(self, source: Path, instance: ServerInstance, backup_type: str = "world", on_progress: Callable[[int, str], None] | None = None) -> Path:
+        path = self.service.import_source(source, instance, self.root, backup_type, on_progress)
         self.set_metadata(path, verified_at=_utc_now())
         return path
 
@@ -515,6 +554,7 @@ class RestoreTransaction:
         self.packages = package_service or BackupPackageService()
 
     def plan(self, package: Path, instance: ServerInstance, components: Iterable[str] | None = None) -> RestorePlan:
+        package = _require_file(Path(package), "备份文件")
         manifest = self.packages.validate(package)
         selected = tuple(component for component in (components or manifest.components) if component in manifest.components or (component == "player" and "world" in manifest.components))
         cross = manifest.source_instance_id != instance.id
@@ -564,17 +604,25 @@ class RestoreTransaction:
         server_password: str = "",
         player_uid: str = "",
     ) -> RestoreResult:
+        package = _require_file(Path(package), "备份文件")
+        package = _require_file(Path(package), "备份文件")
         plan = self.plan(package, instance, components)
-        saved = Path(instance.install_dir) / "Pal" / "Saved"
+        install_dir = Path(instance.install_dir).expanduser().resolve() if instance.install_dir else None
+        if not install_dir or not install_dir.is_dir():
+            raise FileNotFoundError(f"目标服务器安装目录不存在：{install_dir or instance.install_dir or '未设置'}")
+        saved = install_dir / "Pal" / "Saved"
         if not saved.is_dir():
-            raise FileNotFoundError(f"找不到目标 Saved 目录: {saved}")
+            raise FileNotFoundError(f"目标服务器尚未安装或未检测到 Saved 目录：{saved}")
         current_size = sum(path.stat().st_size for path in saved.rglob("*") if path.is_file())
         required_space = current_size * 2 + max(1, plan.estimated_bytes // 3)
         if shutil.disk_usage(saved.parent).free < required_space:
             raise RuntimeError("恢复空间不足，需要当前存档、暂存副本和回滚副本的总空间")
         stop()
         try:
-            restore_point = self.packages.create(instance, saved, repository.root, "restore-point", "恢复操作自动创建的恢复点")
+            try:
+                restore_point = self.packages.create(instance, saved, repository.root, "restore-point", "恢复操作自动创建的恢复点")
+            except Exception as exc:
+                raise _stage_error("创建恢复前恢复点", exc) from exc
             repository.set_metadata(restore_point, protected=True, verified_at=_utc_now())
         except Exception:
             start()
@@ -582,9 +630,16 @@ class RestoreTransaction:
         rollback = saved.with_name(f"{saved.name}.rollback-{uuid.uuid4().hex}")
         staging = saved.with_name(f"{saved.name}.restore-{uuid.uuid4().hex}")
         try:
-            shutil.copytree(saved, staging)
-            self._apply_to_staging(package, staging, plan.components, instance, admin_password, server_password, player_uid)
-            self._validate_staging(staging, plan.components)
+            try:
+                staging.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(saved, staging)
+            except Exception as exc:
+                raise _stage_error("创建恢复暂存目录", exc) from exc
+            try:
+                self._apply_to_staging(package, staging, plan.components, instance, admin_password, server_password, player_uid)
+                self._validate_staging(staging, plan.components)
+            except Exception as exc:
+                raise _stage_error("准备恢复内容", exc) from exc
             saved.rename(rollback)
             staging.rename(saved)
             start()
@@ -628,12 +683,16 @@ class RestoreTransaction:
         if platform_name == "windows":
             install_dir = WindowsRemotePath.normalize(install_dir)
             saved_path = ntpath.join(install_dir, "Pal", "Saved")
-            tool_dir = ntpath.join(install_dir, "_tools")
+            tool_dir = str(instance.remote_profile.get("restore_temp_dir") or ntpath.join(install_dir, "_tools"))
         else:
             if not install_dir.startswith("/"):
                 raise ValueError("Linux 远程安装目录必须是绝对路径")
             saved_path = f"{install_dir}/Pal/Saved"
-            tool_dir = f"{install_dir}/_tools"
+            # SteamCMD may live in ~/.local/share/SteamCMD; restore archives only
+            # need a writable temporary directory and must not assume install/_tools.
+            tool_dir = str(instance.remote_profile.get("restore_temp_dir") or "/tmp")
+        self._check_remote_paths(client, platform_name, saved_path)
+        self._ensure_remote_temp_dir(client, platform_name, tool_dir)
         self._check_remote_space(client, platform_name, saved_path, max(1, plan.estimated_bytes // 3))
         stop()
         try:
@@ -657,8 +716,11 @@ class RestoreTransaction:
             temp = Path(temp_name)
             payload = temp / "Saved"
             payload.mkdir()
-            self._build_remote_payload(package, payload, plan.components, instance, client, admin_password, server_password, player_uid)
-            self._validate_staging(payload, plan.components)
+            try:
+                self._build_remote_payload(package, payload, plan.components, instance, client, admin_password, server_password, player_uid)
+                self._validate_staging(payload, plan.components)
+            except Exception as exc:
+                raise _stage_error("准备远程恢复内容", exc) from exc
             local_archive = temp / f"restore{archive_suffix}"
             if platform_name == "windows":
                 with zipfile.ZipFile(local_archive, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
@@ -667,8 +729,13 @@ class RestoreTransaction:
             else:
                 with tarfile.open(local_archive, "w:gz") as archive:
                     for path in sorted(payload.iterdir()): archive.add(path, arcname=path.name, recursive=True)
+            if not local_archive.is_file():
+                raise RuntimeError(f"远程恢复归档生成失败：{local_archive}")
             local_hash = _sha256(local_archive)
-            client.upload_file(local_archive, remote_archive)
+            try:
+                client.upload_file(local_archive, remote_archive)
+            except Exception as exc:
+                raise _stage_error("上传远程恢复压缩包", exc) from exc
             if platform_name == "windows":
                 code, output, error = client.run_powershell(f"(Get-FileHash -LiteralPath {RemoteHostClient._ps_literal(remote_archive)} -Algorithm SHA256).Hash")
             else:
@@ -695,6 +762,35 @@ class RestoreTransaction:
                 except Exception as rollback_exc:
                     raise RuntimeError(f"远程恢复失败且自动回滚失败：{rollback_exc}；原错误：{exc}") from exc
                 raise RuntimeError(f"远程恢复失败，已自动回滚：{exc}") from exc
+
+    @staticmethod
+    def _check_remote_paths(client, platform_name: str, saved_path: str) -> None:
+        if platform_name == "windows":
+            from .services import RemoteHostClient
+            q = RemoteHostClient._ps_literal
+            script = f"$s=Test-Path -LiteralPath {q(saved_path)}; @{{saved=$s}}|ConvertTo-Json -Compress"
+            code, output, error = client.run_powershell(script)
+        else:
+            script = f"printf '{{\"saved\":%s}}' \"$(test -d {shlex.quote(saved_path)} && echo true || echo false)\""
+            code, output, error = client.run(script)
+        if code:
+            raise RuntimeError(error.strip() or output.strip() or "无法检查远程恢复目录")
+        try:
+            payload = json.loads(output.strip().splitlines()[-1])
+        except (ValueError, IndexError) as exc:
+            raise RuntimeError("远程恢复目录探针返回无效结果") from exc
+        if not payload.get("saved"):
+            raise FileNotFoundError(f"远程目标 Saved 目录不存在：{saved_path}")
+
+    @staticmethod
+    def _ensure_remote_temp_dir(client, platform_name: str, temp_dir: str) -> None:
+        if platform_name == "windows":
+            from .services import RemoteHostClient
+            code, output, error = client.run_powershell(f"New-Item -ItemType Directory -Force -Path {RemoteHostClient._ps_literal(temp_dir)} | Out-Null")
+        else:
+            code, output, error = client.run(f"mkdir -p -- {shlex.quote(temp_dir)}")
+        if code:
+            raise RuntimeError(error.strip() or output.strip() or f"无法准备远程临时目录：{temp_dir}")
 
     @staticmethod
     def _check_remote_space(client, platform_name: str, saved_path: str, incoming_bytes: int) -> None:

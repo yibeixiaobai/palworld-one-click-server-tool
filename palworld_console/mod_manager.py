@@ -18,6 +18,8 @@ import urllib.request
 import zipfile
 import shlex
 
+from . import __version__
+
 
 @dataclass
 class ModManifest:
@@ -146,7 +148,7 @@ class WorkshopCatalogService:
         params = {"appid": self.APP_ID, "browsesort": sort, "section": "readytouseitems", "actualsort": sort, "p": str(page)}
         if query.strip(): params["searchtext"] = query.strip()
         try:
-            request = urllib.request.Request(self.BASE_URL + "?" + urllib.parse.urlencode(params), headers={"User-Agent": "Mozilla/5.0 PalworldConsole/0.3", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7"})
+            request = urllib.request.Request(self.BASE_URL + "?" + urllib.parse.urlencode(params), headers={"User-Agent": f"Mozilla/5.0 PalworldConsole/{__version__}", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7"})
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response: source = response.read().decode("utf-8", errors="replace")
             items = self.parse_catalog(source)
             if not items: raise RuntimeError("Steam Workshop 页面未返回可识别的模组条目")
@@ -160,7 +162,7 @@ class WorkshopCatalogService:
     def fetch_detail(self, item: WorkshopCatalogItem) -> WorkshopCatalogItem:
         cache = self.cache_dir / f"detail-{item.workshop_id}.json"; cached = self._read_cache(cache)
         if cached and time.time() - cache.stat().st_mtime < self.ttl_seconds: return WorkshopCatalogItem(**cached)
-        request = urllib.request.Request(item.detail_url, headers={"User-Agent": "Mozilla/5.0 PalworldConsole/0.3", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7"})
+        request = urllib.request.Request(item.detail_url, headers={"User-Agent": f"Mozilla/5.0 PalworldConsole/{__version__}", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7"})
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response: source = response.read().decode("utf-8", errors="replace")
             description_match = re.search(r'<meta[^>]+property="og:description"[^>]+content="([^"]*)"', source, re.I)
@@ -374,7 +376,7 @@ class ModPackageService:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("请输入有效的 HTTP/HTTPS 模组地址")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        request = urllib.request.Request(url.strip(), headers={"User-Agent": "PalworldConsole/0.3"})
+        request = urllib.request.Request(url.strip(), headers={"User-Agent": f"PalworldConsole/{__version__}"})
         suffix = Path(parsed.path).suffix.lower()
         temporary = self.cache_dir / f"download-{uuid_token()}{suffix or '.download'}"
         received = 0

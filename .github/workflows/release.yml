@@ -91,6 +91,9 @@ jobs:
       - name: Commit version and create tag
         run: |
           $version = "${{ steps.version.outputs.version }}"
+          git restore --worktree palworld_console.egg-info
+          $unexpected = @(git status --porcelain | Where-Object { $_ -notmatch ' palworld_console/VERSION$' })
+          if ($unexpected.Count -gt 0) { throw "Unexpected release worktree changes: $($unexpected -join ', ')" }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add palworld_console/VERSION

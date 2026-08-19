@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Callable
 
+from . import __version__
 from .config_ini import PalWorldSettings, default_settings_path, settings_path
 from .models import ConfigSyncResult, EndpointStatus, GuildSummary, LocalSteamCmdState, PlayerRecord, PrerequisiteStatus, RemotePlatformProfile, RemoteVolume, ServerHealthSnapshot, ServerInstance, TaskProgress, UninstallResult
 
@@ -121,7 +122,7 @@ class LocalSteamCmdManager:
             repaired = executable.exists(); root.mkdir(parents=True, exist_ok=True); archive = root / "steamcmd.zip.download"
             progress(TaskProgress(5, "下载 SteamCMD", "正在从 Steam 官方地址下载", True))
             try:
-                request = urllib.request.Request(self.DOWNLOAD_URL, headers={"User-Agent": "PalworldConsole/0.3"})
+                request = urllib.request.Request(self.DOWNLOAD_URL, headers={"User-Agent": f"PalworldConsole/{__version__}"})
                 with urllib.request.urlopen(request, timeout=60) as response, archive.open("wb") as output:
                     total = int(response.headers.get("Content-Length") or 0); received = 0
                     while True:

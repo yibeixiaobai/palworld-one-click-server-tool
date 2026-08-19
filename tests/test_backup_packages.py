@@ -95,6 +95,35 @@ def test_raw_level_import_is_marked_incomplete(tmp_path: Path):
     assert manifest.player_count == 0
 
 
+def test_restore_preflight_reports_missing_target_saved_directory(tmp_path: Path):
+    source_saved = make_saved(tmp_path / "source", "WORLD-SOURCE")
+    package = BackupPackageService().create(ServerInstance(id="source"), source_saved, tmp_path / "packages")
+    target = ServerInstance(id="target", install_dir=str(tmp_path / "missing-server"))
+    with pytest.raises(FileNotFoundError, match="目标服务器安装目录不存在"):
+        RestoreTransaction().execute_local(package, target, BackupRepository(tmp_path / "repository", target.id), ("world",), lambda: pytest.fail("不应停止服务"), lambda: None, lambda: True)
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar.gz", "tgz"])
+def test_legacy_compressed_archives_import_to_verified_package(tmp_path: Path, archive_kind: str):
+    saved = make_saved(tmp_path / "server", "WORLD-ARCHIVE")
+    archive_path = tmp_path / f"upload.{archive_kind}"
+    if archive_kind == "zip":
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            for path in saved.rglob("*"):
+                if path.is_file():
+                    archive.write(path, Path("Saved") / path.relative_to(saved))
+    else:
+        with tarfile.open(archive_path, "w:gz") as archive:
+            archive.add(saved, arcname="Saved")
+    progress = []
+    package = BackupPackageService().import_source(archive_path, ServerInstance(id="imported"), tmp_path / "packages", on_progress=lambda percent, message: progress.append((percent, message)))
+    manifest = BackupPackageService().validate(package)
+    assert manifest.components == ("world",)
+    assert manifest.world_id == "WORLD-ARCHIVE"
+    assert progress[0][0] == 10
+    assert progress[-1][0] == 100
+
+
 def test_local_restore_replaces_world_and_preserves_target_identity_and_secrets(tmp_path: Path):
     source_saved = make_saved(tmp_path / "source", "WORLD-SOURCE", "do-not-export")
     source = ServerInstance(id="source", name="Source", install_dir=str(tmp_path / "source"))
@@ -268,12 +297,18 @@ class RemoteRestoreClient:
 
     def run(self, command):
         self.commands.append(("run", command))
+        if "test -d" in command and '"saved"' in command:
+            return 0, '{"saved":true}', ""
         if command.startswith("saved=$(du -sb"): return 0, '{"saved":1024,"free":10737418240}', ""
         if command.startswith("sha256sum"): return 0, self.upload_hash, ""
         return 0, "", ""
 
     def run_powershell(self, script):
         self.commands.append(("powershell", script))
+        if "Test-Path" in script and "@{saved=" in script:
+            return 0, '{"saved":true}', ""
+        if "New-Item -ItemType Directory" in script:
+            return 0, "", ""
         if "Measure-Object Length" in script: return 0, '{"saved":1024,"free":10737418240}', ""
         if "Get-FileHash" in script: return 0, self.upload_hash, ""
         return 0, "", ""
@@ -320,3 +355,6 @@ def test_remote_restore_uses_platform_atomic_replace_and_verified_restore_point(
     else:
         assert "tar -xzf" in command_text
         assert "mv --" in command_text
+        upload_paths = [command for kind, command in client.commands if kind == "upload"]
+        assert upload_paths and "/tmp/restore-" in upload_paths[0]
+        assert "/srv/palworld/target/_tools" not in upload_paths[0]
