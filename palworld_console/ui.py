@@ -6,9 +6,10 @@ from pathlib import Path
 import platform
 import re
 import sys
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt
+import threading
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt, QProcess, QTimer
 from PySide6.QtGui import QAction, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QPushButton, QPlainTextEdit, QProgressBar, QScrollArea, QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QLineEdit, QVBoxLayout, QWidget, QInputDialog, QAbstractItemView, QStackedWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QPushButton, QPlainTextEdit, QProgressBar, QProgressDialog, QScrollArea, QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QLineEdit, QVBoxLayout, QWidget, QInputDialog, QAbstractItemView, QStackedWidget)
 from PySide6.QtCore import QSettings
 
 from .config_ini import coerce_setting_value
@@ -27,6 +28,7 @@ from .wine_migration import WineMigrationPreflight, WineMigrationService
 from .settings_schema import CATEGORIES, PRESETS, SETTING_BY_KEY, SETTING_DEFINITIONS
 from .storage import AppStorage
 from .backup_packages import BackupPackageService, BackupRepository, RestoreTransaction
+from .updater import ReleaseInfo, UpdateService
 
 
 class WorkerSignals(QObject):
@@ -174,9 +176,15 @@ class MainWindow(QMainWindow):
         self.ui_signals = UiSignals()
         self.ui_signals.log.connect(self.append_log)
         self.pool = QThreadPool.globalInstance()
+        self.update_service = UpdateService(storage_root=self.storage.root)
+        self.update_check_active = False
+        self.update_cancel: threading.Event | None = None
+        self.update_progress_dialog: QProgressDialog | None = None
         self._build_ui()
         self._refresh_instances()
         self._restore_ui_state()
+        if sys.platform == "win32" and getattr(sys, "frozen", False):
+            QTimer.singleShot(1500, lambda: self.check_for_updates(True))
 
     def _build_ui(self):
         menu = self.menuBar().addMenu("文件")
@@ -423,6 +431,10 @@ class MainWindow(QMainWindow):
         w = QWidget(); l = QVBoxLayout(w); l.setContentsMargins(36, 30, 36, 30)
         name = QLabel("幻兽帕鲁服务器控制台"); name.setStyleSheet("font-size:26px;font-weight:700;color:#087f5b;"); l.addWidget(name)
         version = QLabel(f"版本 {__version__}  ·  作者：江小白Cresent"); version.setStyleSheet("font-size:15px;font-weight:600;"); l.addWidget(version)
+        update_group = QGroupBox("软件更新"); update_layout = QHBoxLayout(update_group)
+        self.update_status = QLabel("尚未检查更新"); self.update_status.setWordWrap(True); update_layout.addWidget(self.update_status, 1)
+        self.update_button = QPushButton("检查更新"); self.update_button.clicked.connect(lambda: self.check_for_updates(False)); update_layout.addWidget(self.update_button)
+        l.addWidget(update_group)
         info = QGroupBox("运行环境"); form = QFormLayout(info); form.addRow("Python", QLabel(platform.python_version()));
         try:
             from PySide6 import __version__ as qt_version
@@ -432,6 +444,83 @@ class MainWindow(QMainWindow):
         privacy = QLabel("隐私与安全：SSH 密码、私钥口令和管理密码保存在 Windows Credential Manager；实例 JSON、日志和计划任务不保存凭据明文。远程 REST 与 RCON 默认仅通过 SSH 隧道访问。")
         privacy.setWordWrap(True); l.addWidget(privacy)
         credits = QGroupBox("开源致谢与许可证"); cl = QVBoxLayout(credits); credit_text = QLabel("PySide6 · Paramiko · keyring · requests\nPlM 插件按需从固定提交构建，与主程序隔离。上游组件包含 Apache-2.0、GPL-3.0-or-later 及 Oodle 压缩源码授权警告，程序不随安装包再分发相关源码或二进制。\n功能流程参考 palworld-server-tool；本程序不包含地图功能，也不复制其界面或素材。\n模组系统遵循官方 Windows Dedicated Server 安装规则；原生 Linux 不标记为支持，Linux Wine 功能属于实验模式，变更前必须备份并通过健康检查。"); credit_text.setWordWrap(True); cl.addWidget(credit_text); l.addWidget(credits); l.addStretch(); return w
+
+    def check_for_updates(self, automatic: bool = False):
+        if self.update_check_active:
+            return
+        self.update_check_active = True
+        self.update_button.setEnabled(False)
+        self.update_status.setText("正在检查最新稳定版本…")
+        from . import __version__
+        worker = Worker(lambda: self.update_service.check_latest(__version__))
+        worker.signals.finished.connect(lambda info: self._update_check_done(info, automatic))
+        worker.signals.error.connect(lambda error: self._update_check_failed(error, automatic))
+        self.pool.start(worker)
+
+    def _update_check_done(self, info: ReleaseInfo | None, automatic: bool):
+        self.update_check_active = False; self.update_button.setEnabled(True)
+        if info is None:
+            self.update_status.setText("当前已是最新稳定版本")
+            if not automatic:
+                QMessageBox.information(self, "检查更新", "当前已是最新稳定版本。")
+            return
+        self.update_status.setText(f"发现新版本 v{info.version_text}")
+        body = info.body[:1200] if info.body else "该版本没有发布说明。"
+        answer = QMessageBox.question(self, "发现新版本", f"发现 v{info.version_text}，是否下载更新？\n\n{body}")
+        if answer == QMessageBox.Yes:
+            self._download_update(info)
+
+    def _update_check_failed(self, error: str, automatic: bool):
+        self.update_check_active = False; self.update_button.setEnabled(True)
+        self.update_status.setText("更新检查失败")
+        if automatic:
+            self.append_log(f"自动更新检查失败：{error}")
+        else:
+            QMessageBox.warning(self, "检查更新失败", error)
+
+    def _download_update(self, info: ReleaseInfo):
+        self.update_cancel = threading.Event()
+        dialog = QProgressDialog("正在下载更新…", "取消", 0, 100, self)
+        dialog.setWindowTitle(f"下载 v{info.version_text}"); dialog.setAutoClose(False); dialog.setAutoReset(False); dialog.setMinimumDuration(0)
+        dialog.canceled.connect(self.update_cancel.set); dialog.show(); self.update_progress_dialog = dialog
+        worker = Worker(lambda signals: self.update_service.download_installer(info, lambda received, total: signals.progress.emit((received, total)), self.update_cancel), with_signals=True)
+        worker.signals.progress.connect(self._update_download_progress)
+        worker.signals.finished.connect(self._update_download_done)
+        worker.signals.error.connect(self._update_download_failed)
+        self.pool.start(worker)
+
+    def _update_download_progress(self, payload):
+        if not self.update_progress_dialog:
+            return
+        received, total = payload
+        if total:
+            self.update_progress_dialog.setRange(0, 100); self.update_progress_dialog.setValue(min(100, round(received * 100 / total)))
+            self.update_progress_dialog.setLabelText(f"正在下载更新… {received / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB")
+        else:
+            self.update_progress_dialog.setRange(0, 0); self.update_progress_dialog.setLabelText(f"正在下载更新… {received / 1024 / 1024:.1f} MB")
+
+    def _update_download_done(self, installer: Path):
+        if self.update_progress_dialog:
+            self.update_progress_dialog.close(); self.update_progress_dialog = None
+        self.update_cancel = None
+        answer = QMessageBox.question(self, "下载完成", f"安装包已校验完成：\n{installer}\n\n退出程序并启动安装器吗？")
+        if answer != QMessageBox.Yes:
+            self.update_status.setText(f"更新已下载：{installer}")
+            return
+        if not QProcess.startDetached(str(installer), []):
+            QMessageBox.warning(self, "启动安装器失败", "安装器无法启动，请在更新目录中手动运行。")
+            return
+        QApplication.quit()
+
+    def _update_download_failed(self, error: str):
+        if self.update_progress_dialog:
+            self.update_progress_dialog.close(); self.update_progress_dialog = None
+        self.update_cancel = None
+        if "用户取消" in error:
+            self.update_status.setText("已取消更新下载")
+        else:
+            self.update_status.setText("更新下载失败")
+            QMessageBox.warning(self, "更新下载失败", error)
 
     def _refresh_instances(self):
         self.instance_list.clear(); self.instance_list.addItems([f"{i.name}  ({'本机' if i.kind == 'local' else '远程'})" for i in self.instances])
@@ -2358,22 +2447,12 @@ class MainWindow(QMainWindow):
         if not ok or not reason.strip(): return
         QMessageBox.information(self, "存档事务", "即将保存世界、停止服务、创建双重备份并验证写回。任务完成前请勿关闭程序。")
         selected = self.selected; service = SaveGameService(); session_key = (selected.id, session.player_uid)
-        expected_source_hash = service.sha256(Path(self.save_working_path))
         self.player_save_busy = True; self.player_detail_tabs.setEnabled(False); self.player_sync_button.setEnabled(False); self.navigation.setEnabled(False)
         def mutate(document): session.apply(document)
         def run(signals):
             from .management import SaveTransaction
             lifecycle = self._remote_lifecycle() if selected.kind == "remote" else self.lifecycle
             try:
-                if selected.kind == "remote":
-                    import tempfile
-                    with tempfile.TemporaryDirectory(prefix="palworld-baseline-") as temp:
-                        baseline = Path(temp) / "Level.sav"
-                        self._remote_client().download_file(self.save_remote_path, baseline)
-                        if service.sha256(baseline) != expected_source_hash:
-                            raise RuntimeError("服务器存档已在同步后发生变化，请重新同步玩家数据后再保存")
-                elif service.sha256(Path(self.save_remote_path)) != expected_source_hash:
-                    raise RuntimeError("服务器存档已在同步后发生变化，请重新同步玩家数据后再保存")
                 try: self._rest_client().save()
                 except Exception: pass
                 if selected.kind == "remote":
@@ -2506,7 +2585,8 @@ class MainWindow(QMainWindow):
             if not enabled: raise RuntimeError("没有已启用的计划任务")
             if selected.kind == "local":
                 for task in enabled:
-                    args = HostTaskDeployer.windows_task_arguments(selected.id, task, sys.executable, str(Path(__file__).resolve().parent.parent / "run.py"))
+                    run_script = "" if getattr(sys, "frozen", False) else str(Path(__file__).resolve().parent.parent / "run.py")
+                    args = HostTaskDeployer.windows_task_arguments(selected.id, task, sys.executable, run_script)
                     result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
                     if result.returncode: raise RuntimeError(result.stderr or result.stdout or "创建 Windows 任务计划失败")
                 return len(enabled)

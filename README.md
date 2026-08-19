@@ -101,6 +101,21 @@ python run.py
 
 脚本会在桌面创建启动快捷方式。
 
+## Windows 安装版与自动更新
+
+项目的 GitHub Releases 提供当前用户级 Windows 安装包 `PalworldConsole-Setup-vX.Y.Z.exe`。安装目录位于 `%LOCALAPPDATA%\Programs\PalworldConsole`，安装和升级通常不需要管理员权限。
+
+- 正式安装版启动后会后台检查最新稳定 Release；也可以在“关于我们”页面手动检查。
+- 下载完成后程序会验证 Release 中 `SHA256SUMS.txt` 提供的 SHA-256，再询问是否退出并启动安装器。
+- 用户数据、服务器实例配置和备份位于 `~/.palworld-console`，覆盖安装和卸载程序不会主动删除这些数据。
+- 当前安装包尚未使用 Authenticode 代码签名，Windows SmartScreen 可能显示来源警告；SHA-256 仅用于校验下载完整性，不能替代代码签名。
+
+## 发布 Windows 版本
+
+仓库的 `Release Windows` GitHub Actions 工作流只能从 `main` 分支手动运行。运行时选择 `patch`、`minor` 或 `major`，工作流会更新 `palworld_console/VERSION`，完成测试、PyInstaller 打包和 Inno Setup 编译，然后提交版本、创建 `vX.Y.Z` tag 和正式 Release。
+
+`palworld_console/VERSION` 是项目唯一版本源。运行时版本、Python 包版本、Windows 文件版本、安装器版本、Release tag 和资产文件名均从该文件派生。仓库分支保护需要允许 `GITHUB_TOKEN` 向 `main` 推送版本提交和 tag。
+
 ## 本机部署说明
 
 选择一个用于 Palworld Dedicated Server 的普通可写目录，例如 `D:\PalworldServer` 或 `E:\Games\PalworldServer`。工具会在该目录创建 `_tools\steamcmd`，维护 `steamcmd.exe`，并使用 AppID `2394010` 安装服务端。完整卸载会同时移除当前实例目录内的 SteamCMD 工具目录。

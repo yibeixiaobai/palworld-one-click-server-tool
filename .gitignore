@@ -3,4 +3,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .test-storage/
-
+build/
+dist/
+release/

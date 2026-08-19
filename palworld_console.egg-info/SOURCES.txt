@@ -1,5 +1,6 @@
 README.md
 pyproject.toml
+palworld_console/VERSION
 palworld_console/__init__.py
 palworld_console/backup_packages.py
 palworld_console/config_cache.py
@@ -19,6 +20,8 @@ palworld_console/settings_schema.py
 palworld_console/storage.py
 palworld_console/task_runner.py
 palworld_console/ui.py
+palworld_console/updater.py
+palworld_console/versioning.py
 palworld_console/wine_migration.py
 palworld_console.egg-info/PKG-INFO
 palworld_console.egg-info/SOURCES.txt
@@ -44,4 +47,5 @@ tests/test_save_codec.py
 tests/test_save_fields.py
 tests/test_ui_progress.py
 tests/test_uninstall.py
+tests/test_updater.py
 tests/test_wine_migration.py

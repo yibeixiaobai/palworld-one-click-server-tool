@@ -4,19 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "palworld-console"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Local and remote Palworld dedicated server console"
 requires-python = ">=3.10"
 dependencies = [
   "PySide6>=6.6",
   "keyring>=24.3",
   "requests>=2.31",
+  "packaging>=24.0",
   "paramiko>=3.4",
   "palworld-save-tools==0.24.0",
 ]
 
 [project.scripts]
 palworld-console = "palworld_console.main:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "palworld_console.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["palworld_console*"]
+
+[tool.setuptools.package-data]
+palworld_console = ["VERSION"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

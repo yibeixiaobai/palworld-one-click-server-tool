@@ -1574,17 +1574,20 @@ class WindowsShortcutService:
         target = Path(sys.executable).resolve()
         project_root = Path(__file__).resolve().parent.parent
         script = project_root / "run.py"
-        if not script.exists():
+        frozen = bool(getattr(sys, "frozen", False))
+        if not frozen and not script.exists():
             raise FileNotFoundError(f"找不到启动文件: {script}")
         powershell = shutil.which("powershell.exe") or shutil.which("powershell")
         if not powershell:
             raise RuntimeError("找不到 PowerShell，无法创建快捷方式")
+        arguments = "" if frozen else f'"{str(script)}"'
+        working_directory = target.parent if frozen else project_root
         command = (
             "$s=New-Object -ComObject WScript.Shell;"
             f"$l=$s.CreateShortcut('{str(shortcut).replace(chr(39), chr(39)*2)}');"
             f"$l.TargetPath='{str(target).replace(chr(39), chr(39)*2)}';"
-            f"$l.Arguments='\"{str(script).replace(chr(39), chr(39)*2)}\"';"
-            f"$l.WorkingDirectory='{str(project_root).replace(chr(39), chr(39)*2)}';"
+            f"$l.Arguments='{arguments.replace(chr(39), chr(39)*2)}';"
+            f"$l.WorkingDirectory='{str(working_directory).replace(chr(39), chr(39)*2)}';"
             "$l.Description='幻兽帕鲁服务器控制台';$l.Save()"
         )
         result = subprocess.run([powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], capture_output=True, text=True, encoding="utf-8", errors="replace")

@@ -5,6 +5,7 @@ import pytest
 
 from palworld_console.management import AutomationService, HostTaskDeployer, RconClient, SaveGameService, SaveTransaction, WhitelistService
 from palworld_console.models import ScheduleDefinition
+from palworld_console.player_edit import PlayerEditSession
 
 
 def test_rcon_packet_and_partial_receive():
@@ -28,6 +29,14 @@ def test_schedule_validation_and_systemd_timer():
     assert "OnCalendar=*-*-* 04:00:00" in timer
     with pytest.raises(ValueError):
         AutomationService.validate({**task.__dict__, "schedule": "25:00"})
+
+
+def test_windows_task_supports_frozen_executable():
+    task = ScheduleDefinition(id="task-1", name="每日备份", action="backup", schedule="04:00")
+    args = HostTaskDeployer.windows_task_arguments("instance-1", task, r"C:\Apps\PalworldConsole.exe")
+    assert args[-1] == '"C:\\Apps\\PalworldConsole.exe" task-run --instance instance-1 --task task-1'
+    source_args = HostTaskDeployer.windows_task_arguments("instance-1", task, "python.exe", r"D:\src\run.py")
+    assert source_args[-1].startswith('"python.exe" "D:\\src\\run.py" task-run')
 
 
 def test_whitelist_is_deduplicated_and_detects_unknown_players():
@@ -120,3 +129,42 @@ def test_remote_candidate_failure_does_not_claim_server_was_replaced(tmp_path: P
     assert client.uploads == 0
     assert client.remote == b"original"
     assert events == ["stop", "start"]
+
+
+def test_save_transaction_preserves_unrelated_server_changes(tmp_path: Path):
+    import json
+
+    save = tmp_path / "Level.sav"
+    save.write_text(json.dumps({"players": [{"level": 10}], "world_day": 1}), encoding="utf-8")
+    session = PlayerEditSession("instance-1", "uid-a")
+    session.stage("players[0].level", 10, 12, "等级", "player", "uid-a")
+
+    # The live server can autosave unrelated world data after the player-center sync.
+    save.write_text(json.dumps({"players": [{"level": 10}], "world_day": 2}), encoding="utf-8")
+
+    class JsonService(SaveGameService):
+        def load(self, path):
+            return type("Document", (), {"properties": json.loads(path.read_text(encoding="utf-8"))})()
+
+        @staticmethod
+        def _write_document(document, path):
+            path.write_text(json.dumps(document.properties), encoding="utf-8")
+
+        def validate(self, path):
+            from palworld_console.models import SaveValidationResult
+            json.loads(path.read_text(encoding="utf-8"))
+            return SaveValidationResult(True)
+
+    SaveTransaction(JsonService()).execute_local(
+        save,
+        tmp_path / "backups",
+        session.apply,
+        [],
+        lambda: None,
+        lambda: None,
+        lambda: True,
+    )
+
+    result = json.loads(save.read_text(encoding="utf-8"))
+    assert result["players"][0]["level"] == 12
+    assert result["world_day"] == 2

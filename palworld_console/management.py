@@ -147,8 +147,12 @@ class HostTaskDeployer:
         return service, timer
 
     @staticmethod
-    def windows_task_arguments(instance_id: str, task: ScheduleDefinition, python: str, run_script: str) -> list[str]:
-        return ["schtasks", "/Create", "/F", "/SC", "DAILY", "/ST", task.schedule, "/TN", f"PalworldConsole-{instance_id}-{task.id}", "/TR", f'"{python}" "{run_script}" task-run --instance {instance_id} --task {task.id}']
+    def windows_task_arguments(instance_id: str, task: ScheduleDefinition, executable: str, run_script: str = "") -> list[str]:
+        command = f'"{executable}"'
+        if run_script:
+            command += f' "{run_script}"'
+        command += f" task-run --instance {instance_id} --task {task.id}"
+        return ["schtasks", "/Create", "/F", "/SC", "DAILY", "/ST", task.schedule, "/TN", f"PalworldConsole-{instance_id}-{task.id}", "/TR", command]
 
     @staticmethod
     def remote_helper() -> str:
