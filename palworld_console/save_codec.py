@@ -178,6 +178,17 @@ class PlmCodecPlugin:
         finally:
             mapping_path.unlink(missing_ok=True)
 
+    def migrate_identities_v2(self, base_world: Path, source_world: Path, mappings: list[dict[str, Any]], output_path: Path) -> dict[str, Any]:
+        """Incremental migration using the immutable source and latest server snapshot."""
+        work = self.root / "work"; work.mkdir(parents=True, exist_ok=True)
+        mapping_path = work / f"identity-v2-{uuid.uuid4().hex}.json"
+        mapping_path.write_text(json.dumps({"format": "palworld-console-identity-migration-v2", "source_world": str(source_world), "mappings": mappings}, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            result = self._run(["migrate-identities-v2", "--base-world", str(base_world), "--source-world", str(source_world), "--mapping", str(mapping_path), "--output", str(output_path)], timeout=600)
+            return json.loads(result)
+        finally:
+            mapping_path.unlink(missing_ok=True)
+
     def convert_file(self, source_path: Path, output_path: Path) -> dict[str, Any]:
         result = self._run(["convert", "--source", str(source_path), "--output", str(output_path)])
         return json.loads(result)
@@ -743,6 +754,22 @@ def guid(value):
     clean=str(value or "").replace("-","").lower()
     if len(clean)!=32 or any(c not in "0123456789abcdef" for c in clean):raise RuntimeError("GUID 必须是 32 位十六进制")
     return clean,"{}-{}-{}-{}-{}".format(clean[:8],clean[8:12],clean[12:16],clean[16:20],clean[20:])
+def valid_uuid_text(value):
+    import uuid
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        return "00000000-0000-0000-0000-000000000000"
+def normalize_guild_guids(world):
+    """Keep raw guild GUID fields serializable across legacy numeric UID saves."""
+    for group in world.get("GroupSaveDataMap",{}).get("value",[]):
+        raw=group.get("value",{}).get("RawData",{}).get("value") or {}
+        for key in ("admin_player_uid","last_guild_name_modifier_player_uid"):
+            if key in raw: raw[key]=valid_uuid_text(raw.get(key))
+        for member in raw.get("players",[]) or []:
+            if isinstance(member,dict) and "player_uid" in member: member["player_uid"]=valid_uuid_text(member.get("player_uid"))
+        for handle in raw.get("individual_character_handle_ids",[]) or []:
+            if isinstance(handle,dict) and "guid" in handle: handle["guid"]=valid_uuid_text(handle.get("guid"))
 def migrate_identities(world_path,mapping_path,output_path):
     import shutil
     world_path=Path(world_path);output_path=Path(output_path)
@@ -761,7 +788,7 @@ def migrate_identities(world_path,mapping_path,output_path):
     shutil.copytree(world_path,output_path)
     level_path=output_path/"Level.sav";players_path=output_path/"Players"
     if not level_path.is_file() or not players_path.is_dir():raise RuntimeError("世界目录缺少 Level.sav 或 Players")
-    level_gvas,level_type,world=load(level_path);reports=[]
+    level_gvas,level_type,world=load(level_path);normalize_guild_guids(world);reports=[]
     for item,old_clean,old_value,new_clean,new_value in prepared:
         old_path=players_path/(old_clean.upper()+".sav");new_path=players_path/(new_clean.upper()+".sav")
         if not old_path.is_file():raise RuntimeError("旧玩家文件不存在："+old_path.name)
@@ -792,7 +819,7 @@ def migrate_identities(world_path,mapping_path,output_path):
             raw=group["value"]["RawData"]["value"]
             if str(item.get("new_instance_id") or ""):
                 raw["individual_character_handle_ids"] = [handle for handle in raw.get("individual_character_handle_ids",[]) if str(handle.get("instance_id","")).lower()!=str(item.get("new_instance_id")).lower()]
-                if str(raw.get("admin_player_uid") or "").replace("-","").lower()==new_clean:raw["admin_player_uid"]=""
+                if str(raw.get("admin_player_uid") or "").replace("-","").lower()==new_clean:raw["admin_player_uid"]="00000000-0000-0000-0000-000000000000"
                 raw["players"] = [member for member in raw.get("players",[]) if str(member.get("player_uid") or "").replace("-","").lower()!=new_clean]
             for handle in raw.get("individual_character_handle_ids",[]):
                 if str(handle.get("instance_id","")).lower()==old_instance:handle["guid"]=new_value;guild_updates+=1
@@ -809,6 +836,55 @@ def migrate_identities(world_path,mapping_path,output_path):
         if (players_path/(report["old_guid"]+".sav")).exists():raise RuntimeError("迁移后旧玩家文件仍然存在")
         if not (players_path/(report["new_guid"]+".sav")).is_file():raise RuntimeError("迁移后新玩家文件不存在")
     return {"migrated":len(reports),"players":reports,"decoded_players":len(decoded.get("players",[]))}
+def migrate_identities_v2(base_world,source_world,mapping_path,output_path):
+    """Merge missing source role records into the latest server snapshot, then rebind identities."""
+    import copy, shutil
+    base_world=Path(base_world); source_world=Path(source_world); output_path=Path(output_path)
+    manifest=json.loads(Path(mapping_path).read_text(encoding="utf-8"))
+    if manifest.get("format")!="palworld-console-identity-migration-v2":raise RuntimeError("unsupported identity migration v2 format")
+    mappings=manifest.get("mappings") or []
+    if not mappings:raise RuntimeError("迁移映射为空")
+    staging=output_path.parent/(output_path.name+"-staging")
+    if staging.exists():shutil.rmtree(staging)
+    shutil.copytree(base_world,staging)
+    try:
+        base_level,base_type,base_data=load(staging/"Level.sav")
+        _source_level,_,source_data=load(source_world/"Level.sav")
+        base_entries=base_data.setdefault("CharacterSaveParameterMap",{}).setdefault("value",[])
+        source_entries=source_data.get("CharacterSaveParameterMap",{}).get("value",[])
+        base_instances={str(e.get("key",{}).get("InstanceId",{}).get("value","" )).lower() for e in base_entries}
+        for item in mappings:
+            old_clean,_=guid(item.get("old_guid")); old_value=guid(item.get("old_guid"))[1]; new_clean,_=guid(item.get("new_guid"))
+            old_instance=str(item.get("old_instance_id") or "").lower()
+            if not old_instance:
+                for entry in source_entries:
+                    if str(entry.get("key",{}).get("PlayerUId",{}).get("value","")).replace("-","").lower()==old_clean:
+                        old_instance=str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower(); break
+            if old_instance and old_instance not in base_instances:
+                source_entry=next((entry for entry in source_entries if str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower()==old_instance),None)
+                new_instance=str(item.get("new_instance_id") or "").lower()
+                template=next((entry for entry in base_entries if str(entry.get("key",{}).get("PlayerUId",{}).get("value","")).replace("-","").lower()==new_clean or (new_instance and str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower()==new_instance)),None)
+                if source_entry is None:raise RuntimeError("原始 Level.sav 中找不到待迁移玩家记录："+old_clean.upper())
+                if template is None:raise RuntimeError("最新专服快照中找不到对应临时角色记录："+new_clean.upper())
+                candidate=copy.deepcopy(template)
+                candidate["key"]["PlayerUId"]["value"]=source_entry["key"]["PlayerUId"]["value"]
+                candidate["key"]["InstanceId"]["value"]=source_entry["key"]["InstanceId"]["value"]
+                candidate["value"]["RawData"]["value"]["object"]["SaveParameter"]["value"]=copy.deepcopy(save_parameter(source_entry))
+                base_entries.append(candidate);base_instances.add(old_instance)
+        (staging/"Level.sav").write_bytes(compress_gvas_to_sav(base_level.write(PALWORLD_CUSTOM_PROPERTIES),base_type))
+        # Source player files are authoritative for pending roles; placeholders remain from the base snapshot.
+        players=staging/"Players"; source_players=source_world/"Players"; players.mkdir(exist_ok=True)
+        for item in mappings:
+            old_clean,_=guid(item.get("old_guid")); old_path=source_players/(old_clean.upper()+".sav")
+            if old_path.is_file(): shutil.copy2(old_path,players/old_path.name)
+        legacy_mapping=staging.parent/(staging.name+"-mapping-v1.json")
+        legacy_mapping.write_text(json.dumps({"format":"palworld-console-identity-migration-v1","mappings":mappings},ensure_ascii=False),encoding="utf-8")
+        try:
+            return migrate_identities(staging,legacy_mapping,output_path)
+        finally:
+            legacy_mapping.unlink(missing_ok=True)
+    finally:
+        if staging.exists():shutil.rmtree(staging)
 def convert_file(source,output):
     from palsav import json_tools
     from palsav.io import load_sav,save_sav
@@ -893,6 +969,7 @@ def main():
         if name=="patch":p.add_argument("--patch",required=True)
     players=sub.add_parser("decode-players");players.add_argument("--level",required=True);players.add_argument("--output",required=True)
     migrate=sub.add_parser("migrate-identities");migrate.add_argument("--world",required=True);migrate.add_argument("--mapping",required=True);migrate.add_argument("--output",required=True)
+    migrate_v2=sub.add_parser("migrate-identities-v2");migrate_v2.add_argument("--base-world",required=True);migrate_v2.add_argument("--source-world",required=True);migrate_v2.add_argument("--mapping",required=True);migrate_v2.add_argument("--output",required=True)
     convert=sub.add_parser("convert");convert.add_argument("--source",required=True);convert.add_argument("--output",required=True)
     map_restore=sub.add_parser("restore-map");map_restore.add_argument("--source",required=True);map_restore.add_argument("--output",required=True)
     palbox=sub.add_parser("expand-palbox");palbox.add_argument("--world",required=True);palbox.add_argument("--player-guid",required=True);palbox.add_argument("--slots",required=True,type=int);palbox.add_argument("--output",required=True)
@@ -904,6 +981,7 @@ def main():
     elif args.cmd=="decode-players":Path(args.output).write_text(json.dumps(decode_players(args.level),ensure_ascii=False),encoding="utf-8")
     elif args.cmd=="patch":patch(args.level,json.loads(Path(args.patch).read_text(encoding="utf-8")),args.output)
     elif args.cmd=="migrate-identities":print(json.dumps(migrate_identities(args.world,args.mapping,args.output),ensure_ascii=False))
+    elif args.cmd=="migrate-identities-v2":print(json.dumps(migrate_identities_v2(args.base_world,args.source_world,args.mapping,args.output),ensure_ascii=False))
     elif args.cmd=="convert":print(json.dumps(convert_file(args.source,args.output),ensure_ascii=False))
     elif args.cmd=="restore-map":print(json.dumps(restore_map(args.source,args.output),ensure_ascii=False))
     elif args.cmd=="expand-palbox":print(json.dumps(expand_palbox(args.world,args.player_guid,args.slots,args.output),ensure_ascii=False))

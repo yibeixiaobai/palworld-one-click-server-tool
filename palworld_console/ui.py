@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 import ntpath
@@ -1393,14 +1393,46 @@ class MainWindow(QMainWindow):
         worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress); worker.signals.finished.connect(lambda result: self._restore_done(result, reason)); worker.signals.error.connect(self._restore_failed); self.pool.start(worker)
 
     def _deploy_restore_migration_task(self, signals, selected, session, restore_point):
-        service = BackupPackageService(); signals.progress.emit(TaskProgress(32, "构建迁移候选", "正在解析 Level.sav、迁移玩家身份并二次校验", True))
-        session, report = service.build_restore_candidate(session, self.storage.root); signals.log.emit(f"候选世界验证通过：迁移 {report.get('migrated', 0)} 个玩家")
-        signals.progress.emit(TaskProgress(35, "候选验证通过", f"已完成 {report.get('migrated', 0)} 个玩家身份迁移，准备部署", False))
+        import shutil
+        service = BackupPackageService(); root = Path(self.storage.root) / "migrations" / selected.id / "restore" / "deployment-snapshot"
+        if root.exists(): shutil.rmtree(root)
+        root.mkdir(parents=True)
         if selected.kind == "local":
             lifecycle = self.lifecycle if isinstance(self.lifecycle, LocalServerLifecycle) else LocalServerLifecycle(selected, signals.log.emit)
-            return service.deploy_restore_candidate_local(session, lifecycle.stop, lifecycle.start, lambda: lifecycle.status() == "running", self.storage.root, restore_point, lambda p, s, m: signals.progress.emit(TaskProgress(p, s, m, False)))
-        client = self._remote_client(); lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit)
-        return service.deploy_restore_candidate_remote(session, client, lifecycle.stop, lifecycle.start, lambda: self._remote_health_ok(selected), self.storage.root, restore_point, lambda p, s, m: signals.progress.emit(TaskProgress(p, s, m, False)))
+            signals.progress.emit(TaskProgress(30, "停止服务器", "正在停止服务器并锁定最新世界", True)); lifecycle.stop()
+            try:
+                target_world = Path(session.target_world_path).expanduser().resolve(); savegames = root / "SaveGames"; savegames.mkdir()
+                shutil.copytree(target_world, savegames / target_world.name)
+                session = service.refresh_restore_target_snapshot(session, root, self.storage.root)
+                signals.progress.emit(TaskProgress(32, "构建迁移候选", "正在基于最新服务器世界迁移玩家身份并二次校验", True))
+                session, report = service.build_restore_candidate(session, self.storage.root); signals.log.emit(f"候选世界验证通过：迁移 {report.get('migrated', 0)} 个玩家")
+            except Exception:
+                lifecycle.start(); raise
+            signals.progress.emit(TaskProgress(35, "候选验证通过", f"已完成 {report.get('migrated', 0)} 个玩家身份迁移，准备部署", False))
+            try:
+                return service.deploy_restore_candidate_local(session, lambda: None, lifecycle.start, lambda: lifecycle.status() == "running", self.storage.root, restore_point, lambda p, s, m: signals.progress.emit(TaskProgress(p, s, m, False)))
+            except Exception:
+                lifecycle.start(); raise
+        client = self._remote_client(); lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit); install_dir = str(selected.remote_profile.get("install_dir") or selected.install_dir)
+        signals.progress.emit(TaskProgress(30, "停止远程服务器", "正在停止服务器并锁定最新世界", True)); lifecycle.stop()
+        try:
+            archive = BackupService().create_remote(client, selected, root, install_dir)
+            if archive is None: raise RuntimeError("无法取得部署前远程服务器快照")
+            saved = service.extract_saved_snapshot(archive, root / "extracted")
+            session = service.refresh_restore_target_snapshot(session, saved, self.storage.root)
+            signals.progress.emit(TaskProgress(32, "构建迁移候选", "正在基于最新服务器世界迁移玩家身份并二次校验", True))
+            session, report = service.build_restore_candidate(session, self.storage.root); signals.log.emit(f"候选世界验证通过：迁移 {report.get('migrated', 0)} 个玩家")
+        except Exception:
+            lifecycle.start(); raise
+        signals.progress.emit(TaskProgress(35, "候选验证通过", f"已完成 {report.get('migrated', 0)} 个玩家身份迁移，准备部署", False))
+        try:
+            return service.deploy_restore_candidate_remote(session, client, lambda: None, lifecycle.start, lambda: self._remote_health_ok(selected), self.storage.root, restore_point, lambda p, s, m: signals.progress.emit(TaskProgress(p, s, m, False)))
+        except Exception:
+            lifecycle.start(); raise
+
+    def _resume_restore_deployment_task(self, signals, selected, session):
+        signals.progress.emit(TaskProgress(28, "恢复迁移部署", "正在重新锁定服务器最新世界并重建候选", True))
+        return self._deploy_restore_migration_task(signals, selected, session, session.backup_path)
 
     def _run_restore_transaction(self, signals, selected, package, reason=""):
         try:
@@ -1802,6 +1834,20 @@ class MainWindow(QMainWindow):
         if not session: return QMessageBox.information(self, "角色迁移", "没有找到待处理的迁移会话，请先恢复包含玩家的存档或部署本地联机世界。")
         if session.package_path:
             if session.phase == "complete": return QMessageBox.information(self, "玩家迁移", "当前恢复会话中的玩家身份已经全部迁移完成。")
+            original = Path(session.original_source_path or session.source_path)
+            if session.phase == "source_missing" or not original.is_dir() or not (original / "Level.sav").is_file():
+                return QMessageBox.warning(self, "需要重新关联原始存档", "不可变原始联机存档不存在或不可读取。请重新选择原始联机存档/转换包后再继续，当前专服世界不会被修改。")
+            if session.phase == "deploying":
+                candidate = Path(self.storage.root) / "migrations" / self.selected.id / "restore" / "candidate"
+                if candidate.is_dir():
+                    if QMessageBox.question(self, "继续部署玩家迁移", "检测到上次已生成但尚未部署的迁移候选。是否继续部署？") != QMessageBox.Yes:
+                        return
+                    selected = self.selected; self._begin_backup_task("继续部署玩家迁移")
+                    worker = Worker(lambda signals: self._resume_restore_deployment_task(signals, selected, session), with_signals=True)
+                    worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress)
+                    worker.signals.finished.connect(lambda result: self._restore_done(result, "继续部署玩家迁移")); worker.signals.error.connect(self._restore_failed); self.pool.start(worker); return
+                session = replace(session, phase="waiting_placeholders", detail="上次候选已不存在，请重新刷新临时角色")
+                service.save_migration_session(self.storage.root, session)
             if session.phase not in {"waiting_placeholders", "mapping_ready"}: return QMessageBox.information(self, "玩家迁移", f"当前迁移阶段为：{session.phase}")
             self._begin_backup_task("继续玩家迁移")
             if session.phase == "mapping_ready" and session.placeholder_players:
@@ -1867,6 +1913,8 @@ class MainWindow(QMainWindow):
             self._finish_backup_task(False)
             return QMessageBox.information(self, "尚未发现临时角色", "请让待迁移玩家进入恢复后的服务器创建临时角色并退出，然后再次继续迁移。")
         pending = set(session.pending_player_guids); targets = list(session.placeholder_players)
+        migrated_count = sum(1 for item in session.mappings if item.status == "migrated")
+        self.append_log(f"继续迁移第 {session.snapshot_generation + 1} 轮：已完成 {migrated_count} 个，待处理 {len(pending)} 个")
         confirmations = {}; used = {item.new_guid for item in session.mappings if item.status == "migrated"}
         for player in session.source_players:
             old_guid = service._player_guid(player)

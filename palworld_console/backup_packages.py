@@ -414,7 +414,7 @@ class BackupPackageService:
     @staticmethod
     def save_migration_session(root: Path, session: CoopMigrationSession) -> Path:
         target = BackupPackageService._migration_path(root, session.instance_id); target.parent.mkdir(parents=True, exist_ok=True)
-        payload = asdict(session); payload["mappings"] = [asdict(item) for item in session.mappings]; payload["source_players"] = list(session.source_players); payload["placeholder_players"] = list(session.placeholder_players)
+        payload = asdict(session); payload["mappings"] = [asdict(item) for item in session.mappings]; payload["source_players"] = list(session.source_players); payload["placeholder_players"] = list(session.placeholder_players); payload["source_player_hashes"] = list(session.source_player_hashes)
         temporary = target.with_suffix(".tmp"); temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"); os.replace(temporary, target); return target
 
     @staticmethod
@@ -422,7 +422,16 @@ class BackupPackageService:
         path = BackupPackageService._migration_path(root, instance_id)
         if not path.is_file(): return None
         try:
-            payload = json.loads(path.read_text(encoding="utf-8")); payload["mappings"] = tuple(PlayerIdentityMapping(**item) for item in payload.get("mappings", [])); payload["source_players"] = tuple(payload.get("source_players", [])); payload["placeholder_players"] = tuple(payload.get("placeholder_players", [])); return CoopMigrationSession(**payload)
+            payload = json.loads(path.read_text(encoding="utf-8")); payload["mappings"] = tuple(PlayerIdentityMapping(**item) for item in payload.get("mappings", [])); payload["source_players"] = tuple(payload.get("source_players", [])); payload["placeholder_players"] = tuple(payload.get("placeholder_players", [])); payload["source_player_hashes"] = tuple(payload.get("source_player_hashes", []))
+            # v1 sessions used source_path for both the immutable source and the latest snapshot.
+            if not payload.get("schema_version"):
+                payload["schema_version"] = 2
+                payload["original_source_path"] = payload.get("source_path", "")
+                payload["original_source_hash"] = payload.get("source_world_hash", "")
+                payload["latest_snapshot_path"] = payload.get("target_snapshot_path", "")
+                payload["latest_snapshot_hash"] = payload.get("target_world_hash", "")
+                payload["snapshot_generation"] = 0
+            return CoopMigrationSession(**payload)
         except (OSError, ValueError, TypeError): return None
 
     @staticmethod
@@ -446,7 +455,9 @@ class BackupPackageService:
     def prepare_coop_migration(self, source_world: Path, instance_id: str, target_world: Path, storage_root: Path) -> CoopMigrationSession:
         players = self.inspect_world_players(source_world, storage_root)
         files = tuple(sorted(path.name for path in (Path(source_world) / "Players").glob("*.sav")))
-        session = CoopMigrationSession(instance_id=instance_id, source_path=str(Path(source_world).resolve()), target_world_path=str(Path(target_world).resolve()), phase="source_ready", source_players=players, baseline_player_files=files)
+        source = Path(source_world).resolve()
+        hashes = tuple({"guid": self._player_guid(item), "hash": _sha256(source / "Players" / str(item.get("player_file") or (self._player_guid(item) + ".sav")))} for item in players if (source / "Players" / str(item.get("player_file") or (self._player_guid(item) + ".sav"))).is_file())
+        session = CoopMigrationSession(instance_id=instance_id, source_path=str(source), original_source_path=str(source), target_world_path=str(Path(target_world).resolve()), phase="source_ready", source_players=players, baseline_player_files=files, source_world_hash=_sha256(source / "Level.sav"), original_source_hash=_sha256(source / "Level.sav"), source_player_hashes=hashes)
         self.save_migration_session(storage_root, session); return session
 
     def refresh_coop_placeholders(self, session: CoopMigrationSession, storage_root: Path) -> CoopMigrationSession:
@@ -554,11 +565,14 @@ class BackupPackageService:
             target_players = self.inspect_world_players(target_snapshot_world, storage_root)
         else:
             target_players = tuple(PlmCodecPlugin(storage_root).decode(target_snapshot_world / "Level.sav").get("players", ()))
+        source_hash = _sha256(source_world / "Level.sav")
+        source_hashes = tuple({"guid": self._player_guid(item), "hash": _sha256(source_world / "Players" / str(item.get("player_file") or (self._player_guid(item) + ".sav")))} for item in source_players if (source_world / "Players" / str(item.get("player_file") or (self._player_guid(item) + ".sav"))).is_file())
+        snapshot_hash = _sha256(target_snapshot_world / "Level.sav")
         session = CoopMigrationSession(
             instance_id=instance.id, source_path=str(source_world), target_world_path=str(target_world_path), phase="mapping_ready",
             source_players=source_players, baseline_player_files=source_player_files, placeholder_players=target_players,
-            package_path=str(package), package_hash=_sha256(package), source_world_hash=_sha256(source_world / "Level.sav"),
-            target_snapshot_path=str(target_snapshot_world), target_world_hash=_sha256(target_snapshot_world / "Level.sav"),
+            package_path=str(package), package_hash=_sha256(package), source_world_hash=source_hash, original_source_path=str(source_world), original_source_hash=source_hash, source_player_hashes=source_hashes,
+            target_snapshot_path=str(target_snapshot_world), target_world_hash=snapshot_hash, latest_snapshot_path=str(target_snapshot_world), latest_snapshot_hash=snapshot_hash, snapshot_generation=0,
             target_kind=target_kind, target_platform=target_platform, pending_player_guids=tuple(self._player_guid(item) for item in source_players),
             detail=f"源玩家 {len(source_players)}，目标身份 {len(target_players)}",
         )
@@ -614,28 +628,58 @@ class BackupPackageService:
         shutil.copytree(current_world, current_copy)
         phase = "mapping_ready" if placeholders else "waiting_placeholders"
         detail = f"检测到 {len(placeholders)} 个新建临时角色" if placeholders else "尚未检测到新增临时角色"
-        updated = replace(
-            session, source_path=str(current_copy), source_world_hash=_sha256(current_copy / "Level.sav"),
-            target_snapshot_path=str(current_copy), target_world_hash=_sha256(current_copy / "Level.sav"),
-            placeholder_players=placeholders, phase=phase, detail=detail,
-        )
+        snapshot_hash = _sha256(current_copy / "Level.sav")
+        # Keep source_path as a legacy alias for callers that display the latest snapshot;
+        # original_source_path remains immutable and is used for all future merges.
+        updated = replace(session, source_path=str(current_copy), source_world_hash=snapshot_hash, target_snapshot_path=str(current_copy), target_world_hash=snapshot_hash, latest_snapshot_path=str(current_copy), latest_snapshot_hash=snapshot_hash, snapshot_generation=session.snapshot_generation + 1, placeholder_players=placeholders, phase=phase, detail=detail)
         self.save_migration_session(storage_root, updated); return updated
 
+    def refresh_restore_target_snapshot(self, session: CoopMigrationSession, current_saved_snapshot: Path, storage_root: Path) -> CoopMigrationSession:
+        """Pin the stopped server's latest world immediately before candidate construction."""
+        current_saved_snapshot = Path(current_saved_snapshot).resolve()
+        target = self.detect_server_world(current_saved_snapshot / "SaveGames" if (current_saved_snapshot / "SaveGames").is_dir() else current_saved_snapshot)
+        current_world = Path(target.world_path)
+        root = Path(storage_root) / "migrations" / session.instance_id / "restore"
+        latest_copy = root / "deployment-world"
+        if latest_copy.exists(): shutil.rmtree(latest_copy)
+        shutil.copytree(current_world, latest_copy)
+        snapshot_hash = _sha256(latest_copy / "Level.sav")
+        updated = replace(
+            session,
+            target_snapshot_path=str(latest_copy),
+            target_world_hash=snapshot_hash,
+            latest_snapshot_path=str(latest_copy),
+            latest_snapshot_hash=snapshot_hash,
+            snapshot_generation=session.snapshot_generation + 1,
+            detail="已锁定停服后的最新服务器世界，正在重建迁移候选",
+        )
+        self.save_migration_session(storage_root, updated)
+        return updated
+
     def build_restore_candidate(self, session: CoopMigrationSession, storage_root: Path) -> tuple[CoopMigrationSession, dict]:
-        if _sha256(Path(session.package_path)) != session.package_hash or _sha256(Path(session.source_path) / "Level.sav") != session.source_world_hash:
-            raise RuntimeError("恢复包或源世界在确认映射后发生变化，请重新开始恢复")
+        original = Path(session.original_source_path or session.source_path).expanduser().resolve()
+        latest = Path(session.latest_snapshot_path or session.target_snapshot_path or session.target_world_path).expanduser().resolve()
+        if session.package_path and session.package_hash and _sha256(Path(session.package_path)) != session.package_hash: raise RuntimeError("恢复包在确认映射后发生变化，请重新关联原始转换包")
+        if not original.is_dir() or not (original / "Level.sav").is_file(): raise RuntimeError("不可变原始联机存档不存在，请重新关联原始联机存档或转换包")
+        if session.original_source_hash and _sha256(original / "Level.sav") != session.original_source_hash: raise RuntimeError("原始联机存档已变化，请重新关联原始联机存档")
+        if not latest.is_dir() or not (latest / "Level.sav").is_file(): raise RuntimeError("最新专服快照不存在，请先刷新服务器快照")
+        if session.latest_snapshot_hash and _sha256(latest / "Level.sav") != session.latest_snapshot_hash: raise RuntimeError("最新专服快照在映射确认后发生变化，请重新刷新服务器快照")
         root = Path(storage_root) / "migrations" / session.instance_id / "restore"; candidate_input = root / "candidate-input"; candidate = root / "candidate"
         for path in (candidate_input, candidate):
             if path.exists(): shutil.rmtree(path)
-        shutil.copytree(session.source_path, candidate_input)
-        target_players = Path(session.target_snapshot_path) / "Players"; candidate_players = candidate_input / "Players"; candidate_players.mkdir(exist_ok=True)
+        shutil.copytree(latest, candidate_input)
+        source_players = original / "Players"; target_players = latest / "Players"; candidate_players = candidate_input / "Players"; candidate_players.mkdir(exist_ok=True)
         active_mappings = tuple(item for item in session.mappings if item.status == "confirmed")
         for mapping in active_mappings:
-            source = target_players / f"{mapping.new_guid}.sav"
-            if not source.is_file(): raise FileNotFoundError(f"目标身份玩家文件不存在：{source.name}")
-            shutil.copy2(source, candidate_players / source.name)
+            placeholder = target_players / f"{mapping.new_guid}.sav"
+            if not placeholder.is_file(): raise FileNotFoundError(f"目标身份玩家文件不存在：{placeholder.name}")
+            old_file = source_players / f"{mapping.old_guid}.sav"
+            if not old_file.is_file(): raise FileNotFoundError(f"原始玩家文件不存在：{old_file.name}")
+            # Keep the latest server Level/world state, while providing both source role data and the current placeholder.
+            shutil.copy2(old_file, candidate_players / old_file.name)
+            shutil.copy2(placeholder, candidate_players / placeholder.name)
         if active_mappings:
-            report = PlmCodecPlugin(storage_root).migrate_identities(candidate_input, [asdict(item) for item in active_mappings], candidate)
+            report = PlmCodecPlugin(storage_root).migrate_identities_v2(latest, original, [asdict(item) for item in active_mappings], candidate)
         else:
             shutil.copytree(candidate_input, candidate); report = {"migrated": 0, "players": []}
         decoded = self.inspect_world_players(candidate, storage_root)

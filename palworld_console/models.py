@@ -101,6 +101,7 @@ class PlayerIdentityMapping:
     confirmed: bool = False
     new_instance_id: str = ""
     status: str = "pending"
+    generation: int = 0
 
 
 @dataclass
@@ -123,6 +124,13 @@ class CoopMigrationSession:
     target_platform: str = "windows"
     pending_player_guids: tuple[str, ...] = ()
     detail: str = ""
+    schema_version: int = 2
+    original_source_path: str = ""
+    original_source_hash: str = ""
+    source_player_hashes: tuple[dict[str, str], ...] = ()
+    latest_snapshot_path: str = ""
+    latest_snapshot_hash: str = ""
+    snapshot_generation: int = 0
 
 
 @dataclass(frozen=True)

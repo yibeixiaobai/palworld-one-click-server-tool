@@ -292,6 +292,42 @@ def test_refresh_restore_placeholders_only_returns_players_added_after_baseline(
     assert Path(updated.source_path, "Players", placeholder).is_file()
 
 
+def test_restore_continuation_keeps_immutable_original_source(tmp_path: Path, monkeypatch):
+    service = BackupPackageService(); saved = make_saved(tmp_path / "snapshot", "WORLD")
+    world = saved / "SaveGames" / "0" / "WORLD"; players = world / "Players"
+    (players / ("A" * 32 + ".sav")).write_bytes(b"old"); (players / ("B" * 32 + ".sav")).write_bytes(b"new")
+    source = tmp_path / "source"; (source / "Players").mkdir(parents=True); (source / "Level.sav").write_bytes(b"source-level")
+    (source / "Players" / ("A" * 32 + ".sav")).write_bytes(b"source-player")
+    monkeypatch.setattr(BackupPackageService, "inspect_world_players", staticmethod(lambda world, *_args: ({"player_guid": "B" * 32, "instance_id": "new-instance", "nickname": "New"},)))
+    session = CoopMigrationSession(instance_id="server", source_path=str(source), original_source_path=str(source), target_world_path=str(world), phase="waiting_placeholders", baseline_player_files=(("A" * 32 + ".sav").upper(),), pending_player_guids=("A" * 32,))
+    updated = service.refresh_restore_placeholders(session, saved, tmp_path / "app")
+    assert updated.original_source_path == str(source)
+    assert updated.latest_snapshot_path.endswith("current-world")
+
+
+def test_deployment_refresh_replaces_stale_target_snapshot(tmp_path: Path):
+    service = BackupPackageService(); old_saved = make_saved(tmp_path / "old", "WORLD")
+    old_world = old_saved / "SaveGames" / "0" / "WORLD"
+    session = CoopMigrationSession(
+        instance_id="server", source_path=str(old_world), original_source_path=str(old_world),
+        target_world_path="/srv/palworld/Pal/Saved/SaveGames/0/WORLD",
+        target_snapshot_path=str(old_world), latest_snapshot_path=str(old_world),
+        target_world_hash="stale", latest_snapshot_hash="stale", phase="candidate_ready",
+    )
+    current_saved = make_saved(tmp_path / "current", "WORLD")
+    current_world = current_saved / "SaveGames" / "0" / "WORLD"
+    (current_world / "Level.sav").write_bytes(b"server-autosave-after-preflight")
+
+    updated = service.refresh_restore_target_snapshot(session, current_saved, tmp_path / "app")
+
+    pinned = Path(updated.latest_snapshot_path)
+    assert pinned.name == "deployment-world"
+    assert (pinned / "Level.sav").read_bytes() == b"server-autosave-after-preflight"
+    assert updated.target_world_hash == updated.latest_snapshot_hash
+    assert updated.target_world_hash != "stale"
+    assert updated.snapshot_generation == 1
+
+
 def test_inspect_world_players_uses_lightweight_decoder_and_storage_root(tmp_path: Path, monkeypatch):
     world = tmp_path / "world"; (world / "Players").mkdir(parents=True); (world / "Level.sav").write_bytes(b"level")
     seen = {}
