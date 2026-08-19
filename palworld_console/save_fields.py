@@ -38,7 +38,7 @@ def _f(object_type: str, key: str, label: str, group: str, value_type: str, **kw
 FIELDS = (
     _f("player", "player_uid", "玩家 UID", "玩家身份", "string", source="Level.sav / REST", description="当前世界中角色的稳定标识", read_only_reason="身份标识不可修改"),
     _f("player", "nickname", "玩家昵称", "玩家属性", "string", writable=True, description="游戏中显示的角色名称", risk="中"),
-    _f("player", "level", "玩家等级", "玩家属性", "int", minimum=1, maximum=65, unit="级", writable=True, description="角色当前等级；与累计经验联动校验", risk="中"),
+    _f("player", "level", "玩家等级", "玩家属性", "int", minimum=1, maximum=80, unit="级", writable=True, description="角色当前等级；与累计经验联动校验", risk="中"),
     _f("player", "exp", "累计经验", "玩家属性", "int", minimum=0, maximum=2147483647, writable=True, description="达到当前等级所需的累计经验", risk="中"),
     _f("player", "hp", "当前生命值", "玩家属性", "int", minimum=0, maximum=2147483647, unit="点", writable=True, risk="中"),
     _f("player", "shield_hp", "当前护盾值", "玩家属性", "int", minimum=0, maximum=2147483647, unit="点", writable=True, risk="中"),
@@ -47,27 +47,37 @@ FIELDS = (
     _f("pal", "individual_id", "帕鲁个体 ID", "帕鲁", "string", description="帕鲁稳定对象 GUID", read_only_reason="稳定身份标识不可修改"),
     _f("pal", "type", "帕鲁种类", "帕鲁", "string", description="游戏内部帕鲁种类标识", read_only_reason="更换种类可能破坏对象关系"),
     _f("pal", "nickname", "帕鲁昵称", "帕鲁", "string", writable=True, risk="中"),
-    _f("pal", "level", "帕鲁等级", "帕鲁", "int", minimum=1, maximum=65, unit="级", writable=True, risk="中"),
+    _f("pal", "level", "帕鲁等级", "帕鲁", "int", minimum=1, maximum=80, unit="级", writable=True, risk="中"),
     _f("pal", "exp", "帕鲁经验", "帕鲁", "int", minimum=0, maximum=2147483647, writable=True, risk="中"),
     _f("pal", "gender", "帕鲁性别", "帕鲁", "enum", description="游戏记录的性别", read_only_reason="性别写回尚未通过真实存档验证"),
-    _f("pal", "is_lucky", "幸运帕鲁", "帕鲁", "bool", description="是否为幸运帕鲁", read_only_reason="幸运状态写回尚未通过真实存档验证"),
+    _f("pal", "is_lucky", "幸运帕鲁", "帕鲁", "bool", writable=True, description="是否为幸运帕鲁", risk="高"),
     _f("pal", "melee", "帕鲁生命个体值", "帕鲁", "int", minimum=0, maximum=100, writable=True, risk="高"),
     _f("pal", "ranged", "帕鲁攻击个体值", "帕鲁", "int", minimum=0, maximum=100, writable=True, risk="高"),
     _f("pal", "defense", "帕鲁防御个体值", "帕鲁", "int", minimum=0, maximum=100, writable=True, risk="高"),
     _f("pal", "workspeed", "帕鲁工作速度", "帕鲁", "int", minimum=0, maximum=255, writable=True, risk="高"),
     _f("pal", "rank", "帕鲁星级", "帕鲁", "int", minimum=1, maximum=5, unit="星", writable=True, risk="高"),
     _f("pal", "skills", "帕鲁被动技能", "帕鲁", "list", writable=True, description="只允许使用存档中已识别的技能 ID", risk="高"),
+    _f("pal", "active_skills", "装备主动技能", "帕鲁", "list", writable=True, description="逗号分隔技能 ID；写回后会验证稳定 InstanceId", risk="高"),
+    _f("pal", "learned_skills", "已掌握主动技能", "帕鲁", "list", writable=True, description="逗号分隔技能 ID", risk="高"),
+    _f("pal", "rank_attack", "攻击强化", "帕鲁", "int", minimum=0, maximum=20, writable=True, risk="高"),
+    _f("pal", "rank_defence", "防御强化", "帕鲁", "int", minimum=0, maximum=20, writable=True, risk="高"),
+    _f("pal", "rank_craftspeed", "工作强化", "帕鲁", "int", minimum=0, maximum=20, writable=True, risk="高"),
     _f("inventory", "container_id", "背包容器 ID", "背包", "string", source="Players/*.sav + Level.sav", read_only_reason="容器标识不可修改"),
     _f("inventory", "SlotIndex", "槽位", "背包", "int", source="Players/*.sav + Level.sav", read_only_reason="槽位移动尚未开放"),
     _f("inventory", "ItemId", "物品名称 / ID", "背包", "string", source="Players/*.sav + Level.sav", read_only_reason="首版不创建或替换未知物品"),
     _f("inventory", "StackCount", "物品数量", "背包", "int", minimum=0, maximum=999999, unit="个", source="Players/*.sav + Level.sav", writable=True, risk="高"),
     _f("guild", "guild_id", "公会 ID", "公会与基地", "string", read_only_reason="稳定身份标识不可修改"),
-    _f("guild", "name", "公会名称", "公会与基地", "string", read_only_reason="公会改名需先通过完整成员和基地关系写回验证", risk="高"),
+    _f("guild", "name", "公会名称", "公会与基地", "string", writable=True, risk="高"),
+    _f("guild", "base_camp_level", "公会基地等级", "公会与基地", "int", minimum=1, maximum=30, writable=True, risk="高"),
     _f("guild", "admin_player_uid", "公会会长", "公会与基地", "string", read_only_reason="会长转移需要完整成员和基地关系校验", risk="高"),
     _f("guild", "players", "公会成员", "公会与基地", "list", read_only_reason="成员变更需要完整关系校验", risk="高"),
     _f("base", "base_id", "基地 ID", "公会与基地", "string", read_only_reason="稳定身份标识不可修改"),
     _f("base", "base_camp_level", "基地等级", "公会与基地", "int", minimum=1, maximum=30, unit="级", read_only_reason="基地写回需先验证容器和工作帕鲁归属", risk="高"),
     _f("base", "guild_id", "基地所属公会", "公会与基地", "string", read_only_reason="归属转移需先验证公会、容器和帕鲁关系", risk="高"),
+    _f("base", "name", "基地名称", "公会与基地", "string", writable=True, risk="高"),
+    _f("base", "x", "基地 X 坐标", "公会与基地", "float", minimum=-1000000, maximum=1000000, writable=True, risk="高"),
+    _f("base", "y", "基地 Y 坐标", "公会与基地", "float", minimum=-1000000, maximum=1000000, writable=True, risk="高"),
+    _f("base", "z", "基地 Z 坐标", "公会与基地", "float", minimum=-1000000, maximum=1000000, writable=True, risk="高"),
 )
 
 FIELD_BY_OBJECT_KEY = {(field.object_type, field.key.lower()): field for field in FIELDS}
@@ -123,7 +133,15 @@ def display_field(path: str, value: Any) -> dict[str, Any]:
 def validate_value(field: SaveFieldDefinition, value: Any) -> Any:
     if not field.writable:
         raise ValueError(f"{field.label}为只读字段：{field.read_only_reason}")
-    converted = int(value) if field.value_type in {"int", "mapping"} else float(value) if field.value_type == "float" else value
+    if field.value_type in {"int", "mapping"}: converted = int(value)
+    elif field.value_type == "float": converted = float(value)
+    elif field.value_type == "bool":
+        if isinstance(value, bool): converted = value
+        elif str(value).strip().lower() in {"1", "true", "yes", "是", "开启"}: converted = True
+        elif str(value).strip().lower() in {"0", "false", "no", "否", "关闭"}: converted = False
+        else: raise ValueError(f"{field.label}必须填写 是/否 或 true/false")
+    elif field.value_type == "list": converted = [item.strip() for item in str(value).replace("，", ",").split(",") if item.strip()]
+    else: converted = value
     if isinstance(converted, (int, float)):
         if field.minimum is not None and converted < field.minimum:
             raise ValueError(f"{field.label}不能小于 {field.minimum:g}")

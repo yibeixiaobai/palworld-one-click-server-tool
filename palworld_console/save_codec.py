@@ -21,7 +21,7 @@ PALWORLD_SAVE_TOOLS_COMMIT = "a0e350127dc570593e666f2177eafcee69f7cd5d"
 REFERENCE_TOOL_COMMIT = "f45a48ef25ce08a5311a27e55b17062ba0bb4362"
 SOURCE_URL = "https://github.com/deafdudecomputers/PalworldSaveTools.git"
 VS_BOOTSTRAPPER_URL = "https://aka.ms/vs/17/release/vs_BuildTools.exe"
-HELPER_API_VERSION = 4
+HELPER_API_VERSION = 8
 SAVE_PATCH_FORMAT = "palworld-console-save-patch-v2"
 IDENTITY_MIGRATION_FORMAT = "palworld-console-identity-migration-v1"
 
@@ -29,9 +29,14 @@ IDENTITY_MIGRATION_FORMAT = "palworld-console-identity-migration-v1"
 class SaveCodecPlugin(Protocol):
     def probe(self) -> tuple[bool, str]: ...
     def decode(self, level_path: Path) -> dict[str, Any]: ...
+    def decode_players(self, level_path: Path) -> dict[str, Any]: ...
     def apply_patch(self, level_path: Path, patch: dict[str, Any], output_path: Path) -> None: ...
     def verify_roundtrip(self, level_path: Path, expected_patch: dict[str, Any] | None = None) -> dict[str, Any]: ...
     def migrate_identities(self, world_path: Path, mappings: list[dict[str, Any]], output_path: Path) -> dict[str, Any]: ...
+    def convert_file(self, source_path: Path, output_path: Path) -> dict[str, Any]: ...
+    def steam_id_to_uid(self, steam_id: str) -> dict[str, str]: ...
+    def restore_map(self, source_path: Path, output_path: Path) -> dict[str, Any]: ...
+    def expand_palbox(self, world_path: Path, player_guid: str, slots: int, output_path: Path) -> dict[str, Any]: ...
 
 
 @dataclass
@@ -133,7 +138,11 @@ class PlmCodecPlugin:
     def _run(self, args: list[str], timeout: int = 600) -> str:
         ready, detail = self.probe()
         if not ready: raise RuntimeError(detail)
-        result = subprocess.run([str(self.python), str(self.helper), *args], capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace")
+        try:
+            result = subprocess.run([str(self.python), str(self.helper), *args], capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace")
+        except subprocess.TimeoutExpired as exc:
+            command = args[0] if args else "helper"
+            raise RuntimeError(f"PlM helper 执行超时：{command} 超过 {timeout} 秒。请确认存档未被游戏占用，并检查插件构建日志") from exc
         if result.returncode: raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "PlM 插件执行失败")
         return result.stdout.strip()
 
@@ -141,6 +150,14 @@ class PlmCodecPlugin:
         output = self.root / "work" / f"decode-{uuid.uuid4().hex}.json"; output.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._run(["decode", "--level", str(level_path), "--output", str(output)])
+            return json.loads(output.read_text(encoding="utf-8"))
+        finally:
+            output.unlink(missing_ok=True)
+
+    def decode_players(self, level_path: Path) -> dict[str, Any]:
+        output = self.root / "work" / f"players-{uuid.uuid4().hex}.json"; output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._run(["decode-players", "--level", str(level_path), "--output", str(output)], timeout=240)
             return json.loads(output.read_text(encoding="utf-8"))
         finally:
             output.unlink(missing_ok=True)
@@ -160,6 +177,22 @@ class PlmCodecPlugin:
             return json.loads(result)
         finally:
             mapping_path.unlink(missing_ok=True)
+
+    def convert_file(self, source_path: Path, output_path: Path) -> dict[str, Any]:
+        result = self._run(["convert", "--source", str(source_path), "--output", str(output_path)])
+        return json.loads(result)
+
+    def steam_id_to_uid(self, steam_id: str) -> dict[str, str]:
+        result = self._run(["steam-uid", "--steam-id", str(steam_id)], timeout=60)
+        return json.loads(result)
+
+    def restore_map(self, source_path: Path, output_path: Path) -> dict[str, Any]:
+        result = self._run(["restore-map", "--source", str(source_path), "--output", str(output_path)])
+        return json.loads(result)
+
+    def expand_palbox(self, world_path: Path, player_guid: str, slots: int, output_path: Path) -> dict[str, Any]:
+        result = self._run(["expand-palbox", "--world", str(world_path), "--player-guid", str(player_guid), "--slots", str(slots), "--output", str(output_path)])
+        return json.loads(result)
 
     def verify_roundtrip(self, level_path: Path, expected_patch: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = self.decode(level_path)
@@ -217,6 +250,22 @@ class PlmCodecPlugin:
                 if not item: raise RuntimeError(f"写回后找不到背包槽位 {identity[1]}:{identity[2]}")
                 for key, expected in operation.get("fields", {}).items():
                     if item.get(key) != expected: raise RuntimeError(f"背包字段验证失败 {key}: {item.get(key)!r} != {expected!r}")
+            by_guild = {str(item.get("guild_id")): item for item in payload.get("guilds", []) if item.get("guild_id")}
+            for operation in expected_patch.get("guilds", []):
+                guild = by_guild.get(str(operation.get("guild_id")))
+                if not guild: raise RuntimeError(f"写回后找不到公会 {operation.get('guild_id')}")
+                for key, expected in operation.get("fields", {}).items():
+                    if guild.get(key) != expected: raise RuntimeError(f"公会字段验证失败 {key}: {guild.get(key)!r} != {expected!r}")
+            by_base = {str(item.get("base_id")): item for item in payload.get("bases", []) if item.get("base_id")}
+            for operation in expected_patch.get("bases", []):
+                base = by_base.get(str(operation.get("base_id")))
+                if not base: raise RuntimeError(f"写回后找不到基地 {operation.get('base_id')}")
+                for key, expected in operation.get("fields", {}).items():
+                    actual = base.get(key)
+                    if key == "position":
+                        for axis, value in expected.items():
+                            if float((actual or {}).get(axis, 0)) != float(value): raise RuntimeError(f"基地坐标验证失败 {axis}")
+                    elif actual != expected: raise RuntimeError(f"基地字段验证失败 {key}: {actual!r} != {expected!r}")
         return payload
 
     def _run_checked(self, command: list[str], on_log: Callable[[str], None], stage: str) -> None:
@@ -380,7 +429,7 @@ class PluginParsedSave:
     def patch_manifest(self) -> dict[str, Any]:
         """Build a stable-identity patch; unknown and index-only objects remain read-only."""
         allowed = {"nickname", "level", "exp", "hp", "shield_hp", "full_stomach", "status_point"}
-        pal_allowed = {"nickname", "level", "exp", "workspeed", "melee", "ranged", "defense", "rank", "skills"}
+        pal_allowed = {"nickname", "level", "exp", "workspeed", "melee", "ranged", "defense", "rank", "skills", "active_skills", "learned_skills", "rank_attack", "rank_defence", "rank_craftspeed", "is_lucky"}
         before = {str(item.get("player_uid")): item for item in self.original.get("players", [])}
         players = []
         pals = []
@@ -424,7 +473,25 @@ class PluginParsedSave:
                 for pal in original_pals if str(pal.get("individual_id")) not in changed_pal_ids
             },
         }
-        return {"format": SAVE_PATCH_FORMAT, "players": players, "pals": pals, "inventory": inventory, "guilds": [], "bases": [], "invariants": invariants}
+        original_guilds = {str(item.get("guild_id") or ""): item for item in self.original.get("guilds", []) if item.get("guild_id")}
+        guilds = []
+        for guild in self.properties.get("guilds", []):
+            guild_id = str(guild.get("guild_id") or ""); before_guild = original_guilds.get(guild_id)
+            if not before_guild: continue
+            fields = {key: guild.get(key) for key in ("name", "base_camp_level") if guild.get(key) != before_guild.get(key)}
+            if fields: guilds.append({"guild_id": guild_id, "fields": fields})
+        original_bases = {str(item.get("base_id") or ""): item for item in self.original.get("bases", []) if item.get("base_id")}
+        bases = []
+        for base in self.properties.get("bases", []):
+            base_id = str(base.get("base_id") or ""); before_base = original_bases.get(base_id)
+            if not before_base: continue
+            fields = {}
+            if base.get("name") != before_base.get("name"): fields["name"] = base.get("name")
+            before_position = before_base.get("position") or {}; position = base.get("position") or {}
+            changed_position = {axis: position.get(axis) for axis in ("x", "y", "z") if position.get(axis) != before_position.get(axis)}
+            if changed_position: fields["position"] = changed_position
+            if fields: bases.append({"base_id": base_id, "fields": fields})
+        return {"format": SAVE_PATCH_FORMAT, "players": players, "pals": pals, "inventory": inventory, "guilds": guilds, "bases": bases, "invariants": invariants}
 
 
 PLM_HELPER = r'''from __future__ import annotations
@@ -561,6 +628,40 @@ def decode(path):
         bases.append(base)
         if guild_id in guild_by_id:guild_by_id[guild_id]["base_ids"].append(base_id)
     return {"format":"PlM1","save_type":save_type,"players":players,"guilds":guilds,"bases":bases,"data_status":{"players":"complete","pals":"complete" if all(p.get("data_status")=="complete" for p in pals) else "partial","guilds":"complete","bases":"complete" if all(b.get("data_status")=="complete" for b in bases) else "partial"}}
+def clean_guid(value):
+    clean=str(value or "").replace("-","").replace("{","").replace("}","").upper()
+    return clean if len(clean)==32 and all(char in "0123456789ABCDEF" for char in clean) else ""
+def decode_players(path):
+    path=Path(path);_,save_type,world=load(path);by_guid={};warnings=[]
+    entries=world.get("CharacterSaveParameterMap",{}).get("value",[])
+    for index,entry in enumerate(entries):
+        try:
+            sp=save_parameter(entry)
+            if not bool(sp.get("IsPlayer",{}).get("value")):continue
+            raw_uid=entry.get("key",{}).get("PlayerUId",{}).get("value");player_guid=clean_guid(raw_uid)
+            if not player_guid:
+                warnings.append("Level.sav 玩家条目缺少有效 GUID："+str(index));continue
+            by_guid[player_guid]={"player_uid":uid_text(raw_uid),"player_guid":player_guid,"instance_id":str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower(),"nickname":str(sp.get("NickName",{}).get("value","") or ""),"level":byte_value(sp.get("Level"),1),"source":"level"}
+        except Exception as exc:warnings.append("Level.sav 玩家条目解析失败 "+str(index)+"："+str(exc))
+    players_dir=path.parent/"Players";file_guids=[]
+    if players_dir.is_dir():
+        for player_path in sorted(players_dir.glob("*.sav")):
+            file_guid=clean_guid(player_path.stem)
+            if not file_guid:continue
+            file_guids.append(file_guid)
+            try:
+                save=read_gvas(player_path)[0].properties.get("SaveData",{}).get("value",{})
+                raw_uid=save.get("PlayerUId",{}).get("value");save_guid=clean_guid(raw_uid) or file_guid
+                individual=save.get("IndividualId",{}).get("value",{})
+                instance_id=str(individual.get("InstanceId",{}).get("value","")).lower()
+                current=by_guid.pop(file_guid,None) or by_guid.get(save_guid) or {}
+                current.update({"player_uid":current.get("player_uid") or uid_text(raw_uid or save_guid),"player_guid":save_guid,"instance_id":current.get("instance_id") or instance_id,"nickname":current.get("nickname") or "","level":current.get("level") or 1,"player_file":player_path.name,"source":"level+player" if current else "player"})
+                by_guid[save_guid]=current
+            except Exception as exc:
+                warnings.append("玩家文件解析失败 "+player_path.name+"："+str(exc))
+                by_guid.setdefault(file_guid,{"player_uid":uid_text(file_guid),"player_guid":file_guid,"instance_id":"","nickname":"","level":1,"player_file":player_path.name,"source":"filename"})
+    players=sorted(by_guid.values(),key=lambda player:(player.get("player_guid")!="00000000000000000000000000000001",player.get("player_guid","")))
+    return {"format":"PlM1-players-v1","save_type":save_type,"players":players,"player_files":file_guids,"warnings":warnings}
 def set_byte(prop,value,field):
     nested=(prop or {}).get("value")
     if not isinstance(nested,dict) or "value" not in nested:
@@ -575,7 +676,9 @@ def patch(level,manifest,output):
     if len(pal_ids)!=len(set(pal_ids)):raise RuntimeError("duplicate pal InstanceId in patch")
     pal_operations={str(x["individual_id"]).lower():x.get("fields",{}) for x in pal_entries}
     item_operations={(str(x["container_id"]),int(x["slot_index"])):x.get("fields",{}) for x in manifest.get("inventory",[])}
-    player_hits={key:0 for key in operations};pal_hits={key:0 for key in pal_operations};item_hits={key:0 for key in item_operations}
+    guild_operations={str(x["guild_id"]):x.get("fields",{}) for x in manifest.get("guilds",[])}
+    base_operations={str(x["base_id"]):x.get("fields",{}) for x in manifest.get("bases",[])}
+    player_hits={key:0 for key in operations};pal_hits={key:0 for key in pal_operations};item_hits={key:0 for key in item_operations};guild_hits={key:0 for key in guild_operations};base_hits={key:0 for key in base_operations}
     for entry in world.get("CharacterSaveParameterMap",{}).get("value",[]):
         uid=uid_text(entry["key"].get("PlayerUId",{}).get("value")); sp=save_parameter(entry)
         if sp.get("IsPlayer",{}).get("value") and uid in operations:
@@ -600,17 +703,41 @@ def patch(level,manifest,output):
             for key,prop in (("workspeed","CraftSpeed"),("melee","Talent_HP"),("ranged","Talent_Shot"),("defense","Talent_Defense"),("rank","Rank")):
                 if key in fields:set_byte(sp.get(prop),fields[key],prop)
             if "skills" in fields:sp["PassiveSkillList"]["value"]["values"]=list(fields["skills"])
+            if "active_skills" in fields:sp["EquipWaza"]["value"]["values"]=list(fields["active_skills"])
+            if "learned_skills" in fields:sp["MasteredWaza"]["value"]["values"]=list(fields["learned_skills"])
+            for key,prop in (("rank_attack","Rank_Attack"),("rank_defence","Rank_Defence"),("rank_craftspeed","Rank_CraftSpeed")):
+                if key in fields:set_byte(sp.get(prop),fields[key],prop)
+            if "is_lucky" in fields:sp["IsRarePal"]["value"]=bool(fields["is_lucky"])
     for container in world.get("ItemContainerSaveData",{}).get("value",[]):
         cid=str(container["key"]["ID"]["value"])
         for slot in container["value"]["Slots"]["value"].get("values",[]):
             raw=slot.get("RawData",{}).get("value") or {}; identity=(cid,int(raw.get("slot_index",0)))
             if identity in item_operations and "StackCount" in item_operations[identity]:raw["count"]=int(item_operations[identity]["StackCount"]);item_hits[identity]+=1
+    for group in world.get("GroupSaveDataMap",{}).get("value",[]):
+        if enum_value(group.get("value",{}).get("GroupType"))!="EPalGroupType::Guild":continue
+        raw=group.get("value",{}).get("RawData",{}).get("value") or {};guild_id=str(raw.get("group_id") or "")
+        if guild_id in guild_operations:
+            guild_hits[guild_id]+=1;fields=guild_operations[guild_id]
+            if "name" in fields:raw["guild_name"]=str(fields["name"])
+            if "base_camp_level" in fields:raw["base_camp_level"]=int(fields["base_camp_level"])
+    for entry in world.get("BaseCampSaveData",{}).get("value",[]):
+        base_id=str(entry.get("key") or "")
+        if base_id in base_operations:
+            base_hits[base_id]+=1;fields=base_operations[base_id];raw=entry.get("value",{}).get("RawData",{}).get("value") or {}
+            if "name" in fields:raw["name"]=str(fields["name"])
+            if "position" in fields:
+                transform=raw.setdefault("transform",{});translation=transform.setdefault("translation",{})
+                for axis,value in fields["position"].items():
+                    if axis in ("x","y","z"):translation[axis]=float(value)
     invalid_players=[key for key,count in player_hits.items() if count!=1]
     invalid_pals=[key for key,count in pal_hits.items() if count!=1]
     invalid_items=[key for key,count in item_hits.items() if count!=1]
+    invalid_guilds=[key for key,count in guild_hits.items() if count!=1];invalid_bases=[key for key,count in base_hits.items() if count!=1]
     if invalid_players:raise RuntimeError("player targets must match exactly once: "+",".join(sorted(invalid_players)))
     if invalid_pals:raise RuntimeError("pal InstanceId targets must match exactly once: "+",".join(sorted(invalid_pals)))
     if invalid_items:raise RuntimeError("inventory targets must match exactly once: "+",".join(f"{x[0]}:{x[1]}" for x in invalid_items))
+    if invalid_guilds:raise RuntimeError("guild targets must match exactly once: "+",".join(sorted(invalid_guilds)))
+    if invalid_bases:raise RuntimeError("base targets must match exactly once: "+",".join(sorted(invalid_bases)))
     output_data=compress_gvas_to_sav(gvas.write(PALWORLD_CUSTOM_PROPERTIES),save_type); Path(output).write_bytes(output_data)
 def guid(value):
     clean=str(value or "").replace("-","").lower()
@@ -682,17 +809,104 @@ def migrate_identities(world_path,mapping_path,output_path):
         if (players_path/(report["old_guid"]+".sav")).exists():raise RuntimeError("迁移后旧玩家文件仍然存在")
         if not (players_path/(report["new_guid"]+".sav")).is_file():raise RuntimeError("迁移后新玩家文件不存在")
     return {"migrated":len(reports),"players":reports,"decoded_players":len(decoded.get("players",[]))}
+def convert_file(source,output):
+    from palsav import json_tools
+    from palsav.io import load_sav,save_sav
+    source=Path(source);output=Path(output)
+    if not source.is_file():raise RuntimeError("转换来源不存在")
+    output.parent.mkdir(parents=True,exist_ok=True)
+    if source.suffix.lower()==".sav":
+        gvas=load_sav(str(source),custom_properties=PALWORLD_CUSTOM_PROPERTIES)
+        json_tools.dump(gvas.dump(),str(output),minify=False,allow_nan=True)
+        mode="sav-to-json"
+    elif source.suffix.lower()==".json":
+        gvas=GvasFile.load(json_tools.load(str(source)))
+        save_sav(gvas,str(output))
+        mode="json-to-sav"
+    else:raise RuntimeError("仅支持 .sav 与 .json 文件")
+    if not output.is_file() or output.stat().st_size==0:raise RuntimeError("转换没有生成有效输出")
+    return {"mode":mode,"source":str(source),"output":str(output),"bytes":output.stat().st_size}
+def restore_map(source,output):
+    from palsav.io import load_sav,save_sav
+    source=Path(source);output=Path(output)
+    if not source.is_file():raise RuntimeError("LocalData.sav 不存在")
+    gvas=load_sav(str(source),custom_properties=PALWORLD_CUSTOM_PROPERTIES);dump=gvas.dump()
+    save_data=dump.get("properties",{}).get("SaveData",{}).get("value",{});masks=0;hidden=0
+    def clear_values(mask):
+        nonlocal masks
+        values=mask.get("values")
+        if isinstance(values,bytes):mask["values"]=b"\x00"*len(values);masks+=1
+        elif isinstance(values,list):mask["values"]=[0]*len(values);masks+=1
+    if "WorldMapUISaveDataMap" in save_data:
+        for entry in save_data["WorldMapUISaveDataMap"].get("value",[]):clear_values(entry.get("value",{}).get("MaskTextureData",{}).get("value",{}))
+    elif "WorldMapMaskTextureV4" in save_data:clear_values(save_data["WorldMapMaskTextureV4"].get("value",{}))
+    for entry in save_data.get("Local_HiddenLocationFlagMap",{}).get("value",[]):
+        if entry.get("value") is not False:entry["value"]=False;hidden+=1
+    save_data["Local_ShowSkyIslandCloudOnWorldMapUI"]={"value":False,"id":None,"type":"BoolProperty"}
+    output.parent.mkdir(parents=True,exist_ok=True);save_sav(GvasFile.load(dump),str(output),custom_properties=PALWORLD_CUSTOM_PROPERTIES)
+    if not output.is_file() or output.stat().st_size==0:raise RuntimeError("地图恢复没有生成有效输出")
+    return {"source":str(source),"output":str(output),"mask_textures":masks,"hidden_locations":hidden,"bytes":output.stat().st_size}
+def expand_palbox(world_path,player_guid,slots,output_path):
+    import shutil
+    clean,_=guid(player_guid);slots=int(slots)
+    if slots<1 or slots>99999:raise RuntimeError("Palbox 槽位必须在 1 到 99999 之间")
+    world_path=Path(world_path);output_path=Path(output_path)
+    player_path=world_path/"Players"/(clean.upper()+".sav")
+    if not (world_path/"Level.sav").is_file() or not player_path.is_file():raise RuntimeError("世界目录缺少 Level.sav 或目标玩家文件")
+    player_gvas,_=read_gvas(player_path);save_data=player_gvas.properties.get("SaveData",{}).get("value",{})
+    palbox=str(save_data.get("PalStorageContainerId",{}).get("value",{}).get("ID",{}).get("value","")).lower()
+    if not palbox:raise RuntimeError("目标玩家文件缺少 PalStorageContainerId")
+    if output_path.exists():shutil.rmtree(output_path)
+    shutil.copytree(world_path,output_path);level_path=output_path/"Level.sav";level_gvas,save_type,world=load(level_path)
+    matches=[]
+    for entry in world.get("CharacterContainerSaveData",{}).get("value",[]):
+        if container_id(entry).lower()==palbox:matches.append(entry)
+    if len(matches)!=1:raise RuntimeError("Palbox 容器必须恰好命中一次")
+    value=matches[0].get("value",{});slot_values=value.get("Slots",{}).get("value",{}).get("values",[])
+    used=max([int(slot.get("SlotIndex",{}).get("value",index)) for index,slot in enumerate(slot_values)]+[-1])+1
+    if slots<used:raise RuntimeError("新槽位数不能小于当前已使用槽位")
+    current=int(value.get("SlotNum",{}).get("value",0));value.setdefault("SlotNum",{"id":None,"type":"IntProperty"})["value"]=slots
+    level_path.write_bytes(compress_gvas_to_sav(level_gvas.write(PALWORLD_CUSTOM_PROPERTIES),save_type))
+    _,_,verified=load(level_path);verified_matches=[entry for entry in verified.get("CharacterContainerSaveData",{}).get("value",[]) if container_id(entry).lower()==palbox]
+    actual=int(verified_matches[0].get("value",{}).get("SlotNum",{}).get("value",0)) if len(verified_matches)==1 else -1
+    if actual!=slots:raise RuntimeError("Palbox 槽位写回验证失败")
+    return {"player_guid":clean.upper(),"container_id":palbox,"old_slots":current,"new_slots":actual,"used_slots":used,"output":str(output_path)}
+def u32(value):return int.from_bytes((value&4294967295).to_bytes(8,"little",signed=True),"little",signed=False)
+def no_steam_uid(value):
+    a=u32(u32(value<<8)^u32(2654435769-value));b=u32(a>>13^u32(-(value+a)));c=u32(b>>12^u32(value-a-b));d=u32(u32(c<<16)^u32(a-c-b));e=u32(d>>5^b-d-c);f=u32(e>>3^c-d-e)
+    return "%08X"%u32(u32(u32(f<<10)^u32(d-f-e))>>15^e-(u32(f<<10)^u32(d-f-e))-f)
+def steam_uid(value):
+    from palsav.archive import UUID
+    from palsav._cityhash import cityhash64
+    raw=str(value).strip()
+    if "steamcommunity.com/profiles/" in raw:raw=raw.split("steamcommunity.com/profiles/",1)[1].split("/",1)[0]
+    if raw.lower().startswith("steam_"):raw=raw[6:]
+    steam_id=int(raw)
+    if steam_id<=0:raise RuntimeError("SteamID 必须是正整数")
+    hashed=cityhash64(str(steam_id).encode("utf-16-le"));pal=UUID(int(u32(u32(hashed)+(hashed>>32)*23)).to_bytes(4,"little",signed=False)+b"\x00"*12)
+    nosteam=no_steam_uid(int.from_bytes(pal.raw_bytes[:4],"little"))+"-0000-0000-0000-000000000000"
+    return {"steam_id":str(steam_id),"palworld_uid":str(pal).upper(),"nosteam_uid":nosteam.upper()}
 def main():
     parser=argparse.ArgumentParser(); sub=parser.add_subparsers(dest="cmd",required=True); sub.add_parser("probe")
     for name in ("decode","patch"):
         p=sub.add_parser(name);p.add_argument("--level",required=True);p.add_argument("--output",required=True)
         if name=="patch":p.add_argument("--patch",required=True)
+    players=sub.add_parser("decode-players");players.add_argument("--level",required=True);players.add_argument("--output",required=True)
     migrate=sub.add_parser("migrate-identities");migrate.add_argument("--world",required=True);migrate.add_argument("--mapping",required=True);migrate.add_argument("--output",required=True)
+    convert=sub.add_parser("convert");convert.add_argument("--source",required=True);convert.add_argument("--output",required=True)
+    map_restore=sub.add_parser("restore-map");map_restore.add_argument("--source",required=True);map_restore.add_argument("--output",required=True)
+    palbox=sub.add_parser("expand-palbox");palbox.add_argument("--world",required=True);palbox.add_argument("--player-guid",required=True);palbox.add_argument("--slots",required=True,type=int);palbox.add_argument("--output",required=True)
+    steam=sub.add_parser("steam-uid");steam.add_argument("--steam-id",required=True)
     args=parser.parse_args()
     if args.cmd=="probe":
         import palooz, palsav;print("PlM codec ready");return
     if args.cmd=="decode":Path(args.output).write_text(json.dumps(decode(args.level),ensure_ascii=False),encoding="utf-8")
+    elif args.cmd=="decode-players":Path(args.output).write_text(json.dumps(decode_players(args.level),ensure_ascii=False),encoding="utf-8")
     elif args.cmd=="patch":patch(args.level,json.loads(Path(args.patch).read_text(encoding="utf-8")),args.output)
-    else:print(json.dumps(migrate_identities(args.world,args.mapping,args.output),ensure_ascii=False))
+    elif args.cmd=="migrate-identities":print(json.dumps(migrate_identities(args.world,args.mapping,args.output),ensure_ascii=False))
+    elif args.cmd=="convert":print(json.dumps(convert_file(args.source,args.output),ensure_ascii=False))
+    elif args.cmd=="restore-map":print(json.dumps(restore_map(args.source,args.output),ensure_ascii=False))
+    elif args.cmd=="expand-palbox":print(json.dumps(expand_palbox(args.world,args.player_guid,args.slots,args.output),ensure_ascii=False))
+    else:print(json.dumps(steam_uid(args.steam_id),ensure_ascii=False))
 if __name__=="__main__":main()
 '''

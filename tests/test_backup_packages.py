@@ -248,6 +248,31 @@ def test_restore_mapping_keeps_completed_players_and_only_maps_pending(tmp_path:
     assert updated.mappings[1].status == "confirmed"
 
 
+def test_identity_target_candidates_exclude_same_used_and_duplicate_guids():
+    service = BackupPackageService(); old = "A" * 32; used = "B" * 32; available = "C" * 32
+    targets = (
+        {"player_guid": old, "nickname": "same"},
+        {"player_guid": used, "nickname": "used"},
+        {"player_guid": available, "nickname": "first"},
+        {"player_guid": available.lower(), "nickname": "duplicate"},
+        {"player_guid": "", "nickname": "invalid"},
+    )
+
+    result = service.available_identity_targets(old, targets, {used})
+
+    assert result == ({"player_guid": available, "nickname": "first"},)
+
+
+def test_restore_mapping_reports_same_and_reused_target_separately(tmp_path: Path):
+    service = BackupPackageService(); old_a = "A" * 32; old_c = "C" * 32; target = "B" * 32
+    session = CoopMigrationSession(instance_id="server", source_path="source", target_world_path="target", phase="mapping_ready", source_players=({"player_guid": old_a, "nickname": "Alice"}, {"player_guid": old_c, "nickname": "Carol"}), placeholder_players=({"player_guid": old_a}, {"player_guid": target}), pending_player_guids=(old_a, old_c))
+
+    with pytest.raises(ValueError, match="不能映射到自己的旧 GUID"):
+        service.confirm_restore_mappings(session, {old_a: old_a}, tmp_path)
+    with pytest.raises(ValueError, match="已分配给其他玩家"):
+        service.confirm_restore_mappings(session, {old_a: target, old_c: target}, tmp_path)
+
+
 def test_refresh_restore_placeholders_only_returns_players_added_after_baseline(tmp_path: Path, monkeypatch):
     service = BackupPackageService(); saved = make_saved(tmp_path / "snapshot", "WORLD")
     world = saved / "SaveGames" / "0" / "WORLD"; players = world / "Players"
@@ -265,6 +290,61 @@ def test_refresh_restore_placeholders_only_returns_players_added_after_baseline(
     assert tuple(service._player_guid(item) for item in updated.placeholder_players) == ("D" * 32,)
     assert updated.phase == "mapping_ready"
     assert Path(updated.source_path, "Players", placeholder).is_file()
+
+
+def test_inspect_world_players_uses_lightweight_decoder_and_storage_root(tmp_path: Path, monkeypatch):
+    world = tmp_path / "world"; (world / "Players").mkdir(parents=True); (world / "Level.sav").write_bytes(b"level")
+    seen = {}
+    monkeypatch.setattr("palworld_console.backup_packages.PlmCodecPlugin.probe", lambda self: (seen.setdefault("root", self.app_root) is not None, "ready"))
+    monkeypatch.setattr("palworld_console.backup_packages.PlmCodecPlugin.decode_players", lambda _self, _level: {"players": [{"player_guid": "0" * 31 + "1", "instance_id": "host-instance"}]})
+
+    players = BackupPackageService.inspect_world_players(world, tmp_path / "app-storage")
+
+    assert players[0]["player_guid"].endswith("1")
+    assert seen["root"] == tmp_path / "app-storage"
+
+
+def test_refresh_coop_placeholders_matches_player_filenames_case_insensitively(tmp_path: Path, monkeypatch):
+    service = BackupPackageService(); target = tmp_path / "target"; players_dir = target / "Players"; players_dir.mkdir(parents=True); (target / "Level.sav").write_bytes(b"level")
+    guid = "ABCDEF0123456789ABCDEF0123456789"; (players_dir / f"{guid.lower()}.sav").write_bytes(b"player")
+    monkeypatch.setattr(BackupPackageService, "inspect_world_players", staticmethod(lambda *_args: ({"player_guid": guid, "instance_id": "new-instance"},)))
+    session = CoopMigrationSession(instance_id="server", source_path="source", target_world_path=str(target), phase="waiting_placeholders", baseline_player_files=())
+
+    updated = service.refresh_coop_placeholders(session, tmp_path / "storage")
+
+    assert service._player_guid(updated.placeholder_players[0]) == guid
+    assert updated.phase == "mapping_ready"
+
+
+def test_refresh_coop_placeholders_surfaces_identity_parse_error(tmp_path: Path, monkeypatch):
+    service = BackupPackageService(); target = tmp_path / "target"; players_dir = target / "Players"; players_dir.mkdir(parents=True); (target / "Level.sav").write_bytes(b"level"); (players_dir / ("A" * 32 + ".sav")).write_bytes(b"player")
+    monkeypatch.setattr(BackupPackageService, "inspect_world_players", staticmethod(lambda *_args: (_ for _ in ()).throw(RuntimeError("player file corrupt"))))
+    session = CoopMigrationSession(instance_id="server", source_path="source", target_world_path=str(target), phase="waiting_placeholders", baseline_player_files=())
+
+    with pytest.raises(RuntimeError, match="临时角色身份解析失败.*player file corrupt"):
+        service.refresh_coop_placeholders(session, tmp_path / "storage")
+
+
+def test_world_candidates_ignore_embedded_backup_history(tmp_path: Path):
+    savegames = tmp_path / "SaveGames"; current = savegames / "0" / "WORLD"; backup = current / "backup" / "world" / "old"
+    current.mkdir(parents=True); backup.mkdir(parents=True)
+    (current / "Level.sav").write_bytes(b"current"); (backup / "Level.sav").write_bytes(b"old")
+
+    candidates = BackupPackageService._world_candidates(savegames)
+
+    assert [world for _root, world, _relative in candidates] == [current.resolve()]
+
+
+def test_normalize_world_directory_excludes_embedded_backups(tmp_path: Path):
+    source = tmp_path / "WORLD"; players = source / "Players"; backup = source / "backup" / "world" / "old"
+    players.mkdir(parents=True); backup.mkdir(parents=True)
+    (source / "Level.sav").write_bytes(b"current"); (players / ("A" * 32 + ".sav")).write_bytes(b"player"); (backup / "Level.sav").write_bytes(b"old")
+
+    BackupPackageService().normalize_local_save(source, tmp_path / "normalized")
+
+    world = tmp_path / "normalized" / "SaveGames" / "imported-world"
+    assert (world / "Level.sav").read_bytes() == b"current"
+    assert not (world / "backup").exists()
 
 
 class FakePlmPlugin:

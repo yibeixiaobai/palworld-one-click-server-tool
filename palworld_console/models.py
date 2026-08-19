@@ -34,6 +34,55 @@ class LocalSaveSource:
 
 
 @dataclass(frozen=True)
+class SaveToolOperation:
+    operation_id: str
+    operation: str
+    source_path: str
+    target_path: str = ""
+    source_kind: str = ""
+    source_format: str = ""
+    target_kind: str = ""
+    status: str = "planned"
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class ConversionPackage:
+    path: str
+    manifest_path: str
+    operation_id: str
+    source_path: str
+    source_kind: str
+    world_id: str
+    file_count: int
+    total_bytes: int
+    sha256: str
+    created_at: str
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SaveDiagnosticFinding:
+    severity: str
+    category: str
+    object_type: str
+    object_id: str
+    message: str
+    repairable: bool = False
+
+
+@dataclass(frozen=True)
+class SaveDiagnosticReport:
+    source_path: str
+    level_path: str
+    players: int
+    pals: int
+    guilds: int
+    bases: int
+    findings: tuple[SaveDiagnosticFinding, ...] = ()
+
+
+@dataclass(frozen=True)
 class ServerWorldTarget:
     savegames_path: str
     world_path: str

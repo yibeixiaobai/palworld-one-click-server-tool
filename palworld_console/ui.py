@@ -11,7 +11,7 @@ import threading
 import time
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt, QProcess, QTimer
 from PySide6.QtGui import QAction, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QPushButton, QPlainTextEdit, QProgressBar, QProgressDialog, QScrollArea, QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QLineEdit, QVBoxLayout, QWidget, QInputDialog, QAbstractItemView, QStackedWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGraphicsScene, QGraphicsView, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QPushButton, QPlainTextEdit, QProgressBar, QProgressDialog, QScrollArea, QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QLineEdit, QVBoxLayout, QWidget, QInputDialog, QAbstractItemView, QStackedWidget)
 from PySide6.QtCore import QSettings
 
 from .config_ini import coerce_setting_value
@@ -30,6 +30,7 @@ from .wine_migration import WineMigrationPreflight, WineMigrationService
 from .settings_schema import CATEGORIES, PRESETS, SETTING_BY_KEY, SETTING_DEFINITIONS
 from .storage import AppStorage
 from .backup_packages import BackupPackageService, BackupRepository, RestoreTransaction
+from .save_tools import SaveToolsService
 from .updater import ReleaseInfo, UpdateService
 
 
@@ -141,6 +142,34 @@ class RestoreOptionsDialog(QDialog):
         return self.player_uid.currentText().strip() if self.player.isChecked() else ""
 
 
+class SaveDiagnosticsDialog(QDialog):
+    def __init__(self, report, payload, parent=None):
+        super().__init__(parent); self.setWindowTitle("存档地图与诊断"); self.resize(920, 660)
+        layout = QVBoxLayout(self)
+        summary = QLabel(f"玩家 {report.players} · 帕鲁 {report.pals} · 公会 {report.guilds} · 基地 {report.bases} · 风险 {len(report.findings)}")
+        summary.setStyleSheet("font-size:16px;font-weight:650;"); layout.addWidget(summary)
+        split = QSplitter(Qt.Vertical); layout.addWidget(split, 1)
+        scene = QGraphicsScene(self); view = QGraphicsView(scene); view.setMinimumHeight(300); split.addWidget(view)
+        bases = list(payload.get("bases") or []); points = []
+        for base in bases:
+            position = base.get("position") or {}; x = float(position.get("x") or 0); y = float(position.get("y") or 0); points.append((x, y, base))
+        if points:
+            xs = [item[0] for item in points]; ys = [item[1] for item in points]; min_x, max_x = min(xs), max(xs); min_y, max_y = min(ys), max(ys)
+            span_x = max(1.0, max_x - min_x); span_y = max(1.0, max_y - min_y)
+            for x, y, base in points:
+                px = (x - min_x) / span_x * 760; py = (max_y - y) / span_y * 260
+                marker = scene.addEllipse(px - 6, py - 6, 12, 12); marker.setToolTip(f"{base.get('name') or base.get('base_id')}\nX={x:g} Y={y:g}\n公会：{base.get('guild_id') or '-'}")
+                label = scene.addText(str(base.get("name") or base.get("base_id") or "基地")); label.setPos(px + 8, py - 12)
+            scene.setSceneRect(-20, -20, 840, 320); view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
+        else:
+            scene.addText("当前解析结果没有可显示的基地坐标")
+        table = QTableWidget(len(report.findings), 6); table.setHorizontalHeaderLabels(["风险", "类别", "对象", "ID", "说明", "可修复"]); table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        for row, finding in enumerate(report.findings):
+            for column, value in enumerate((finding.severity, finding.category, finding.object_type, finding.object_id, finding.message, "是" if finding.repairable else "否")): table.setItem(row, column, QTableWidgetItem(str(value)))
+        split.addWidget(table); split.setSizes([360, 240])
+        buttons = QDialogButtonBox(QDialogButtonBox.Close); buttons.rejected.connect(self.reject); layout.addWidget(buttons)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -174,6 +203,7 @@ class MainWindow(QMainWindow):
         self.player_edit_sessions: dict[tuple[str, str], PlayerEditSession] = {}
         self.player_center = PlayerCenterController()
         self.player_edit_sessions = self.player_center.sessions
+        self.world_edit_session: PlayerEditSession | None = None
         self.active_player_uid = ""
         self.current_guilds: list[GuildSummary] = []
         self.config_original: dict[str, object] = {}
@@ -215,8 +245,8 @@ class MainWindow(QMainWindow):
         self.navigation = QListWidget(); self.navigation.setObjectName("pageNavigation"); self.navigation.setFixedWidth(172); page_layout.addWidget(self.navigation)
         self.page_stack = QStackedWidget(); page_layout.addWidget(self.page_stack, 1); right_layout.addWidget(page_area)
         self.tabs = QTabWidget(); self.tabs.hide()
-        self.dashboard = self._dashboard_tab(); self.connection = self._connection_tab(); self.config = self._game_config_tab(); self.players_page = self._players_tab(); self.guilds_page = self._guilds_tab(); self.mods_page = self._mods_tab(); self.automation_page = self._automation_tab(); self.backups_page = self._backup_tab(); self.ops = self._ops_tab(); self.about_page = self._about_tab()
-        pages = ((self.dashboard, "仪表盘"), (self.connection, "连接与部署"), (self.config, "游戏配置"), (self.players_page, "玩家中心"), (self.guilds_page, "公会与基地"), (self.mods_page, "模组管理"), (self.automation_page, "RCON 与自动化"), (self.backups_page, "备份与恢复"), (self.ops, "日志与审计"), (self.about_page, "关于我们"))
+        self.dashboard = self._dashboard_tab(); self.connection = self._connection_tab(); self.config = self._game_config_tab(); self.players_page = self._players_tab(); self.guilds_page = self._guilds_tab(); self.mods_page = self._mods_tab(); self.automation_page = self._automation_tab(); self.save_tools_page = self._save_tools_tab(); self.backups_page = self._backup_tab(); self.ops = self._ops_tab(); self.about_page = self._about_tab()
+        pages = ((self.dashboard, "仪表盘"), (self.connection, "连接与部署"), (self.config, "游戏配置"), (self.players_page, "玩家中心"), (self.guilds_page, "公会与基地"), (self.mods_page, "模组管理"), (self.automation_page, "RCON 与自动化"), (self.save_tools_page, "存档工具"), (self.backups_page, "备份与恢复"), (self.ops, "日志与审计"), (self.about_page, "关于我们"))
         for page, title in pages:
             self.tabs.addTab(QWidget(), title); self.navigation.addItem(title); self.page_stack.addWidget(page)
         self.navigation.currentRowChanged.connect(self.page_stack.setCurrentIndex); self.navigation.currentRowChanged.connect(self.tabs.setCurrentIndex); self.navigation.currentRowChanged.connect(self._navigation_page_changed); self.navigation.setCurrentRow(0)
@@ -344,9 +374,12 @@ class MainWindow(QMainWindow):
         self.save_fields_table = QTableWidget(0, 7); self.save_fields_table.setHorizontalHeaderLabels(["对象", "中文字段", "当前值", "修改值", "来源", "状态", "风险"]); self.save_fields_table.setAlternatingRowColors(True); self.save_fields_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents); self.save_fields_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch); self.save_fields_table.itemChanged.connect(self._save_edit_changed); al.addWidget(self.save_fields_table); self.player_detail_tabs.addTab(attributes, "玩家属性")
         pals = QWidget(); pal_l = QVBoxLayout(pals); pal_split = QSplitter(Qt.Horizontal); self.player_pals_table = QTableWidget(0, 8); self.player_pals_table.setHorizontalHeaderLabels(["帕鲁", "昵称", "等级", "性别", "幸运", "星级", "个体值", "状态"]); self.player_pals_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.player_pals_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_pals_table.horizontalHeader().setStretchLastSection(True); self.player_pals_table.currentCellChanged.connect(self._show_pal_editor); pal_split.addWidget(self.player_pals_table)
         pal_detail = QWidget(); pal_detail_l = QVBoxLayout(pal_detail); self.pal_detail_text = QPlainTextEdit(); self.pal_detail_text.setReadOnly(True); self.pal_detail_text.setMinimumWidth(320); pal_detail_l.addWidget(self.pal_detail_text, 1); pal_editor = QGroupBox("所选帕鲁修改草稿"); pal_form = QGridLayout(pal_editor); self.pal_editors = {}
-        for index, (key, label) in enumerate((("nickname", "昵称"), ("level", "等级"), ("exp", "经验"), ("workspeed", "工作速度"), ("melee", "生命个体值"), ("ranged", "攻击个体值"), ("defense", "防御个体值"), ("rank", "星级"))):
+        pal_fields = (("nickname", "昵称"), ("level", "等级"), ("exp", "经验"), ("workspeed", "工作速度"), ("melee", "生命个体值"), ("ranged", "攻击个体值"), ("defense", "防御个体值"), ("rank", "星级"), ("rank_attack", "攻击强化"), ("rank_defence", "防御强化"), ("rank_craftspeed", "工作强化"), ("is_lucky", "幸运 是/否"), ("skills", "被动技能 ID"), ("active_skills", "装备主动技能 ID"), ("learned_skills", "已掌握技能 ID"))
+        for index, (key, label) in enumerate(pal_fields):
             edit = QLineEdit(); self.pal_editors[key] = edit; pal_form.addWidget(QLabel(label), index // 4 * 2, index % 4); pal_form.addWidget(edit, index // 4 * 2 + 1, index % 4)
-        self.stage_pal_button = QPushButton("加入修改草稿"); self.stage_pal_button.clicked.connect(self.stage_selected_pal); pal_form.addWidget(self.stage_pal_button, 4, 3); pal_detail_l.addWidget(pal_editor); pal_split.addWidget(pal_detail); pal_split.setSizes([650, 390]); pal_l.addWidget(pal_split); self.player_pals_tab_index = self.player_detail_tabs.addTab(pals, "帕鲁 0")
+        pal_action_row = ((len(pal_fields) - 1) // 4 + 1) * 2
+        fix_pals = QPushButton("生成非法数值修复草稿"); fix_pals.clicked.connect(self.stage_legal_pal_repairs); pal_form.addWidget(fix_pals, pal_action_row, 2)
+        self.stage_pal_button = QPushButton("加入修改草稿"); self.stage_pal_button.clicked.connect(self.stage_selected_pal); pal_form.addWidget(self.stage_pal_button, pal_action_row, 3); pal_detail_l.addWidget(pal_editor); pal_split.addWidget(pal_detail); pal_split.setSizes([650, 390]); pal_l.addWidget(pal_split); self.player_pals_tab_index = self.player_detail_tabs.addTab(pals, "帕鲁 0")
         inventory = QWidget(); inv_l = QVBoxLayout(inventory); inv_filter = QHBoxLayout(); inv_filter.addWidget(QLabel("容器")); self.inventory_container_filter = QComboBox(); self.inventory_container_filter.addItem("全部", "all"); [self.inventory_container_filter.addItem(label, key) for key, label in CONTAINER_LABELS.items()]; self.inventory_container_filter.currentIndexChanged.connect(self._render_inventory_for_active_player); inv_filter.addWidget(self.inventory_container_filter); self.inventory_status_label = QLabel("尚未载入背包"); inv_filter.addWidget(self.inventory_status_label); inv_filter.addStretch(); inv_l.addLayout(inv_filter); self.player_inventory_table = QTableWidget(0, 5); self.player_inventory_table.setHorizontalHeaderLabels(["容器", "槽位", "物品", "物品 ID", "数量"]); self.player_inventory_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.player_inventory_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_inventory_table.horizontalHeader().setStretchLastSection(True); self.player_inventory_table.currentCellChanged.connect(self._show_inventory_editor); inv_l.addWidget(self.player_inventory_table)
         inventory_editor = QHBoxLayout(); self.inventory_selected_label = QLabel("选择背包槽位后可修改数量"); inventory_editor.addWidget(self.inventory_selected_label, 1); self.inventory_quantity = QSpinBox(); self.inventory_quantity.setRange(0, 999999); inventory_editor.addWidget(self.inventory_quantity); self.stage_inventory_button = QPushButton("加入修改草稿"); self.stage_inventory_button.clicked.connect(self.stage_selected_inventory); inventory_editor.addWidget(self.stage_inventory_button); inv_l.addLayout(inventory_editor); self.player_inventory_tab_index = self.player_detail_tabs.addTab(inventory, "背包 0")
         relations = QWidget(); rel_l = QVBoxLayout(relations); self.player_relations_summary = QLabel("尚未载入公会与基地关系"); self.player_relations_summary.setWordWrap(True); rel_l.addWidget(self.player_relations_summary); rel_split = QSplitter(Qt.Vertical); self.player_guild_members_table = QTableWidget(0, 3); self.player_guild_members_table.setHorizontalHeaderLabels(["公会成员", "角色 UID", "身份"]); self.player_guild_members_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_guild_members_table.horizontalHeader().setStretchLastSection(True); rel_split.addWidget(self.player_guild_members_table); self.player_bases_table = QTableWidget(0, 7); self.player_bases_table.setHorizontalHeaderLabels(["基地", "基地 ID", "坐标", "工作帕鲁", "工作容器", "关联容器", "状态"]); self.player_bases_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_bases_table.horizontalHeader().setStretchLastSection(True); rel_split.addWidget(self.player_bases_table); rel_split.setSizes([220, 320]); rel_l.addWidget(rel_split, 1); self.player_relations_tab_index = self.player_detail_tabs.addTab(relations, "公会与基地 0")
@@ -357,8 +390,20 @@ class MainWindow(QMainWindow):
         self.player_view_stack.addWidget(self.player_detail_page); self.player_view_stack.setCurrentWidget(self.player_list_page); self.save_document = None; self.save_scalar_values = {}; self.save_working_path = None; self._refresh_plm_plugin_status(); self._refresh_localization_status(); self.player_detail_tabs.setEnabled(False); return w
 
     def _guilds_tab(self):
-        w = QWidget(); l = QVBoxLayout(w); row = QHBoxLayout(); refresh = QPushButton("刷新公会与基地"); refresh.clicked.connect(self.refresh_guilds); row.addWidget(refresh); row.addWidget(QLabel("在线数据来自官方接口；改名、转移、合并和删除通过停服存档事务执行。")); row.addStretch(); l.addLayout(row)
-        self.guilds_table = QTableWidget(0, 7); self.guilds_table.setHorizontalHeaderLabels(["公会", "公会 ID", "成员", "在线", "平均等级", "基地", "帕鲁"]); self.guilds_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.guilds_table.horizontalHeader().setStretchLastSection(True); l.addWidget(self.guilds_table); self.guild_members = QPlainTextEdit(); self.guild_members.setReadOnly(True); self.guild_members.setMaximumHeight(100); l.addWidget(self.guild_members); self.guilds_table.currentCellChanged.connect(self._show_guild_members); return w
+        w = QWidget(); l = QVBoxLayout(w); row = QHBoxLayout(); refresh = QPushButton("刷新在线数据"); refresh.clicked.connect(self.refresh_guilds); row.addWidget(refresh); sync = QPushButton("同步完整存档"); sync.clicked.connect(self.load_save_snapshot); row.addWidget(sync); row.addWidget(QLabel("在线数据用于监控；结构化修改来自完整存档并通过停服事务写回。")); row.addStretch(); l.addLayout(row)
+        self.guilds_table = QTableWidget(0, 7); self.guilds_table.setHorizontalHeaderLabels(["公会", "公会 ID", "成员", "在线", "平均等级", "基地", "帕鲁"]); self.guilds_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.guilds_table.horizontalHeader().setStretchLastSection(True); l.addWidget(self.guilds_table); self.guild_members = QPlainTextEdit(); self.guild_members.setReadOnly(True); self.guild_members.setMaximumHeight(100); l.addWidget(self.guild_members); self.guilds_table.currentCellChanged.connect(self._show_guild_members)
+        editors = QGroupBox("结构化公会与基地修改草稿"); form = QGridLayout(editors)
+        self.world_guild_combo = QComboBox(); self.world_guild_combo.currentIndexChanged.connect(self._show_world_guild_editor); form.addWidget(QLabel("公会"), 0, 0); form.addWidget(self.world_guild_combo, 0, 1)
+        self.world_guild_name = QLineEdit(); form.addWidget(QLabel("名称"), 0, 2); form.addWidget(self.world_guild_name, 0, 3)
+        self.world_guild_level = QSpinBox(); self.world_guild_level.setRange(1, 30); form.addWidget(QLabel("基地等级"), 0, 4); form.addWidget(self.world_guild_level, 0, 5)
+        stage_guild = QPushButton("暂存公会修改"); stage_guild.clicked.connect(self.stage_world_guild); form.addWidget(stage_guild, 0, 6)
+        self.world_base_combo = QComboBox(); self.world_base_combo.currentIndexChanged.connect(self._show_world_base_editor); form.addWidget(QLabel("基地"), 1, 0); form.addWidget(self.world_base_combo, 1, 1)
+        self.world_base_name = QLineEdit(); form.addWidget(QLabel("名称"), 1, 2); form.addWidget(self.world_base_name, 1, 3)
+        self.world_base_x = QLineEdit(); self.world_base_y = QLineEdit(); self.world_base_z = QLineEdit()
+        coordinates = QHBoxLayout(); coordinates.addWidget(QLabel("X")); coordinates.addWidget(self.world_base_x); coordinates.addWidget(QLabel("Y")); coordinates.addWidget(self.world_base_y); coordinates.addWidget(QLabel("Z")); coordinates.addWidget(self.world_base_z); form.addLayout(coordinates, 1, 4, 1, 2)
+        stage_base = QPushButton("暂存基地修改"); stage_base.clicked.connect(self.stage_world_base); form.addWidget(stage_base, 1, 6)
+        actions = QHBoxLayout(); self.world_edit_status = QLabel("尚未同步结构化存档"); actions.addWidget(self.world_edit_status, 1); preview = QPushButton("预览世界修改"); preview.clicked.connect(self.preview_world_changes); actions.addWidget(preview); revert = QPushButton("撤销世界草稿"); revert.clicked.connect(self.revert_world_changes); actions.addWidget(revert); save = QPushButton("保存世界修改"); save.clicked.connect(self.apply_world_changes); save.setStyleSheet("color:#b42318;"); actions.addWidget(save); form.addLayout(actions, 2, 0, 1, 7)
+        l.addWidget(editors); return w
 
     def _mods_tab(self):
         w = QWidget(); l = QVBoxLayout(w)
@@ -404,6 +449,55 @@ class MainWindow(QMainWindow):
         whitelist = QGroupBox("白名单策略"); wl = QVBoxLayout(whitelist); wr = QHBoxLayout(); self.whitelist_uid = QLineEdit(); self.whitelist_uid.setPlaceholderText("玩家 UID"); wr.addWidget(self.whitelist_uid); self.whitelist_name = QLineEdit(); self.whitelist_name.setPlaceholderText("玩家名称/备注"); wr.addWidget(self.whitelist_name); self.whitelist_policy = QComboBox(); self.whitelist_policy.addItem("仅记录", "log"); self.whitelist_policy.addItem("广播警告", "warn"); self.whitelist_policy.addItem("自动踢出", "kick"); wr.addWidget(self.whitelist_policy); add = QPushButton("加入白名单"); add.clicked.connect(self.add_whitelist); wr.addWidget(add); wl.addLayout(wr)
         self.whitelist_table = QTableWidget(0, 4); self.whitelist_table.setHorizontalHeaderLabels(["玩家 UID", "名称", "平台", "备注"]); self.whitelist_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch); wl.addWidget(self.whitelist_table); l.addWidget(whitelist); l.addStretch(); return w
 
+    def _save_tools_tab(self):
+        w = QWidget(); l = QVBoxLayout(w)
+        source_group = QGroupBox("存档来源"); source_layout = QVBoxLayout(source_group)
+        source_row = QHBoxLayout(); self.save_tool_source = QLineEdit(); self.save_tool_source.setPlaceholderText("选择 Steam、Xbox/Game Pass、专用服务器世界、存档文件或转换包"); source_row.addWidget(self.save_tool_source, 1)
+        for text, handler in (("扫描本地存档", self.refresh_save_tool_sources), ("选择文件", self.choose_save_tool_file), ("选择文件夹", self.choose_save_tool_directory)):
+            button = QPushButton(text); button.clicked.connect(handler); source_row.addWidget(button)
+        source_layout.addLayout(source_row)
+        self.save_tool_sources = QTableWidget(0, 6); self.save_tool_sources.setHorizontalHeaderLabels(["来源", "世界 ID", "格式", "玩家文件", "文件数", "修改时间"]); self.save_tool_sources.setSelectionBehavior(QAbstractItemView.SelectRows); self.save_tool_sources.setSelectionMode(QAbstractItemView.SingleSelection); self.save_tool_sources.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch); self.save_tool_sources.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch); self.save_tool_sources.cellClicked.connect(self._select_save_tool_source); source_layout.addWidget(self.save_tool_sources)
+        l.addWidget(source_group)
+
+        migration = QGroupBox("转换与迁移"); ml = QGridLayout(migration)
+        actions = (
+            ("联机世界转专用服务器", self.start_selected_coop_migration, "迁移 1 至 4 名玩家，并在部署后完成临时角色身份映射。"),
+            ("继续玩家身份迁移", self.finish_coop_migration, "重新扫描服务器临时角色并继续未完成的映射。"),
+            ("Game Pass 转 Steam", self.convert_gamepass_world, "只读提取 WGS 容器，生成标准 Steam 世界目录；不会修改 Xbox 云存档。"),
+            ("Host Swap / 专服转联机", self.rebind_save_identity, "选择原角色与已登录生成的占位角色，离线生成重绑定后的新世界。"),
+            ("直接导入当前服务器", self.import_selected_save_source, "将所选世界导入当前本地或远程服务器。"),
+            ("导出转换包", self.export_save_conversion_package, "生成带 manifest 和逐文件 SHA-256 的 .pwc-conversion 包。"),
+            ("校验转换包", self.verify_save_conversion_package, "验证转换包结构、清单和所有文件摘要。"),
+        )
+        for index, (text, handler, tip) in enumerate(actions):
+            column = index % 2; row = index // 2
+            button = QPushButton(text); button.setToolTip(tip); button.clicked.connect(handler); button.setMinimumHeight(34); ml.addWidget(button, row, column)
+        ml.setColumnStretch(0, 1); ml.setColumnStretch(1, 1)
+        l.addWidget(migration)
+
+        conversion = QGroupBox("格式与标识"); cl = QHBoxLayout(conversion)
+        for text, handler, tip in (
+            ("SAV 转 JSON", self.convert_sav_to_json, "导出完整结构化 JSON，不修改原 SAV。"),
+            ("JSON 转 SAV", self.convert_json_to_sav, "候选文件通过二次转换验证后再原子写入。"),
+            ("SteamID 转 UID", self.convert_steam_id, "支持 SteamID64、steam_ 前缀和个人资料链接。"),
+            ("恢复地图迷雾", self.restore_save_map, "备份并清除 LocalData.sav 的迷雾与隐藏地点标志，保留地图标记。"),
+            ("扩容 Palbox", self.expand_save_palbox, "按稳定玩家身份扩展 Palbox 槽位，生成经过二次解析的新世界目录。"),
+            ("地图与存档诊断", self.open_save_diagnostics, "解析玩家、公会、基地和帕鲁关系并显示基地坐标。"),
+        ):
+            button = QPushButton(text); button.setToolTip(tip); button.clicked.connect(handler); cl.addWidget(button)
+        cl.addStretch(); l.addWidget(conversion)
+
+        management = QGroupBox("存档管理"); gl = QHBoxLayout(management)
+        for text, page_name in (("玩家、帕鲁与背包", "players_page"), ("公会与基地", "guilds_page"), ("备份与恢复", "backups_page")):
+            button = QPushButton(text); button.clicked.connect(lambda _checked=False, name=page_name: self._navigate_to_page(name)); gl.addWidget(button)
+        gl.addStretch(); l.addWidget(management)
+
+        status = QGroupBox("任务与能力状态"); sl = QVBoxLayout(status); header = QHBoxLayout(); self.save_tool_stage = QLabel("等待选择存档"); self.save_tool_percent = QLabel("0%"); header.addWidget(self.save_tool_stage); header.addStretch(); header.addWidget(self.save_tool_percent); sl.addLayout(header)
+        self.save_tool_progress = QProgressBar(); self.save_tool_progress.setRange(0, 100); self.save_tool_progress.setValue(0); self.save_tool_progress.setTextVisible(False); sl.addWidget(self.save_tool_progress)
+        ready, detail = PlmCodecPlugin(self.storage.root).probe(); self.save_tool_engine_status = QLabel(("存档 helper 可用：" if ready else "存档 helper 只读降级：") + detail); self.save_tool_engine_status.setWordWrap(True); self.save_tool_engine_status.setStyleSheet("color:#087f5b;" if ready else "color:#8a4b08;"); sl.addWidget(self.save_tool_engine_status)
+        self.save_tool_result = QPlainTextEdit(); self.save_tool_result.setReadOnly(True); self.save_tool_result.setMaximumHeight(120); self.save_tool_result.setPlaceholderText("转换、迁移和校验结果将在这里显示"); sl.addWidget(self.save_tool_result); l.addWidget(status)
+        return w
+
     def _backup_tab(self):
         w = QWidget(); l = QVBoxLayout(w); row = QHBoxLayout()
         self.backup_action_buttons = []
@@ -414,21 +508,12 @@ class MainWindow(QMainWindow):
         import_button = QPushButton("导入"); import_menu = QMenu(import_button)
         import_menu.addAction("导入文件", self.import_backup_file); import_menu.addAction("导入 Saved/SaveGames 目录", self.import_backup_directory)
         import_button.setMenu(import_menu); row.addWidget(import_button); self.backup_action_buttons.append(import_button)
-        local_import = QPushButton("本地存档转服务器"); local_menu = QMenu(local_import)
-        local_menu.addAction("自动检测本地存档", self.detect_local_save_sources)
-        local_menu.addAction("选择存档文件", self.import_local_save_file)
-        local_menu.addAction("选择存档文件夹", self.import_local_save_directory)
-        local_import.setMenu(local_menu); row.addWidget(local_import); self.backup_action_buttons.append(local_import)
-        migration_button = QPushButton("联机角色迁移"); migration_menu = QMenu(migration_button)
-        migration_menu.addAction("从本地联机存档恢复", self.start_coop_migration)
-        migration_menu.addAction("继续玩家迁移", self.finish_coop_migration)
-        migration_button.setMenu(migration_menu); row.addWidget(migration_button); self.backup_action_buttons.append(migration_button)
         for text, handler in (("导出", self.export_selected_backup), ("校验报告", self.export_selected_backup_report), ("恢复", self.restore), ("校验", self.verify_selected_backup), ("添加备注", self.note_selected_backup), ("保护/解锁", self.toggle_selected_backup_protection), ("删除", self.delete_selected_backup), ("刷新", self.refresh_backup_list)):
             b = QPushButton(text); b.clicked.connect(handler); row.addWidget(b); self.backup_action_buttons.append(b)
         row.addStretch(); l.addLayout(row)
         self.backup_summary = QLabel("默认创建仅含 SaveGames 的世界导出包；完整灾备包会包含脱敏配置。计划备份默认关闭，启用后每天 04:00，保留最近 14 份。")
         self.backup_summary.setWordWrap(True); l.addWidget(self.backup_summary)
-        task_group = QGroupBox("备份、恢复与玩家迁移进度"); task_layout = QVBoxLayout(task_group)
+        task_group = QGroupBox("备份与恢复进度"); task_layout = QVBoxLayout(task_group)
         task_header = QHBoxLayout(); self.backup_task_stage = QLabel("暂无任务"); self.backup_task_percent = QLabel("0%")
         task_header.addWidget(self.backup_task_stage); task_header.addStretch(); task_header.addWidget(self.backup_task_percent)
         self.backup_task_progress = QProgressBar(); self.backup_task_progress.setRange(0, 100); self.backup_task_progress.setValue(0); self.backup_task_progress.setTextVisible(False)
@@ -565,6 +650,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "player_detail_sync_label"): self.player_detail_sync_label.setText("尚未同步")
         self.current_players = self.player_repository.list_players(self.instances[row].id); self.current_player_groups = self.player_repository.list_identity_groups(self.instances[row].id); self.current_guilds = []
         self.selected = self.instances[row]; self.title.setText(self.selected.name); self.name_edit.setText(self.selected.name); self.kind_combo.setCurrentIndex(0 if self.selected.kind == "local" else 1); self.path_edit.setText(self.selected.install_dir); self.host_edit.setText(self.selected.host); self.user_edit.setText(self.selected.remote_username); self.ssh_port_spin.setValue(self.selected.ssh_port); self.auth_combo.setCurrentIndex(0 if self.selected.ssh_auth_type == "password" else 1); self.key_path_edit.setText(self.selected.ssh_key_path); self.port_spin.setValue(self.selected.game_port); self.rest_edit.setText(self.selected.rest_url); self.rest_password_edit.setText(self.storage.get_secret(self.selected.admin_secret_ref)); self.public_edit.setText(self.selected.public_address); self.config_source_label.setText(f"配置状态：{self.selected.config_source or '尚未同步'}" + ("，需要重启" if self.selected.config_restart_required else "")); self.lifecycle = LocalServerLifecycle(self.selected, self.ui_signals.log.emit) if self.selected.kind == "local" else (self._remote_lifecycle() if self.selected.discovery_status == "ready" else None); self._toggle_remote_fields(); self._show_discovery(); self.refresh_status()
+        self.world_edit_session = PlayerEditSession(self.selected.id, "__world__")
         self._load_cached_config()
         self._render_players(); self._render_guilds()
         self._render_schedules(); self._render_whitelist(); self._render_audit(); self.refresh_backup_list(); self._render_mods(); self._show_mod_environment()
@@ -965,6 +1051,8 @@ class MainWindow(QMainWindow):
                 self.backup_task_progress.setRange(0, 0); self.backup_task_percent.setText("处理中")
             else:
                 self.backup_task_progress.setRange(0, 100); self.backup_task_progress.setValue(progress.percent); self.backup_task_percent.setText(f"{progress.percent}%")
+            if getattr(self, "save_tool_task_active", False):
+                self._set_save_tool_progress(progress)
 
     def _install_succeeded(self, message: str):
         self._set_install_progress(TaskProgress(100, "安装完成", message))
@@ -1148,6 +1236,7 @@ class MainWindow(QMainWindow):
 
     def _begin_backup_task(self, label):
         self.install_task_active = True; self.active_task_kind = "backup"; self._set_install_controls_enabled(False)
+        self.save_tool_task_active = hasattr(self, "save_tools_page") and self.page_stack.currentWidget() is self.save_tools_page
         self.navigation.setEnabled(False)
         for button in getattr(self, "backup_action_buttons", []): button.setEnabled(False)
         self.backup_task_started_at = time.monotonic(); self.backup_task_last_progress_at = self.backup_task_started_at; self.backup_task_message = "正在准备备份任务"
@@ -1165,11 +1254,14 @@ class MainWindow(QMainWindow):
             self.install_progress.setValue(100); self.install_percent.setText("100%")
             self.backup_task_progress.setRange(0, 100); self.backup_task_progress.setValue(100); self.backup_task_percent.setText("100%")
             self.backup_task_stage.setText("任务完成"); self.backup_task_stage.setStyleSheet("color:#18794e;font-weight:600;")
+            if getattr(self, "save_tool_task_active", False): self._set_save_tool_progress(TaskProgress(100, "任务完成", self.backup_task_message or "存档工具任务已完成"))
         else:
             self.backup_task_progress.setRange(0, 100); self.backup_task_progress.setValue(self.install_progress_value); self.backup_task_percent.setText(f"{self.install_progress_value}%")
             self.backup_task_stage.setStyleSheet("color:#b42318;font-weight:600;")
+            if getattr(self, "save_tool_task_active", False): self.save_tool_stage.setText("任务失败"); self.save_tool_percent.setText("失败")
         if self.backup_task_started_at:
             self.backup_task_elapsed.setText(f"总耗时 {max(0, int(time.monotonic() - self.backup_task_started_at))} 秒")
+        self.save_tool_task_active = False
 
     def _backup_task_heartbeat(self):
         if self.active_task_kind != "backup" or not self.backup_task_started_at: return
@@ -1277,14 +1369,15 @@ class MainWindow(QMainWindow):
         return session, str(restore_point)
 
     def _restore_migration_prepared(self, payload, reason):
-        session, restore_point = payload; service = BackupPackageService(); targets = list(session.placeholder_players); options = ["稍后迁移（玩家进入恢复后的服务器创建临时角色）"]
+        session, restore_point = payload; service = BackupPackageService(); targets = list(session.placeholder_players)
         self._set_install_progress(TaskProgress(30, "等待玩家映射确认", "请在弹出的映射窗口中逐项确认玩家身份", False))
-        options.extend(f"{service._player_guid(item)} · {item.get('nickname') or '未命名'}" for item in targets)
         confirmations = {}; used = set()
         for player in session.source_players:
             old_guid = service._player_guid(player); old_name = str(player.get("nickname") or "未命名")
+            available = list(service.available_identity_targets(old_guid, targets, used))
+            options = ["稍后迁移（玩家进入恢复后的服务器创建临时角色）"] + [f"{service._player_guid(item)} · {item.get('nickname') or '未命名'}" for item in available]
             suggested = 0
-            matches = [index for index, target in enumerate(targets, 1) if str(target.get("nickname") or "").casefold() == old_name.casefold()]
+            matches = [index for index, target in enumerate(available, 1) if str(target.get("nickname") or "").casefold() == old_name.casefold()]
             if len(matches) == 1: suggested = matches[0]
             choice, ok = QInputDialog.getItem(self, "恢复玩家身份映射", f"备份角色：{old_name} ({old_guid})\n请选择该玩家在目标服务器的登录身份：", options, suggested, False)
             if not ok: self._finish_backup_task(False); return
@@ -1368,6 +1461,269 @@ class MainWindow(QMainWindow):
     def _import_backup_done(self, path):
         self.append_log(f"备份已导入并校验：{path}"); self._finish_backup_task(); self.refresh_backup_list(Path(path))
 
+    def _navigate_to_page(self, attribute: str):
+        page = getattr(self, attribute, None)
+        if page is None: return
+        index = self.page_stack.indexOf(page)
+        if index >= 0: self.navigation.setCurrentRow(index)
+
+    def _current_save_tool_source(self) -> Path | None:
+        value = self.save_tool_source.text().strip() if hasattr(self, "save_tool_source") else ""
+        if not value:
+            QMessageBox.information(self, "选择存档", "请先扫描或选择一个存档来源。")
+            return None
+        source = Path(value).expanduser().resolve()
+        if not source.exists():
+            QMessageBox.warning(self, "存档不存在", f"所选存档来源不存在：\n{source}")
+            return None
+        return source
+
+    def refresh_save_tool_sources(self):
+        try:
+            sources = SaveToolsService(self.storage.root).detect_sources()
+        except Exception as exc:
+            return QMessageBox.critical(self, "本地存档检测失败", str(exc))
+        self.save_tool_source_records = list(sources)
+        self.save_tool_sources.setRowCount(len(sources))
+        for row, source in enumerate(sources):
+            values = (source.source_path, source.world_id, source.save_format, "是" if source.has_players else "否", source.file_count, source.modified_at)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value)); item.setData(Qt.UserRole, {"path": source.source_path, "kind": source.source_kind, "world_id": source.world_id}); self.save_tool_sources.setItem(row, column, item)
+        if sources:
+            self.save_tool_sources.setCurrentCell(0, 0); self.save_tool_source.setText(sources[0].source_path); self.save_tool_selected_world_id = sources[0].world_id; self.save_tool_selected_kind = sources[0].source_kind
+            self.save_tool_stage.setText(f"检测到 {len(sources)} 个本地存档来源")
+        else:
+            self.save_tool_stage.setText("未在常见路径检测到存档")
+
+    def _select_save_tool_source(self, row: int, _column: int = 0):
+        item = self.save_tool_sources.item(row, 0)
+        if item:
+            data = item.data(Qt.UserRole)
+            if isinstance(data, dict):
+                self.save_tool_source.setText(str(data.get("path") or item.text())); self.save_tool_selected_world_id = str(data.get("world_id") or ""); self.save_tool_selected_kind = str(data.get("kind") or "")
+            else: self.save_tool_source.setText(str(data or item.text()))
+
+    def choose_save_tool_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择 Palworld 存档或转换包", "", "存档来源 (*.sav *.zip *.tar.gz *.tgz *.pwcbackup *.pwc-conversion);;所有文件 (*)")
+        if path: self.save_tool_source.setText(path); self.save_tool_selected_world_id = ""; self.save_tool_selected_kind = ""; self._inspect_save_tool_source(Path(path))
+
+    def choose_save_tool_directory(self):
+        path = QFileDialog.getExistingDirectory(self, "选择 Palworld 世界、Saved 或 SaveGames 文件夹")
+        if path: self.save_tool_source.setText(path); self.save_tool_selected_world_id = ""; self.save_tool_selected_kind = ""; self._inspect_save_tool_source(Path(path))
+
+    def _inspect_save_tool_source(self, source: Path):
+        if source.suffix.lower() == ".pwc-conversion":
+            try: report = SaveToolsService(self.storage.root).verify_conversion_package(source)
+            except Exception as exc: return QMessageBox.critical(self, "转换包校验失败", str(exc))
+            self.save_tool_result.setPlainText(f"转换包有效\n世界：{report['world_id']}\n文件：{report['entries']}\nSHA-256：{report['sha256']}")
+            return
+        try: inspection = SaveToolsService(self.storage.root).inspect(source)
+        except Exception as exc: return QMessageBox.critical(self, "存档预检失败", str(exc))
+        warnings = "；".join(inspection.warnings) or "无"
+        self.save_tool_result.setPlainText(f"世界：{inspection.world_id}\n格式：{inspection.save_format}\n文件：{inspection.file_count}\n玩家文件：{'有' if inspection.has_players else '无'}\n警告：{warnings}")
+
+    def _set_save_tool_progress(self, progress: TaskProgress):
+        self.save_tool_stage.setText(progress.stage); self.save_tool_percent.setText("处理中" if progress.indeterminate else f"{progress.percent}%")
+        if progress.indeterminate: self.save_tool_progress.setRange(0, 0)
+        else: self.save_tool_progress.setRange(0, 100); self.save_tool_progress.setValue(progress.percent)
+        if progress.message: self.save_tool_result.setPlainText(progress.message)
+
+    def export_save_conversion_package(self):
+        source = self._current_save_tool_source()
+        if source is None: return
+        default = f"{source.stem or 'palworld-world'}.pwc-conversion"
+        output, _ = QFileDialog.getSaveFileName(self, "导出存档转换包", default, "Palworld 转换包 (*.pwc-conversion)")
+        if not output: return
+        output_path = Path(output if output.lower().endswith(".pwc-conversion") else output + ".pwc-conversion")
+        self._set_save_tool_progress(TaskProgress(0, "创建转换包", "正在规范化存档", True))
+        world_id = getattr(self, "save_tool_selected_world_id", "")
+        worker = Worker(lambda signals: SaveToolsService(self.storage.root).create_conversion_package(source, "convert", output_path, lambda p, m: signals.progress.emit(TaskProgress(p, "创建转换包", m)), world_id), with_signals=True)
+        worker.signals.progress.connect(self._set_save_tool_progress); worker.signals.finished.connect(self._save_conversion_done); worker.signals.error.connect(self._save_tool_failed); self.pool.start(worker)
+
+    def _save_conversion_done(self, package):
+        self._set_save_tool_progress(TaskProgress(100, "转换包已创建", package.path))
+        self.save_tool_result.setPlainText(f"转换包：{package.path}\n世界：{package.world_id}\n文件：{package.file_count}\n大小：{package.total_bytes} 字节\nSHA-256：{package.sha256}")
+        self.append_log(f"存档转换包已创建：{package.path}")
+
+    def _save_tool_failed(self, error: str):
+        self.save_tool_progress.setRange(0, 100); self.save_tool_stage.setText("存档工具任务失败"); self.save_tool_percent.setText("失败"); self.save_tool_result.setPlainText(error); QMessageBox.critical(self, "存档工具任务失败", error)
+
+    def verify_save_conversion_package(self):
+        source = self._current_save_tool_source()
+        if source is None: return
+        try: report = SaveToolsService(self.storage.root).verify_conversion_package(source)
+        except Exception as exc: return self._save_tool_failed(str(exc))
+        self._set_save_tool_progress(TaskProgress(100, "转换包校验通过", f"已校验 {report['entries']} 个文件"))
+        self.save_tool_result.setPlainText(f"世界：{report['world_id']}\n文件：{report['entries']}\nSHA-256：{report['sha256']}")
+
+    def _convert_save_file_dialog(self, source_suffix: str, target_suffix: str):
+        label = source_suffix[1:].upper()
+        source, _ = QFileDialog.getOpenFileName(self, f"选择 {label} 文件", "", f"{label} 文件 (*{source_suffix})")
+        if not source: return
+        default = str(Path(source).with_suffix(target_suffix))
+        output, _ = QFileDialog.getSaveFileName(self, f"保存 {target_suffix[1:].upper()} 文件", default, f"{target_suffix[1:].upper()} 文件 (*{target_suffix})")
+        if not output: return
+        if not output.lower().endswith(target_suffix): output += target_suffix
+        self._set_save_tool_progress(TaskProgress(0, "转换存档格式", f"正在转换 {Path(source).name}", True))
+        worker = Worker(lambda: SaveToolsService(self.storage.root).convert_save_file(Path(source), Path(output)))
+        worker.signals.finished.connect(self._save_file_conversion_done); worker.signals.error.connect(self._save_tool_failed); self.pool.start(worker)
+
+    def convert_sav_to_json(self): self._convert_save_file_dialog(".sav", ".json")
+
+    def convert_json_to_sav(self): self._convert_save_file_dialog(".json", ".sav")
+
+    def _save_file_conversion_done(self, report):
+        self._set_save_tool_progress(TaskProgress(100, "格式转换完成", report["output"]))
+        backup = f"\n原目标备份：{report['backup']}" if report.get("backup") else ""
+        self.save_tool_result.setPlainText(f"输出：{report['output']}\nSHA-256：{report['sha256']}{backup}")
+        self.append_log(f"存档格式转换完成：{report['output']}")
+
+    def convert_steam_id(self):
+        value, ok = QInputDialog.getText(self, "SteamID 转 Palworld UID", "SteamID64、steam_ 前缀或 Steam 个人资料链接：")
+        if not ok: return
+        try: result = SaveToolsService(self.storage.root).steam_id_to_uid(value)
+        except Exception as exc: return self._save_tool_failed(str(exc))
+        text = f"SteamID：{result['steam_id']}\nPalworld UID：{result['palworld_uid']}\nNoSteam UID：{result['nosteam_uid']}"
+        self.save_tool_result.setPlainText(text); QApplication.clipboard().setText(result["palworld_uid"]); self._set_save_tool_progress(TaskProgress(100, "UID 转换完成", "Palworld UID 已复制到剪贴板"))
+
+    def restore_save_map(self):
+        source = self._current_save_tool_source()
+        if source is None: return
+        try:
+            source = SaveToolsService(self.storage.root).materialize_source(source, getattr(self, "save_tool_selected_world_id", ""))
+            candidates = [source] if source.is_file() and source.name.casefold() == "localdata.sav" else list(source.rglob("LocalData.sav"))
+            if not candidates: raise FileNotFoundError("所选来源中未找到 LocalData.sav")
+            local_data = max(candidates, key=lambda path: path.stat().st_mtime)
+        except Exception as exc:
+            return self._save_tool_failed(str(exc))
+        if QMessageBox.question(self, "恢复地图迷雾", f"将备份并修改：\n{local_data}\n\n地图标记会保留，Game Pass WGS 源不会被直接修改。继续吗？") != QMessageBox.Yes: return
+        self._set_save_tool_progress(TaskProgress(0, "恢复地图迷雾", "正在生成并验证 LocalData.sav 候选", True))
+        worker = Worker(lambda: SaveToolsService(self.storage.root).restore_map_file(local_data))
+        worker.signals.finished.connect(self._map_restore_done); worker.signals.error.connect(self._save_tool_failed); self.pool.start(worker)
+
+    def _map_restore_done(self, report):
+        self._set_save_tool_progress(TaskProgress(100, "地图迷雾已恢复", report["output"]))
+        self.save_tool_result.setPlainText(f"LocalData：{report['output']}\n遮罩：{report.get('mask_textures', 0)}\n隐藏地点：{report.get('hidden_locations', 0)}\n保护备份：{report['backup']}\nSHA-256：{report['sha256']}")
+        self.append_log(f"地图迷雾恢复完成：{report['output']}")
+
+    def expand_save_palbox(self):
+        source = self._current_save_tool_source()
+        if source is None: return
+        service = SaveToolsService(self.storage.root)
+        try:
+            source = service.materialize_source(source, getattr(self, "save_tool_selected_world_id", "")); _level, payload = service.load_world_snapshot(source)
+        except Exception as exc: return self._save_tool_failed(str(exc))
+        players = [player for player in payload.get("players", []) if service._player_guid(player)]
+        if not players: return QMessageBox.information(self, "扩容 Palbox", "当前世界没有可识别玩家。")
+        labels = [f"{player.get('nickname') or '未命名'} · {service._player_guid(player)}" for player in players]
+        label, ok = QInputDialog.getItem(self, "选择玩家", "要扩容 Palbox 的玩家：", labels, 0, False)
+        if not ok: return
+        slots, ok = QInputDialog.getInt(self, "Palbox 槽位", "新的最大槽位数：", 960, 1, 99999, 1)
+        if not ok: return
+        parent = QFileDialog.getExistingDirectory(self, "选择扩容世界输出位置")
+        if not parent: return
+        player = players[labels.index(label)]; destination = Path(parent) / f"{Path(source).name}-palbox-{slots}"
+        self._set_save_tool_progress(TaskProgress(0, "扩容 Palbox", "正在构建并验证离线候选世界", True))
+        worker = Worker(lambda: service.expand_palbox_world(source, service._player_guid(player), slots, destination))
+        worker.signals.finished.connect(self._palbox_expand_done); worker.signals.error.connect(self._save_tool_failed); self.pool.start(worker)
+
+    def _palbox_expand_done(self, report):
+        backup = f"\n旧输出备份：{report['backup']}" if report.get("backup") else ""
+        self._set_save_tool_progress(TaskProgress(100, "Palbox 扩容完成", report["destination"]))
+        self.save_tool_result.setPlainText(f"候选世界：{report['destination']}\n玩家：{report['player_guid']}\n槽位：{report['old_slots']} -> {report['new_slots']}\n已使用：{report['used_slots']}{backup}")
+        self.append_log(f"Palbox 扩容候选已生成：{report['destination']}")
+
+    def convert_gamepass_world(self):
+        source = self._current_save_tool_source()
+        if source is None: return
+        service = SaveToolsService(self.storage.root)
+        try:
+            worlds = service.detect_gamepass_worlds(source)
+        except Exception as exc:
+            return self._save_tool_failed(str(exc))
+        if not worlds:
+            return QMessageBox.information(self, "选择 Game Pass 存档", "当前来源不是可读取的 Game Pass WGS 用户容器。请扫描本地存档，或选择包含 containers.index 的用户目录。")
+        selected_id = getattr(self, "save_tool_selected_world_id", "")
+        selected = next((world for world in worlds if world.save_id == selected_id), None)
+        if selected is None and len(worlds) > 1:
+            labels = [f"{world.save_id}（{world.player_count} 名玩家）" for world in worlds]
+            label, ok = QInputDialog.getItem(self, "选择 Game Pass 世界", "要转换的世界：", labels, 0, False)
+            if not ok: return
+            selected = worlds[labels.index(label)]
+        selected = selected or worlds[0]
+        parent = QFileDialog.getExistingDirectory(self, "选择 Steam 世界输出位置")
+        if not parent: return
+        destination = Path(parent) / selected.save_id
+        self._set_save_tool_progress(TaskProgress(0, "Game Pass 转 Steam", "正在只读解析 WGS 容器", True))
+        worker = Worker(lambda signals: service.convert_gamepass_to_steam(source, selected.save_id, destination, lambda p, m: signals.progress.emit(TaskProgress(p, "Game Pass 转 Steam", m))), with_signals=True)
+        worker.signals.progress.connect(self._set_save_tool_progress); worker.signals.finished.connect(self._gamepass_conversion_done); worker.signals.error.connect(self._save_tool_failed); self.pool.start(worker)
+
+    def _gamepass_conversion_done(self, report):
+        self.save_tool_source.setText(report["destination"]); self.save_tool_selected_world_id = report["save_id"]; self.save_tool_selected_kind = "folder"
+        backup = f"\n旧目标备份：{report['backup']}" if report.get("backup") else ""
+        self._set_save_tool_progress(TaskProgress(100, "Game Pass 转换完成", report["destination"]))
+        self.save_tool_result.setPlainText(f"Steam 世界：{report['destination']}\n玩家文件：{report['player_count']}\n文件：{len(report['files'])}\nWGS 源保持只读{backup}")
+        self.append_log(f"Game Pass 世界已只读转换：{report['save_id']} -> {report['destination']}")
+
+    def rebind_save_identity(self):
+        source = self._current_save_tool_source()
+        if source is None: return
+        service = SaveToolsService(self.storage.root)
+        try:
+            source = service.materialize_source(source, getattr(self, "save_tool_selected_world_id", ""))
+            _level, payload = service.load_world_snapshot(source)
+        except Exception as exc:
+            return self._save_tool_failed(str(exc))
+        players = [player for player in payload.get("players", []) if service._player_guid(player) and player.get("instance_id")]
+        if len(players) < 2:
+            return QMessageBox.information(self, "角色重绑定", "当前世界至少需要原角色和一个已登录创建的占位角色。")
+        labels = [f"{player.get('nickname') or '未命名'} · {service._player_guid(player)}" for player in players]
+        old_label, ok = QInputDialog.getItem(self, "选择原角色", "要保留数据的原角色：", labels, 0, False)
+        if not ok: return
+        remaining = [label for label in labels if label != old_label]
+        new_label, ok = QInputDialog.getItem(self, "选择占位角色", "用于接收原角色数据的新身份：", remaining, 0, False)
+        if not ok: return
+        old = players[labels.index(old_label)]; new = players[labels.index(new_label)]
+        parent = QFileDialog.getExistingDirectory(self, "选择重绑定世界输出位置")
+        if not parent: return
+        destination = Path(parent) / f"{Path(source).name}-identity-rebound"
+        self._set_save_tool_progress(TaskProgress(0, "角色身份重绑定", "正在构建并验证离线候选世界", True))
+        worker = Worker(lambda: service.rebind_world_identity(source, service._player_guid(old), service._player_guid(new), destination))
+        worker.signals.finished.connect(self._identity_rebind_done); worker.signals.error.connect(self._save_tool_failed); self.pool.start(worker)
+
+    def _identity_rebind_done(self, report):
+        backup = f"\n旧输出备份：{report['backup']}" if report.get("backup") else ""
+        self._set_save_tool_progress(TaskProgress(100, "角色重绑定完成", report["destination"]))
+        self.save_tool_result.setPlainText(f"候选世界：{report['destination']}\n原 GUID：{report['old_guid']}\n新 GUID：{report['new_guid']}\n迁移玩家：{report.get('migrated', 0)}{backup}")
+        self.append_log(f"角色身份重绑定候选已生成：{report['destination']}")
+
+    def open_save_diagnostics(self):
+        source = self._current_save_tool_source()
+        if source is None: return
+        self._set_save_tool_progress(TaskProgress(0, "解析存档", "正在构建地图与关系诊断", True))
+        def task():
+            service = SaveToolsService(self.storage.root); level, payload = service.load_world_snapshot(source); return service.diagnose(source), payload
+        worker = Worker(task); worker.signals.finished.connect(self._save_diagnostics_ready); worker.signals.error.connect(self._save_tool_failed); self.pool.start(worker)
+
+    def _save_diagnostics_ready(self, result):
+        report, payload = result; self._set_save_tool_progress(TaskProgress(100, "存档诊断完成", f"发现 {len(report.findings)} 条风险"))
+        self.save_tool_result.setPlainText(f"Level.sav：{report.level_path}\n玩家：{report.players} · 帕鲁：{report.pals} · 公会：{report.guilds} · 基地：{report.bases}\n风险：{len(report.findings)}")
+        dialog = SaveDiagnosticsDialog(report, payload, self); dialog.exec()
+
+    def import_selected_save_source(self):
+        source = self._current_save_tool_source()
+        if source is not None:
+            try: source = SaveToolsService(self.storage.root).materialize_source(source, getattr(self, "save_tool_selected_world_id", ""))
+            except Exception as exc: return self._save_tool_failed(str(exc))
+            self._import_local_save_source(source)
+
+    def start_selected_coop_migration(self):
+        source = self._current_save_tool_source()
+        if source is not None:
+            try: source = SaveToolsService(self.storage.root).materialize_source(source, getattr(self, "save_tool_selected_world_id", ""))
+            except Exception as exc: return self._save_tool_failed(str(exc))
+            self._start_coop_migration_source(source)
+
     def detect_local_save_sources(self):
         try:
             sources = BackupPackageService().detect_local_save_sources()
@@ -1424,7 +1780,10 @@ class MainWindow(QMainWindow):
         source, _ = QFileDialog.getOpenFileName(self, "选择本地联机存档来源", "", "存档来源 (*.zip *.tar.gz *.tgz *.pwcbackup *.sav);;所有文件 (*)")
         if not source:
             source = QFileDialog.getExistingDirectory(self, "选择本地联机存档文件夹")
-        if not source: return
+        if source: self._start_coop_migration_source(Path(source))
+
+    def _start_coop_migration_source(self, source: Path):
+        if not self.selected: return
         selected = self.selected; source = Path(source).expanduser().resolve()
         if self.install_task_active: return QMessageBox.information(self, "任务进行中", "当前服务器任务尚未结束。")
         self._begin_backup_task("准备本地联机存档恢复")
@@ -1508,13 +1867,14 @@ class MainWindow(QMainWindow):
             self._finish_backup_task(False)
             return QMessageBox.information(self, "尚未发现临时角色", "请让待迁移玩家进入恢复后的服务器创建临时角色并退出，然后再次继续迁移。")
         pending = set(session.pending_player_guids); targets = list(session.placeholder_players)
-        options = ["暂不迁移"] + [f"{service._player_guid(item)} · {item.get('nickname') or '未命名'}" for item in targets]
         confirmations = {}; used = {item.new_guid for item in session.mappings if item.status == "migrated"}
         for player in session.source_players:
             old_guid = service._player_guid(player)
             if old_guid not in pending: continue
             old_name = str(player.get("nickname") or "未命名")
-            matches = [index for index, target in enumerate(targets, 1) if str(target.get("nickname") or "").casefold() == old_name.casefold()]
+            available = list(service.available_identity_targets(old_guid, targets, used))
+            options = ["暂不迁移"] + [f"{service._player_guid(item)} · {item.get('nickname') or '未命名'}" for item in available]
+            matches = [index for index, target in enumerate(available, 1) if str(target.get("nickname") or "").casefold() == old_name.casefold()]
             suggested = matches[0] if len(matches) == 1 else 0
             choice, ok = QInputDialog.getItem(self, "继续玩家身份迁移", f"备份角色：{old_name} ({old_guid})\n请选择刚在服务器创建的临时角色：", options, suggested, False)
             if not ok: self._finish_backup_task(False); return
@@ -2016,7 +2376,8 @@ class MainWindow(QMainWindow):
         session = self._active_edit_session(create=False)
         for key, editor in self.pal_editors.items():
             path = f"players[{_player_index}].pals[{pal_index}].{key}" if _player_index is not None and pal_index is not None else ""
-            value = (document_pal or pal).get(key, ""); editor.setText(str(session.value_for(path, value) if session and path else value)); editor.setEnabled(bool(individual_id and document_pal is not None and self.player_center.snapshot.plugin_ready))
+            value = (document_pal or pal).get(key, ""); value = session.value_for(path, value) if session and path else value
+            editor.setText(", ".join(str(item) for item in value) if isinstance(value, list) else ("是" if value is True else "否" if value is False else str(value))); editor.setEnabled(bool(individual_id and document_pal is not None and self.player_center.snapshot.plugin_ready))
         if not pal:
             self.pal_detail_text.setPlainText("选择帕鲁后查看完整存档字段。")
             return
@@ -2044,6 +2405,26 @@ class MainWindow(QMainWindow):
                 session.stage(path, pal.get(key), editor.text(), resolve_path(path).label, "pal", individual_id, resolve_path(path).risk)
         except Exception as exc: return QMessageBox.warning(self, "帕鲁修改无效", str(exc))
         self._update_pending_save_label(); self.append_log(f"已暂存帕鲁 {individual_id} 的修改")
+
+    def stage_legal_pal_repairs(self):
+        player_index, player = self._player_document_entry()
+        if player_index is None or not player: return QMessageBox.information(self, "修复非法帕鲁", "请先同步并选择玩家角色。")
+        session = self._active_edit_session(); repairs = 0
+        limits = {"level": (1, 80), "melee": (0, 100), "ranged": (0, 100), "defense": (0, 100), "rank": (1, 5), "rank_attack": (0, 20), "rank_defence": (0, 20), "rank_craftspeed": (0, 20)}
+        try:
+            for pal_index, pal in enumerate(player.get("pals") or []):
+                individual_id = str(pal.get("individual_id") or "")
+                if not individual_id or not pal.get("stable_id_valid", True): continue
+                for key, (minimum, maximum) in limits.items():
+                    value = pal.get(key)
+                    if not isinstance(value, (int, float)): continue
+                    corrected = max(minimum, min(maximum, value))
+                    if corrected == value: continue
+                    path = f"players[{player_index}].pals[{pal_index}].{key}"; field = resolve_path(path)
+                    session.stage(path, value, corrected, field.label, "pal", individual_id, field.risk); repairs += 1
+        except Exception as exc: return QMessageBox.warning(self, "修复草稿生成失败", str(exc))
+        self._update_pending_save_label(); self._show_pal_editor(self.player_pals_table.currentRow())
+        QMessageBox.information(self, "修复草稿已生成", f"已生成 {repairs} 项合法值修复草稿。请使用“预览修改”检查后再保存。" if repairs else "当前玩家没有需要修复的已识别非法 Pal 数值。")
 
     def _render_inventory_for_active_player(self, items=None):
         if items is not None: self.active_inventory_items = list(items)
@@ -2148,6 +2529,99 @@ class MainWindow(QMainWindow):
         for row, guild in enumerate(self.current_guilds):
             for column, value in enumerate((guild.name, guild.guild_id, guild.member_count, guild.online_count, guild.average_level, guild.base_count, guild.pal_count)): self.guilds_table.setItem(row, column, QTableWidgetItem(str(value)))
         self._show_guild_members(self.guilds_table.currentRow(), 0, -1, -1)
+
+    def _render_world_editors(self):
+        if not hasattr(self, "world_guild_combo"): return
+        payload = self.save_document.properties if isinstance(self.save_document, PluginParsedSave) else {}
+        guilds = list(payload.get("guilds") or []); bases = list(payload.get("bases") or [])
+        current_guild = self.world_guild_combo.currentData(); current_base = self.world_base_combo.currentData()
+        self.world_guild_combo.blockSignals(True); self.world_guild_combo.clear()
+        for index, guild in enumerate(guilds): self.world_guild_combo.addItem(f"{guild.get('name') or '未命名公会'} · {guild.get('guild_id') or '-'}", index)
+        self.world_guild_combo.blockSignals(False)
+        self.world_base_combo.blockSignals(True); self.world_base_combo.clear()
+        for index, base in enumerate(bases): self.world_base_combo.addItem(f"{base.get('name') or '未命名基地'} · {base.get('base_id') or '-'}", index)
+        self.world_base_combo.blockSignals(False)
+        if current_guild is not None and self.world_guild_combo.findData(current_guild) >= 0: self.world_guild_combo.setCurrentIndex(self.world_guild_combo.findData(current_guild))
+        if current_base is not None and self.world_base_combo.findData(current_base) >= 0: self.world_base_combo.setCurrentIndex(self.world_base_combo.findData(current_base))
+        self._show_world_guild_editor(); self._show_world_base_editor(); self._update_world_edit_status()
+
+    def _show_world_guild_editor(self, *_args):
+        if not isinstance(self.save_document, PluginParsedSave): return
+        index = self.world_guild_combo.currentData(); guilds = self.save_document.properties.get("guilds") or []
+        if index is None or not 0 <= int(index) < len(guilds): return
+        guild = guilds[int(index)]; session = self.world_edit_session
+        name_path = f"guilds[{index}].name"; level_path = f"guilds[{index}].base_camp_level"
+        self.world_guild_name.setText(str(session.value_for(name_path, guild.get("name") or "") if session else guild.get("name") or ""))
+        self.world_guild_level.setValue(int(session.value_for(level_path, guild.get("base_camp_level") or 1) if session else guild.get("base_camp_level") or 1))
+
+    def _show_world_base_editor(self, *_args):
+        if not isinstance(self.save_document, PluginParsedSave): return
+        index = self.world_base_combo.currentData(); bases = self.save_document.properties.get("bases") or []
+        if index is None or not 0 <= int(index) < len(bases): return
+        base = bases[int(index)]; position = base.get("position") or {}; session = self.world_edit_session
+        self.world_base_name.setText(str(session.value_for(f"bases[{index}].name", base.get("name") or "") if session else base.get("name") or ""))
+        for axis, editor in (("x", self.world_base_x), ("y", self.world_base_y), ("z", self.world_base_z)):
+            path = f"bases[{index}].position.{axis}"; value = session.value_for(path, position.get(axis, 0)) if session else position.get(axis, 0); editor.setText(str(value))
+
+    def stage_world_guild(self):
+        if not isinstance(self.save_document, PluginParsedSave) or not self.world_edit_session: return QMessageBox.information(self, "公会修改", "请先同步完整存档。")
+        index = self.world_guild_combo.currentData(); guilds = self.save_document.properties.get("guilds") or []
+        if index is None or not 0 <= int(index) < len(guilds): return
+        guild = guilds[int(index)]; guild_id = str(guild.get("guild_id") or "")
+        if not guild_id: return QMessageBox.warning(self, "公会不可编辑", "所选公会缺少稳定 ID。")
+        try:
+            for key, value in (("name", self.world_guild_name.text()), ("base_camp_level", self.world_guild_level.value())):
+                path = f"guilds[{index}].{key}"; field = resolve_path(path); self.world_edit_session.stage(path, guild.get(key), value, field.label, "guild", guild_id, field.risk)
+        except Exception as exc: return QMessageBox.warning(self, "公会修改无效", str(exc))
+        self._update_world_edit_status()
+
+    def stage_world_base(self):
+        if not isinstance(self.save_document, PluginParsedSave) or not self.world_edit_session: return QMessageBox.information(self, "基地修改", "请先同步完整存档。")
+        index = self.world_base_combo.currentData(); bases = self.save_document.properties.get("bases") or []
+        if index is None or not 0 <= int(index) < len(bases): return
+        base = bases[int(index)]; base_id = str(base.get("base_id") or ""); position = base.get("position") or {}
+        if not base_id: return QMessageBox.warning(self, "基地不可编辑", "所选基地缺少稳定 ID。")
+        try:
+            values = (("name", base.get("name"), self.world_base_name.text()), ("position.x", position.get("x", 0), self.world_base_x.text()), ("position.y", position.get("y", 0), self.world_base_y.text()), ("position.z", position.get("z", 0), self.world_base_z.text()))
+            for key, original, value in values:
+                path = f"bases[{index}].{key}"; field = resolve_path(path); self.world_edit_session.stage(path, original, value, field.label, "base", base_id, field.risk)
+        except Exception as exc: return QMessageBox.warning(self, "基地修改无效", str(exc))
+        self._update_world_edit_status()
+
+    def _update_world_edit_status(self):
+        count = len(self.world_edit_session.changes) if self.world_edit_session else 0
+        self.world_edit_status.setText(f"世界修改草稿 {count} 项" if isinstance(self.save_document, PluginParsedSave) else "尚未同步结构化存档")
+
+    def preview_world_changes(self):
+        changes = self.world_edit_session.preview() if self.world_edit_session else []
+        QMessageBox.information(self, "世界修改预览", "\n".join(changes[:40]) if changes else "当前没有世界修改草稿。")
+
+    def revert_world_changes(self):
+        if self.world_edit_session: self.world_edit_session.discard()
+        self._show_world_guild_editor(); self._show_world_base_editor(); self._update_world_edit_status()
+
+    def apply_world_changes(self):
+        session = self.world_edit_session
+        if not self.selected or not isinstance(self.save_document, PluginParsedSave) or not session or not session.changes: return QMessageBox.information(self, "世界修改", "没有需要保存的世界修改草稿。")
+        name, ok = QInputDialog.getText(self, "高风险世界操作", f"将修改 {len(session.changes)} 个公会或基地字段。请输入实例名称“{self.selected.name}”确认：")
+        if not ok or name != self.selected.name: return
+        reason, ok = QInputDialog.getText(self, "操作原因", "请输入本次世界修改原因：")
+        if not ok or not reason.strip(): return
+        selected = self.selected; service = SaveGameService(); self.player_save_busy = True; self.navigation.setEnabled(False)
+        def mutate(document): session.apply(document)
+        def run(_signals):
+            from .management import SaveTransaction
+            lifecycle = self._remote_lifecycle() if selected.kind == "remote" else (self.lifecycle or LocalServerLifecycle(selected, self.ui_signals.log.emit))
+            if selected.kind == "remote":
+                backup_root = self._backup_destination(selected); client = self._remote_client()
+                return SaveTransaction(service).execute_remote(client, self.save_remote_path, backup_root, mutate, lifecycle.stop, lifecycle.start, lambda: self._remote_health_ok(selected), lambda: BackupService().create_remote(client, selected, backup_root, selected.install_dir))
+            backup_root = self._backup_destination(selected)
+            return SaveTransaction(service).execute_local(Path(self.save_remote_path), backup_root, mutate, [], lifecycle.stop, lifecycle.start, lambda: lifecycle.status() == "running", lambda: BackupService().create_local(selected, backup_root))
+        worker = Worker(run, with_signals=True); worker.signals.finished.connect(lambda backup: self._world_save_done(backup, reason)); worker.signals.error.connect(self._save_apply_failed); self.pool.start(worker)
+
+    def _world_save_done(self, backup, reason):
+        self.world_edit_session = PlayerEditSession(self.selected.id, "__world__") if self.selected else None
+        self.player_save_busy = False; self.navigation.setEnabled(True); AuditService.record(self.selected, "公会与基地存档修改", str(self.save_remote_path), detail=reason); self.storage.save_instances(self.instances); self._render_audit(); self.append_log(f"公会与基地修改完成，回滚备份：{backup}"); self.load_save_snapshot()
 
     def _show_guild_members(self, row, _column=0, _previous_row=-1, _previous_column=-1):
         self.guild_members.setPlainText("\n".join(self.current_guilds[row].members) if 0 <= row < len(self.current_guilds) else "")
@@ -2662,7 +3136,7 @@ class MainWindow(QMainWindow):
             if self.active_player_uid and self.player_view_stack.currentWidget() is self.player_detail_page:
                 aliases = [str(self.player_role_combo.itemData(index)) for index in range(self.player_role_combo.count())]
                 self._load_player_role(self.active_player_uid, aliases)
-        self._render_save_fields(); self.append_log("已读取服务器当前存档用于玩家中心展示，未执行写回操作")
+        self._render_save_fields(); self._render_world_editors(); self.append_log("已读取服务器当前存档用于玩家中心展示，未执行写回操作")
 
     @staticmethod
     def _download_remote_save_bundle(client, remote_level: str, local_level: Path) -> None:

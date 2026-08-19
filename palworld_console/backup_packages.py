@@ -29,6 +29,7 @@ MAX_ENTRIES = 200_000
 MAX_UNCOMPRESSED = 50 * 1024**3
 MAX_COMPRESSION_RATIO = 250
 SECRET_FIELDS = ("AdminPassword", "ServerPassword")
+WORLD_TRANSIENT_DIRS = {"backup", "backups", ".backup", ".backups"}
 
 
 def _require_file(path: Path, label: str) -> Path:
@@ -280,6 +281,13 @@ class BackupPackageService:
         save_roots.extend(path for path in root.rglob("*") if path.is_dir() and path.name.casefold() == "savegames")
         if (root / "Level.sav").is_file():
             save_roots.append(root.parent); candidates.append((root.parent, root, Path(root.name)))
+        for level in root.rglob("Level.sav"):
+            world = level.parent
+            relative_to_root = world.relative_to(root)
+            if any(part.casefold() in WORLD_TRANSIENT_DIRS for part in relative_to_root.parts): continue
+            if any(parent.name.casefold() == "savegames" for parent in world.parents if root == parent or root in parent.parents): continue
+            relative = relative_to_root if relative_to_root != Path(".") else Path(world.name)
+            candidates.append((root, world, relative))
         seen = set()
         for save_root in save_roots:
             save_root = save_root.resolve()
@@ -289,6 +297,7 @@ class BackupPackageService:
                 world = level.parent
                 try: relative = world.relative_to(save_root)
                 except ValueError: continue
+                if any(part.casefold() in WORLD_TRANSIENT_DIRS for part in relative.parts): continue
                 if relative == Path("."): relative = Path(world.name)
                 candidates.append((save_root, world, relative))
         unique = {}
@@ -422,10 +431,20 @@ class BackupPackageService:
         if not level.is_file() or not players_dir.is_dir(): raise FileNotFoundError("世界目录缺少 Level.sav 或 Players")
         plugin = PlmCodecPlugin(app_root); ready, detail = plugin.probe()
         if not ready: raise RuntimeError(f"PlM 插件不可用：{detail}")
-        decoded = plugin.decode(level); return tuple(decoded.get("players", ()))
+        decoded = plugin.decode_players(level)
+        players = tuple(decoded.get("players", ()))
+        if not players:
+            warnings = "；".join(str(item) for item in decoded.get("warnings", ())[:3])
+            detail = f"；诊断：{warnings}" if warnings else ""
+            raise RuntimeError(f"未能从 Level.sav 或 Players/*.sav 解析出玩家身份{detail}")
+        invalid = [item for item in players if not BackupPackageService._player_guid(item) or not item.get("instance_id")]
+        if invalid:
+            names = ", ".join(str(item.get("player_file") or BackupPackageService._player_guid(item) or "未知玩家") for item in invalid[:4])
+            raise RuntimeError(f"玩家身份缺少 GUID 或 InstanceId：{names}。请确认玩家文件与 Level.sav 来自同一次完整保存")
+        return players
 
     def prepare_coop_migration(self, source_world: Path, instance_id: str, target_world: Path, storage_root: Path) -> CoopMigrationSession:
-        players = self.inspect_world_players(source_world)
+        players = self.inspect_world_players(source_world, storage_root)
         files = tuple(sorted(path.name for path in (Path(source_world) / "Players").glob("*.sav")))
         session = CoopMigrationSession(instance_id=instance_id, source_path=str(Path(source_world).resolve()), target_world_path=str(Path(target_world).resolve()), phase="source_ready", source_players=players, baseline_player_files=files)
         self.save_migration_session(storage_root, session); return session
@@ -433,9 +452,13 @@ class BackupPackageService:
     def refresh_coop_placeholders(self, session: CoopMigrationSession, storage_root: Path) -> CoopMigrationSession:
         current = {path.name for path in (Path(session.target_world_path) / "Players").glob("*.sav")}
         added = sorted(current - set(session.baseline_player_files)); placeholders = []
-        try: placeholders = list(self.inspect_world_players(Path(session.target_world_path)))
-        except Exception: placeholders = []
-        placeholders = [item for item in placeholders if str(item.get("player_guid", "")).upper() + ".sav" in current and str(item.get("player_guid", "")).upper() + ".sav" not in session.baseline_player_files]
+        try: placeholders = list(self.inspect_world_players(Path(session.target_world_path), storage_root))
+        except Exception as exc:
+            updated = replace(session, phase="waiting_placeholders", placeholder_players=(), detail=f"临时角色身份解析失败：{exc}")
+            self.save_migration_session(storage_root, updated)
+            raise RuntimeError(updated.detail) from exc
+        current_folded = {name.casefold() for name in current}; baseline_folded = {name.casefold() for name in session.baseline_player_files}
+        placeholders = [item for item in placeholders if f"{self._player_guid(item)}.sav".casefold() in current_folded and f"{self._player_guid(item)}.sav".casefold() not in baseline_folded]
         updated = replace(session, phase="mapping_ready" if added else "waiting_placeholders", placeholder_players=tuple(placeholders), detail="检测到临时角色：" + ", ".join(added) if added else "尚未检测到新建角色")
         self.save_migration_session(storage_root, updated); return updated
 
@@ -445,8 +468,10 @@ class BackupPackageService:
         for old_guid, new_guid in confirmations.items():
             old_key = str(old_guid).replace("-", "").upper(); new_key = str(new_guid).replace("-", "").upper()
             if old_key not in source_by_uid or new_key not in target_by_uid: raise ValueError("玩家映射引用了不存在的角色")
-            if old_key == new_key or new_key in used: raise ValueError("玩家映射包含相同或重复的新 GUID")
-            used.add(new_key); source = source_by_uid[old_key]; target = target_by_uid[new_key]
+            source = source_by_uid[old_key]; target = target_by_uid[new_key]
+            if old_key == new_key: raise ValueError(f"玩家 {source.get('nickname') or old_key} 不能映射到自己的旧 GUID；请让该玩家进入专服创建新角色后选择新的 GUID")
+            if new_key in used: raise ValueError(f"目标 GUID {new_key} 已分配给其他玩家，存在重复目标 GUID；每个专服临时角色只能使用一次")
+            used.add(new_key)
             mappings.append(PlayerIdentityMapping(old_guid=old_key, new_guid=new_key, old_name=str(source.get("nickname") or ""), new_name=str(target.get("nickname") or ""), old_instance_id=str(source.get("instance_id") or ""), new_instance_id=str(target.get("instance_id") or ""), confirmed=True, status="confirmed"))
         if len(mappings) != len(source_by_uid): raise ValueError("必须确认全部本地角色的迁移映射")
         updated = replace(session, phase="mapping_ready", mappings=tuple(mappings), detail=f"已确认 {len(mappings)} 个玩家映射"); self.save_migration_session(storage_root, updated); return updated
@@ -459,13 +484,13 @@ class BackupPackageService:
         if not world.is_dir() or not (world / "Level.sav").is_file(): raise FileNotFoundError("目标世界目录不存在或缺少 Level.sav")
         if not source.is_dir() or not (source / "Level.sav").is_file(): raise FileNotFoundError("本地世界目录不存在或缺少 Level.sav")
         progress = lambda p, s, m: RestoreTransaction._emit_progress(on_progress, p, s, m)
-        ready, detail = PlmCodecPlugin().probe()
+        plugin = PlmCodecPlugin(storage_root); ready, detail = plugin.probe()
         if not ready: raise RuntimeError(f"PlM 插件不可用：{detail}")
         with tempfile.TemporaryDirectory(prefix="palworld-coop-migration-") as temp_name:
             temp = Path(temp_name); candidate = temp / "world"; progress(5, "准备迁移", "正在校验本地和专服角色")
             # Build the candidate from the current server world so untouched players and world data remain intact.
             shutil.copytree(world, candidate)
-            report = PlmCodecPlugin().migrate_identities(candidate, [asdict(item) for item in session.mappings], temp / "migrated")
+            report = plugin.migrate_identities(candidate, [asdict(item) for item in session.mappings], temp / "migrated")
             migrated = temp / "migrated"
             if not migrated.is_dir(): raise RuntimeError("身份迁移未生成候选世界")
             progress(25, "候选验证", f"已完成 {report.get('migrated', 0)} 个玩家身份重绑定")
@@ -543,6 +568,19 @@ class BackupPackageService:
     def _player_guid(player: dict) -> str:
         return str(player.get("player_guid") or player.get("player_uid") or "").replace("-", "").upper()
 
+    @classmethod
+    def available_identity_targets(cls, old_guid: str, targets: Iterable[dict], used_guids: Iterable[str] = ()) -> tuple[dict, ...]:
+        old_key = str(old_guid).replace("-", "").upper()
+        used = {str(value).replace("-", "").upper() for value in used_guids}
+        result = []
+        seen = set()
+        for target in targets:
+            target_guid = cls._player_guid(target)
+            if not target_guid or target_guid == old_key or target_guid in used or target_guid in seen:
+                continue
+            seen.add(target_guid); result.append(target)
+        return tuple(result)
+
     def confirm_restore_mappings(self, session: CoopMigrationSession, confirmations: dict[str, str], storage_root: Path) -> CoopMigrationSession:
         source = {self._player_guid(item): item for item in session.source_players}; targets = {self._player_guid(item): item for item in session.placeholder_players}
         completed = [item for item in session.mappings if item.status == "migrated"]
@@ -552,8 +590,10 @@ class BackupPackageService:
             old_key = str(old_guid).replace("-", "").upper(); new_key = str(new_guid).replace("-", "").upper()
             if not new_key: continue
             if old_key not in source or old_key not in allowed or new_key not in targets: raise ValueError("玩家映射引用了不存在或已完成迁移的角色")
-            if old_key == new_key or new_key in used: raise ValueError("玩家映射包含相同或重复的新 GUID")
-            used.add(new_key); old = source[old_key]; new = targets[new_key]
+            old = source[old_key]; new = targets[new_key]
+            if old_key == new_key: raise ValueError(f"玩家 {old.get('nickname') or old_key} 不能映射到自己的旧 GUID；请让该玩家进入专服创建新角色后选择新的 GUID")
+            if new_key in used: raise ValueError(f"目标 GUID {new_key} 已分配给其他玩家，存在重复目标 GUID；每个专服临时角色只能使用一次")
+            used.add(new_key)
             mappings.append(PlayerIdentityMapping(old_guid=old_key, new_guid=new_key, old_name=str(old.get("nickname") or ""), new_name=str(new.get("nickname") or ""), old_instance_id=str(old.get("instance_id") or ""), confirmed=True, new_instance_id=str(new.get("instance_id") or ""), status="confirmed"))
         pending = tuple(guid for guid in session.pending_player_guids if guid not in {item.old_guid for item in mappings}) if session.pending_player_guids else tuple(guid for guid in source if guid not in {item.old_guid for item in mappings})
         updated = replace(session, mappings=tuple(mappings), pending_player_guids=pending, phase="candidate_ready", detail=f"已确认 {len(mappings)} 个映射，待后续迁移 {len(pending)} 个")
@@ -752,12 +792,21 @@ class BackupPackageService:
 
     @staticmethod
     def _copy_directory_safe(source: Path, destination: Path) -> None:
-        for path in (source, *source.rglob("*")):
+        source = Path(source).resolve(); is_world = (source / "Level.sav").is_file()
+        paths = [source]
+        for path in source.rglob("*"):
+            if is_world:
+                relative = path.relative_to(source)
+                if any(part.casefold() in WORLD_TRANSIENT_DIRS for part in relative.parts):
+                    continue
+            paths.append(path)
+        for path in paths:
             attributes = getattr(path.lstat(), "st_file_attributes", 0)
             if path.is_symlink() or attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
                 raise ValueError(f"拒绝导入符号链接或重解析点: {path}")
         target = destination / source.name
-        shutil.copytree(source, target, symlinks=False)
+        ignore = shutil.ignore_patterns(*WORLD_TRANSIENT_DIRS) if is_world else None
+        shutil.copytree(source, target, symlinks=False, ignore=ignore)
 
     @staticmethod
     def _extract_legacy_zip(source: Path, destination: Path) -> None:

@@ -26,3 +26,8 @@ def test_inventory_quantity_has_chinese_meaning_and_range():
     assert validate_value(field, "99") == 99
     with pytest.raises(ValueError):
         validate_value(field, "1000000")
+
+
+def test_deep_pal_fields_coerce_lists_and_booleans():
+    assert validate_value(resolve_path("players[0].pals[0].active_skills"), "FireBall, DragonCannon") == ["FireBall", "DragonCannon"]
+    assert validate_value(resolve_path("players[0].pals[0].is_lucky"), "是") is True

@@ -60,6 +60,7 @@ flowchart LR
 | 公会与基地 | 在线快照、成员关系、基地与帕鲁统计 | 高风险关系修改必须停服并经过完整校验 |
 | 模组管理 | Workshop/ZIP/URL 来源、UE4SS Mods、NativeMods、迁移包 | 统一部署到 UE4SS；不写入 PalModSettings.ini，原生 Linux 只读 |
 | RCON 与自动化 | 命令控制台、白名单、主机级计划任务 | 高风险命令确认，远程连接默认走 SSH 隧道 |
+| 存档工具 | Steam/Game Pass 来源、联机转专服、Host Swap、格式/地图/Palbox 工具 | 与备份职责分离；转换包逐文件校验，可重复部署 |
 | 备份与恢复 | `.pwcbackup`、导入导出、组件恢复、跨实例迁服、保留策略 | CRC/SHA-256 校验、配置脱敏、恢复点与失败回滚 |
 | 日志与审计 | 运行日志、筛选、导出、管理操作记录 | 关键操作可追溯，不在日志中保存凭据明文 |
 
@@ -77,6 +78,9 @@ flowchart LR
 - 远程使用 `systemd timer`，本机使用 Windows 任务计划执行备份、重启等任务。
 - 服务器侧计划备份保存在安装目录外层的 `_backups/palworld-console`，下次 SSH 检测时自动下载、转换、校验并加入当前实例的本地备份库。
 - 统一 `.pwcbackup` ZIP 容器支持仅含 `SaveGames` 的世界导出包，以及包含脱敏配置的完整灾备包；可导入旧 ZIP/TAR、目录和 `Level.sav`。
+- 独立“存档工具”工作台可扫描 Steam 与 Xbox/Game Pass WGS 世界、只读转换 Game Pass 存档、导入本地或远程服务器、执行联机角色身份迁移，并生成可复核的 `.pwc-conversion` 转换包。
+- SAV/JSON、SteamID/Palworld UID、Host Swap/专服转联机、地图迷雾恢复和 Palbox 槽位扩容均通过版本化隔离 helper 执行；写入前生成候选，二次解析后才原子替换。
+- `.pwc-conversion` 包包含版本化 manifest、来源信息和逐文件 SHA-256；重新部署前会拒绝缺失、篡改、未登记或路径不安全的文件。
 - 恢复向导按世界、配置或经 PlM 验证的单玩家角色生成差异计划；跨实例恢复保留目标端口、路径、服务、SSH 与凭据，失败自动回滚。
 - 旧格式存档使用 `palworld-save-tools==0.24.0`；`PlM1` 存档使用隔离的固定提交插件进行结构化修改、二次解析、原子替换和失败回滚。
 
@@ -144,10 +148,12 @@ Workshop、ZIP 和 PAK 包会校验 `Info.json`、安装规则、依赖、冲突
 - SSH 密码、私钥口令和管理密码保存在 Windows Credential Manager，实例 JSON 仅保存引用。
 - 高级存档编辑禁止修改正在运行的世界；写回前必须停服并完成本地与服务器侧备份。
 - 公会、基地、玩家或帕鲁的删除、迁移属于高风险操作，应先在备份副本中验证。
+- “存档工具”负责转换和迁移；“备份与恢复”只负责备份包、恢复点及灾备恢复。直接部署仍会先创建恢复点并沿用停服、原子替换和健康检查流程。
 - 模组部署统一使用 UE4SS/Mods 与 UE4SS/NativeMods；Workshop、ZIP、URL 仅作为下载来源，不写入官方 PalModSettings.ini 或 ManagedMods。
 - 模组部署需要停服、完整备份、重启和健康检查；旧官方模组只保留并标记为待迁移。
 - 玩家中心按“同步玩家数据 → 选择角色 → 编辑 → 预览并保存”工作；保存失败自动回滚但保留草稿，可直接重试。
 - PlM 插件不可用、构建失败或格式校验不通过时，存档功能保持只读，不猜测未知字段。
+- Game Pass WGS 解析保持只读，不停止 Xbox 服务、不修改 `containers.index`、不写云存档，也不添加防火墙规则；需要写入的操作必须先导出为 Steam 世界目录。
 - 程序不会自动操作云厂商控制台，也不会主动将 REST 或 RCON 端口暴露到公网。
 - 备份包不会保存管理员密码、玩家密码、SSH 凭据、私钥路径或完整玩家 IP；恢复配置时从目标实例的系统凭据管理器重新注入密码。
 - 单玩家恢复不直接复制 `Players/<UID>.sav`，仅在 UID、公会、帕鲁 GUID、容器和槽位关系完整时执行结构化合并。
@@ -161,4 +167,4 @@ Workshop、ZIP 和 PAK 包会校验 `Info.json`、安装规则、依赖、冲突
 - palworld-save-tools（MIT，旧格式适配）
 - PalworldSaveTools 固定提交插件中的 `palsav-flex` / `palooz`（GPL-3.0-or-later；按需本机构建，不随主程序分发）
 
-部分存档结构化流程参考 `palworld-server-tool` 的固定提交（Apache-2.0）。上游 `palooz` 所含部分 Oodle 压缩源码存在额外授权警告，因此插件与主程序隔离且不随安装包再分发。本项目不包含地图功能，也不复制参考项目界面或素材。
+部分存档结构化流程参考 `palworld-server-tool` 的固定提交（Apache-2.0）。上游 `palooz` 所含部分 Oodle 压缩源码存在额外授权警告，因此插件与主程序隔离且不随安装包再分发。地图工具仅处理用户存档内的数据字段，不分发上游地图素材，也不复制参考项目界面或素材。

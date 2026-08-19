@@ -85,6 +85,21 @@ def test_backup_page_mirrors_task_progress_and_heartbeat(window, monkeypatch):
     assert window.navigation.isEnabled()
 
 
+def test_save_tools_page_mirrors_migration_progress(window, monkeypatch):
+    monkeypatch.setattr(ui_module.time, "monotonic", lambda: 100.0)
+    window.navigation.setCurrentRow(window.page_stack.indexOf(window.save_tools_page))
+
+    window._begin_backup_task("准备四人联机迁移")
+    window._set_install_progress(TaskProgress(48, "构建迁移候选", "正在校验玩家身份", False))
+
+    assert window.save_tool_progress.value() == 48
+    assert window.save_tool_stage.text() == "构建迁移候选"
+    assert window.save_tool_percent.text() == "48%"
+    assert "玩家身份" in window.save_tool_result.toPlainText()
+    window._finish_backup_task()
+    assert window.save_tool_stage.text() == "任务完成"
+
+
 def test_update_check_states_and_automatic_failure(window, monkeypatch):
     messages = []
     logs = []
@@ -327,8 +342,12 @@ def test_uninstall_success_keeps_instance_and_ssh_credentials(window):
     assert window.install_stage.text() == "卸载完成"
 
 
-def test_main_window_exposes_ten_management_pages(window):
-    assert [window.tabs.tabText(i) for i in range(window.tabs.count())] == ["仪表盘", "连接与部署", "游戏配置", "玩家中心", "公会与基地", "模组管理", "RCON 与自动化", "备份与恢复", "日志与审计", "关于我们"]
+def test_main_window_exposes_save_tools_as_an_independent_management_page(window):
+    assert [window.tabs.tabText(i) for i in range(window.tabs.count())] == ["仪表盘", "连接与部署", "游戏配置", "玩家中心", "公会与基地", "模组管理", "RCON 与自动化", "存档工具", "备份与恢复", "日志与审计", "关于我们"]
+    assert window.page_stack.indexOf(window.save_tools_page) != window.page_stack.indexOf(window.backups_page)
+    assert hasattr(window, "save_tool_sources")
+    assert hasattr(window, "save_tool_engine_status")
+    assert not any(button.text() == "本地存档转服务器" for button in window.backup_action_buttons)
     assert len(window.ini_fields) >= 60
     assert not hasattr(window, "status_timer")
 
@@ -389,3 +408,55 @@ def test_config_preset_updates_fields_without_saving(window):
     window.apply_config_preset()
     assert window._setting_text(window.ini_fields["ExpRate"]) == "5.0"
     assert "已修改" in window.config_diff_label.text()
+
+
+def test_illegal_pal_repair_creates_reviewable_draft(window, tmp_path, monkeypatch):
+    payload = {"players": [{"player_uid": "42", "pals": [{"individual_id": "pal-1", "stable_id_valid": True, "level": 99, "melee": 140, "ranged": 50, "defense": -5, "rank": 8, "rank_attack": 30, "rank_defence": 2, "rank_craftspeed": 3}]}]}
+    window.selected.id = "repair-instance"; window.active_player_uid = "42"
+    window.save_document = ui_module.PluginParsedSave.create(payload, tmp_path / "Level.sav", object())
+    messages = []; monkeypatch.setattr(QMessageBox, "information", lambda *args: messages.append(args) or QMessageBox.Ok)
+
+    window.stage_legal_pal_repairs()
+
+    session = window._active_edit_session()
+    assert session.value_for("players[0].pals[0].level", 99) == 80
+    assert session.value_for("players[0].pals[0].melee", 140) == 100
+    assert session.value_for("players[0].pals[0].defense", -5) == 0
+    assert session.value_for("players[0].pals[0].rank", 8) == 5
+    assert len(session.changes) == 5
+    assert messages
+
+
+def test_world_editors_stage_guild_and_base_draft(window, tmp_path):
+    payload = {
+        "players": [],
+        "guilds": [{"guild_id": "guild-1", "name": "Old Guild", "base_camp_level": 2}],
+        "bases": [{"base_id": "base-1", "name": "Old Base", "position": {"x": 1, "y": 2, "z": 3}}],
+    }
+    window.selected.id = "world-edit-instance"
+    window.save_document = ui_module.PluginParsedSave.create(payload, tmp_path / "Level.sav", object())
+    window.world_edit_session = ui_module.PlayerEditSession(window.selected.id, "__world__")
+    window._render_world_editors()
+    window.world_guild_name.setText("New Guild"); window.world_guild_level.setValue(7)
+    window.world_base_name.setText("New Base"); window.world_base_x.setText("12.5")
+
+    window.stage_world_guild(); window.stage_world_base()
+
+    assert window.world_edit_session.value_for("guilds[0].name", "") == "New Guild"
+    assert window.world_edit_session.value_for("guilds[0].base_camp_level", 0) == 7
+    assert window.world_edit_session.value_for("bases[0].name", "") == "New Base"
+    assert window.world_edit_session.value_for("bases[0].position.x", 0) == 12.5
+    assert "4 项" in window.world_edit_status.text()
+
+
+def test_save_failure_keeps_world_draft_and_reenables_ui(window, monkeypatch):
+    window.world_edit_session = ui_module.PlayerEditSession(window.selected.id, "__world__")
+    window.world_edit_session.stage("guilds[0].name", "Before", "After", "公会名称", "guild", "guild-1", "中")
+    window.player_save_busy = True; window.navigation.setEnabled(False)
+    monkeypatch.setattr(QMessageBox, "critical", lambda *_args: QMessageBox.Ok)
+
+    window._save_apply_failed("round-trip failed")
+
+    assert len(window.world_edit_session.changes) == 1
+    assert window.navigation.isEnabled()
+    assert window.player_save_busy is False
