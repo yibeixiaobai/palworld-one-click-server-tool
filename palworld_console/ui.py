@@ -408,6 +408,11 @@ class MainWindow(QMainWindow):
         import_button = QPushButton("导入"); import_menu = QMenu(import_button)
         import_menu.addAction("导入文件", self.import_backup_file); import_menu.addAction("导入 Saved/SaveGames 目录", self.import_backup_directory)
         import_button.setMenu(import_menu); row.addWidget(import_button); self.backup_action_buttons.append(import_button)
+        local_import = QPushButton("本地存档转服务器"); local_menu = QMenu(local_import)
+        local_menu.addAction("自动检测本地存档", self.detect_local_save_sources)
+        local_menu.addAction("选择存档文件", self.import_local_save_file)
+        local_menu.addAction("选择存档文件夹", self.import_local_save_directory)
+        local_import.setMenu(local_menu); row.addWidget(local_import); self.backup_action_buttons.append(local_import)
         for text, handler in (("导出", self.export_selected_backup), ("校验报告", self.export_selected_backup_report), ("恢复", self.restore), ("校验", self.verify_selected_backup), ("添加备注", self.note_selected_backup), ("保护/解锁", self.toggle_selected_backup_protection), ("删除", self.delete_selected_backup), ("刷新", self.refresh_backup_list)):
             b = QPushButton(text); b.clicked.connect(handler); row.addWidget(b); self.backup_action_buttons.append(b)
         row.addStretch(); l.addLayout(row)
@@ -1153,59 +1158,52 @@ class MainWindow(QMainWindow):
             except Exception as exc: return QMessageBox.critical(self, "旧备份转换失败", str(exc))
             package = Path(package).resolve()
             self.refresh_backup_list()
-        transaction = RestoreTransaction()
         try:
-            manifest = BackupPackageService().validate(package); plan = transaction.plan(package, self.selected)
+            manifest = BackupPackageService().validate(package)
+            if "world" not in manifest.components:
+                return QMessageBox.critical(self, "恢复前预检失败", "备份中没有可恢复的 SaveGames 文件。")
         except Exception as exc: return QMessageBox.critical(self, "备份校验失败", str(exc))
-        plugin_status = PlmCodecPlugin().probe()
-        player_uids = ()
-        if plugin_status[0] and "world" in manifest.components:
-            try: player_uids = BackupPackageService().read_player_uids(package, structured=True)
-            except Exception as exc: plugin_status = (False, str(exc))
-        dialog = RestoreOptionsDialog(plan, manifest, self, player_uids, plugin_status)
-        if dialog.exec() != QDialog.Accepted: return
-        components = dialog.selected_components()
-        player_uid = dialog.selected_player_uid()
-        try:
-            selected_plan = transaction.plan(package, self.selected, components)
-            if selected_plan.blocked_reason: return QMessageBox.critical(self, "恢复预检失败", selected_plan.blocked_reason)
-        except Exception as exc: return QMessageBox.critical(self, "恢复预检失败", str(exc))
         name, ok = QInputDialog.getText(self, "确认恢复", f"请输入目标实例名称“{self.selected.name}”：")
         if not ok or name != self.selected.name: return
         reason, ok = QInputDialog.getText(self, "恢复原因", "请输入恢复或迁服原因：")
         if not ok or not reason.strip(): return
         selected = self.selected; admin = self.storage.get_secret(selected.admin_secret_ref); server_password = self.storage.get_secret(selected.server_password_secret_ref)
         if selected.kind == "local":
-            saved = Path(selected.install_dir).expanduser().resolve() / "Pal" / "Saved"
-            if not saved.is_dir():
-                return QMessageBox.critical(self, "恢复前预检失败", f"目标服务器尚未安装或未检测到 Saved 目录：\n{saved}")
+            savegames = Path(selected.install_dir).expanduser().resolve() / "Pal" / "Saved" / "SaveGames"
+            if not savegames.is_dir():
+                return QMessageBox.critical(self, "恢复前预检失败", f"目标服务器尚未创建 SaveGames 目录：\n{savegames}")
         self._begin_backup_task("恢复服务器存档")
-        worker = Worker(lambda signals: self._run_restore_transaction(signals, selected, package, repository, components, admin, server_password, player_uid), with_signals=True)
+        worker = Worker(lambda signals: self._run_restore_transaction(signals, selected, package, reason), with_signals=True)
         worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress)
         worker.signals.finished.connect(lambda result: self._restore_done(result, reason)); worker.signals.error.connect(self._restore_failed); self.pool.start(worker)
 
-    def _run_restore_transaction(self, signals, selected, package, repository, components, admin_password, server_password, player_uid=""):
-        signals.progress.emit(TaskProgress(5, "恢复预检", "正在校验备份和目标实例", True))
+    def _run_restore_transaction(self, signals, selected, package, reason=""):
         try:
             try: self._rest_client().save()
             except Exception as exc: signals.log.emit(f"REST 保存世界失败，将通过停服保证一致性：{exc}")
             transaction = RestoreTransaction()
             if selected.kind == "remote":
-                lifecycle = _remote_lifecycle_for(selected, self._remote_client(), signals.log.emit)
-                signals.progress.emit(TaskProgress(20, "创建恢复点", "正在下载当前服务器完整恢复点", True))
-                return transaction.execute_remote(package, selected, self._remote_client(), repository, components, lifecycle.stop, lifecycle.start, lambda: self._remote_health_ok(selected), admin_password, server_password, player_uid)
+                client = self._remote_client(); lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit)
+                platform_name = str(selected.remote_profile.get("platform") or "linux").lower()
+                install_dir = str(selected.remote_profile.get("install_dir") or selected.install_dir)
+                if platform_name == "windows":
+                    from .services import WindowsRemotePath
+                    savegames = WindowsRemotePath.normalize(install_dir).rstrip("\\/") + "\\Pal\\Saved\\SaveGames"
+                else:
+                    savegames = install_dir.rstrip("/") + "/Pal/Saved/SaveGames"
+                return transaction.restore_savegames_remote(package, savegames, client, platform_name, lifecycle.stop, lifecycle.start, lambda p, s, m: signals.progress.emit(TaskProgress(p, s, m, False)))
             lifecycle = self.lifecycle if isinstance(self.lifecycle, LocalServerLifecycle) else LocalServerLifecycle(selected, signals.log.emit)
-            signals.progress.emit(TaskProgress(20, "创建恢复点", "正在创建当前服务器受保护恢复点", True))
-            return transaction.execute_local(package, selected, repository, components, lifecycle.stop, lifecycle.start, lambda: lifecycle.status() == "running", admin_password, server_password, player_uid)
+            savegames = Path(selected.install_dir).expanduser().resolve() / "Pal" / "Saved" / "SaveGames"
+            return transaction.restore_savegames(package, savegames, lifecycle.stop, lifecycle.start, lambda p, s, m: signals.progress.emit(TaskProgress(p, s, m, False)))
         finally:
             self._close_rest_tunnel()
 
     def _restore_done(self, result, reason):
         if self.selected:
-            self.selected.last_backup = result.restore_point
-            AuditService.record(self.selected, "恢复存档", result.package_path, result="成功", detail=f"组件={','.join(result.components)}；原因={reason}")
+            self.selected.last_backup = result.package_path
+            AuditService.record(self.selected, "恢复存档", result.package_path, result="成功", detail=f"{result.detail}；原因={reason}")
             self.storage.save_instances(self.instances); self._render_audit()
-        self.append_log(f"恢复完成，恢复点：{result.restore_point}"); self._finish_backup_task(); self.refresh_backup_list(); self.refresh_status()
+        self.append_log(f"恢复完成：服务器存档文件已替换。{result.detail}"); self._finish_backup_task(); self.refresh_backup_list(); self.refresh_status()
         self.load_ini(); self.load_save_snapshot()
 
     def _restore_failed(self, error):
@@ -1235,6 +1233,57 @@ class MainWindow(QMainWindow):
 
     def _import_backup_done(self, path):
         self.append_log(f"备份已导入并校验：{path}"); self._finish_backup_task(); self.refresh_backup_list(Path(path))
+
+    def detect_local_save_sources(self):
+        try:
+            sources = BackupPackageService().detect_local_save_sources()
+        except Exception as exc:
+            return QMessageBox.critical(self, "本地存档检测失败", str(exc))
+        if not sources:
+            return QMessageBox.information(self, "未检测到本地存档", "未在常见 Palworld 路径找到世界存档，请使用“选择存档文件”或“选择存档文件夹”。")
+        lines = [f"{index}. {item.world_id} | {item.source_kind} | {item.file_count} 个文件 | {item.source_path}" for index, item in enumerate(sources, 1)]
+        QMessageBox.information(self, "检测到本地存档", "\n".join(lines))
+
+    def import_local_save_file(self):
+        if not self.selected: return
+        path, _ = QFileDialog.getOpenFileName(self, "选择本地 Palworld 存档", "", "存档来源 (*.zip *.tar.gz *.tgz *.pwcbackup *.sav);;所有文件 (*)")
+        if path: self._import_local_save_source(Path(path))
+
+    def import_local_save_directory(self):
+        if not self.selected: return
+        path = QFileDialog.getExistingDirectory(self, "选择本地 Palworld 存档文件夹")
+        if path: self._import_local_save_source(Path(path))
+
+    def _import_local_save_source(self, source: Path):
+        if self.install_task_active: return QMessageBox.information(self, "任务进行中", "当前服务器任务尚未结束。")
+        source = Path(source).expanduser().resolve()
+        try:
+            inspection = BackupPackageService().inspect_save_source(source)
+        except Exception as exc:
+            return QMessageBox.critical(self, "本地存档检测失败", str(exc))
+        warnings = "\n".join(inspection.warnings) if inspection.warnings else "无"
+        detail = f"来源：{inspection.source_path}\n世界：{inspection.world_id}\n文件：{inspection.file_count}\n格式：{inspection.save_format}\n警告：{warnings}\n\n将覆盖服务器当前世界的对应文件，保留服务器额外文件。继续吗？"
+        if QMessageBox.question(self, "确认导入本地存档", detail) != QMessageBox.Yes: return
+        selected = self.selected; self._begin_backup_task("导入本地存档")
+        def task(signals):
+            service = BackupPackageService()
+            if selected.kind == "local":
+                lifecycle = self.lifecycle if isinstance(self.lifecycle, LocalServerLifecycle) else LocalServerLifecycle(selected, signals.log.emit)
+                target = Path(selected.install_dir).expanduser().resolve() / "Pal" / "Saved" / "SaveGames"
+                return service.import_local_save_to_server(source, target, lifecycle.stop, lifecycle.start, lambda p, s, m: signals.progress.emit(TaskProgress(p, s, m, False)))
+            package = self._backup_repository().import_source(source, selected, on_progress=lambda p, m: signals.progress.emit(TaskProgress(min(30, p // 3), "准备本地存档", m)))
+            client = self._remote_client(); lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit)
+            platform_name = str(selected.remote_profile.get("platform") or "linux").lower(); install_dir = str(selected.remote_profile.get("install_dir") or selected.install_dir)
+            if platform_name == "windows":
+                from .services import WindowsRemotePath
+                target = WindowsRemotePath.normalize(install_dir).rstrip("\\/") + "\\Pal\\Saved\\SaveGames"
+            else:
+                target = install_dir.rstrip("/") + "/Pal/Saved/SaveGames"
+            return RestoreTransaction().restore_savegames_remote(package, target, client, platform_name, lifecycle.stop, lifecycle.start, lambda p, s, m: signals.progress.emit(TaskProgress(p, s, m, False)))
+        worker = Worker(task, with_signals=True); worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress); worker.signals.finished.connect(self._local_save_import_done); worker.signals.error.connect(self._backup_task_failed); self.pool.start(worker)
+
+    def _local_save_import_done(self, result):
+        self.append_log(result.detail); self._finish_backup_task(); self.refresh_status(); self.load_save_snapshot(); QMessageBox.information(self, "本地存档导入完成", result.detail)
 
     @staticmethod
     def _friendly_backup_error(error) -> str:
@@ -2361,7 +2410,7 @@ class MainWindow(QMainWindow):
             if self.active_player_uid and self.player_view_stack.currentWidget() is self.player_detail_page:
                 aliases = [str(self.player_role_combo.itemData(index)) for index in range(self.player_role_combo.count())]
                 self._load_player_role(self.active_player_uid, aliases)
-        self._render_save_fields(); self.append_log("存档副本已解析，尚未修改服务器文件")
+        self._render_save_fields(); self.append_log("已读取服务器当前存档用于玩家中心展示，未执行写回操作")
 
     @staticmethod
     def _download_remote_save_bundle(client, remote_level: str, local_level: Path) -> None:

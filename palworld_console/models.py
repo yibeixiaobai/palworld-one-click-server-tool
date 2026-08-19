@@ -18,6 +18,31 @@ class TaskProgress:
 
 
 @dataclass(frozen=True)
+class LocalSaveSource:
+    source_path: str
+    source_kind: str
+    savegames_root: str
+    world_relative_path: str
+    world_id: str
+    file_count: int
+    total_bytes: int
+    has_level: bool
+    has_players: bool
+    save_format: str
+    modified_at: str
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ServerWorldTarget:
+    savegames_path: str
+    world_path: str
+    world_id: str
+    file_count: int
+    modified_at: str
+
+
+@dataclass(frozen=True)
 class LocalSteamCmdState:
     root: str
     executable: str

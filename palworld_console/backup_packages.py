@@ -11,6 +11,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import time
 import uuid
 import zipfile
 from dataclasses import asdict
@@ -19,7 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
 from .config_ini import PalWorldSettings
-from .models import BackupEntry, BackupManifest, RestorePlan, RestoreResult, ServerInstance
+from .models import BackupEntry, BackupManifest, LocalSaveSource, RestorePlan, RestoreResult, ServerInstance, ServerWorldTarget
 
 
 SCHEMA = "palworld-console-backup-v1"
@@ -116,6 +117,8 @@ class BackupPackageService:
                 relative = source.relative_to(savegames).as_posix()
                 payloads.append((source, f"payload/savegames/{relative}", "world", source.name == "Level.sav"))
 
+        # 旧 disaster/restore-point 包保留脱敏配置，供历史 API 和灾备导出兼容；
+        # 新的 world 备份和新的直接恢复流程只使用 SaveGames。
         config_text = ""
         if backup_type in {"disaster", "restore-point"}:
             candidates = sorted((saved_dir / "Config").glob("*Server/PalWorldSettings.ini"))
@@ -264,6 +267,135 @@ class BackupPackageService:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(archive.read(entry.path))
         return manifest
+
+    @staticmethod
+    def _world_candidates(root: Path) -> list[tuple[Path, Path, Path]]:
+        """Return (savegames root, world dir, relative world path) candidates."""
+        root = root.resolve(); candidates = []
+        save_roots = []
+        if root.name.casefold() == "savegames" and root.is_dir(): save_roots.append(root)
+        for candidate in (root / "SaveGames", root / "savegames"):
+            if candidate.is_dir(): save_roots.append(candidate)
+        save_roots.extend(path for path in root.rglob("*") if path.is_dir() and path.name.casefold() == "savegames")
+        if (root / "Level.sav").is_file():
+            save_roots.append(root.parent); candidates.append((root.parent, root, Path(root.name)))
+        seen = set()
+        for save_root in save_roots:
+            save_root = save_root.resolve()
+            if str(save_root).casefold() in seen: continue
+            seen.add(str(save_root).casefold())
+            for level in save_root.rglob("Level.sav"):
+                world = level.parent
+                try: relative = world.relative_to(save_root)
+                except ValueError: continue
+                if relative == Path("."): relative = Path(world.name)
+                candidates.append((save_root, world, relative))
+        unique = {}
+        for item in candidates: unique[str(item[1]).casefold()] = item
+        return list(unique.values())
+
+    def inspect_save_source(self, source: Path) -> LocalSaveSource:
+        source = Path(source).expanduser().resolve()
+        if not source.exists(): raise FileNotFoundError(f"存档来源不存在：{source}")
+        kind = "folder" if source.is_dir() else ("pwcbackup" if source.suffix.lower() == ".pwcbackup" else "level" if source.name.casefold() == "level.sav" else "zip" if zipfile.is_zipfile(source) else "tar" if tarfile.is_tarfile(source) else "file")
+        warnings: list[str] = []
+        if kind == "pwcbackup": self.validate(source)
+        with tempfile.TemporaryDirectory(prefix="palworld-inspect-") as temp_name:
+            temp = Path(temp_name)
+            if kind == "pwcbackup": self.extract(source, temp, ("world",))
+            elif kind == "folder": self._copy_directory_safe(source, temp)
+            elif kind == "level":
+                world = temp / "SaveGames" / "imported-world"; world.mkdir(parents=True); shutil.copy2(source, world / "Level.sav")
+                warnings.append("仅包含 Level.sav，玩家和世界附属文件不会被恢复")
+            elif kind == "zip": self._extract_legacy_zip(source, temp)
+            elif kind == "tar": self._extract_legacy_tar(source, temp)
+            else: raise ValueError("不支持的存档来源格式")
+            candidates = self._world_candidates(temp)
+            if not candidates: raise ValueError("导入内容中未找到包含 Level.sav 的世界目录")
+            save_root, world, relative = max(candidates, key=lambda item: item[1].stat().st_mtime)
+            files = [p for p in world.rglob("*") if p.is_file()]
+            players = list(world.rglob("Players/*.sav"))
+            if not players: warnings.append("未检测到 Players 文件，玩家数据可能不完整")
+            modified = datetime.fromtimestamp(max((p.stat().st_mtime for p in files), default=world.stat().st_mtime), timezone.utc).isoformat()
+            return LocalSaveSource(str(source), kind, str(save_root), relative.as_posix(), relative.name, len(files), sum(p.stat().st_size for p in files), True, bool(players), self._save_format(world / "Level.sav"), modified, tuple(warnings))
+
+    def detect_local_save_sources(self) -> tuple[LocalSaveSource, ...]:
+        paths = []
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            paths.extend([Path(local) / "Pal" / "Saved" / "SaveGames", Path(local) / "Pal" / "Saved"])
+        paths.extend([Path.home() / "AppData" / "Local" / "Pal" / "Saved" / "SaveGames"])
+        results = []; seen = set()
+        for path in paths:
+            try:
+                key = str(path.expanduser().resolve()).casefold()
+                if key in seen or not path.exists(): continue
+                seen.add(key); results.append(self.inspect_save_source(path))
+            except (OSError, ValueError):
+                continue
+        return tuple(results)
+
+    def normalize_local_save(self, source: Path, destination: Path, on_progress: Callable[[int, str], None] | None = None) -> LocalSaveSource:
+        inspection = self.inspect_save_source(source)
+        source = Path(source).expanduser().resolve(); destination = Path(destination).expanduser().resolve()
+        destination.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="palworld-normalize-") as temp_name:
+            temp = Path(temp_name)
+            kind = inspection.source_kind
+            if kind == "pwcbackup": self.extract(source, temp, ("world",))
+            elif kind == "folder": self._copy_directory_safe(source, temp)
+            elif kind == "level":
+                world = temp / "SaveGames" / "imported-world"; world.mkdir(parents=True); shutil.copy2(source, world / "Level.sav")
+            elif kind == "zip": self._extract_legacy_zip(source, temp)
+            else: self._extract_legacy_tar(source, temp)
+            candidate = max(self._world_candidates(temp), key=lambda item: item[1].stat().st_mtime)
+            target = destination / "SaveGames" / "imported-world"; target.mkdir(parents=True, exist_ok=True)
+            files = [p for p in candidate[1].rglob("*") if p.is_file()]
+            for index, path in enumerate(files, 1):
+                relative = path.relative_to(candidate[1]); output = target / relative; output.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(path, output)
+                if on_progress: on_progress(20 + round(index / max(1, len(files)) * 70), f"正在规范化 {index}/{len(files)} 个文件")
+        return self.inspect_save_source(destination)
+
+    @staticmethod
+    def detect_server_world(target_savegames: Path) -> ServerWorldTarget:
+        target_savegames = Path(target_savegames).expanduser().resolve()
+        if not target_savegames.is_dir():
+            raise FileNotFoundError(f"服务器尚未创建 SaveGames 目录：{target_savegames}")
+        worlds = []
+        for level in target_savegames.rglob("Level.sav"):
+            world = level.parent
+            files = [p for p in world.rglob("*") if p.is_file()]
+            worlds.append((max((p.stat().st_mtime for p in files), default=world.stat().st_mtime), world, files))
+        if not worlds: raise FileNotFoundError("服务器尚未创建世界，请先启动一次服务器并生成存档。")
+        _, world, files = max(worlds, key=lambda item: item[0])
+        modified = datetime.fromtimestamp(max((p.stat().st_mtime for p in files), default=world.stat().st_mtime), timezone.utc).isoformat()
+        return ServerWorldTarget(str(target_savegames), str(world), world.name, len(files), modified)
+
+    def import_local_save_to_server(self, source: Path, target_savegames: Path, stop: Callable[[], None], start: Callable[[], None], on_progress: Callable[[int, str, str], None] | None = None) -> RestoreResult:
+        progress = lambda p, s, m: RestoreTransaction._emit_progress(on_progress, p, s, m)
+        source = Path(source).expanduser().resolve(); progress(0, "检测本地存档", "正在识别文件夹或压缩包")
+        inspection = self.inspect_save_source(source); progress(10, "安全解包", f"已识别 {inspection.file_count} 个存档文件")
+        target = self.detect_server_world(target_savegames); progress(35, "检测服务器世界", f"目标世界：{target.world_id}")
+        with tempfile.TemporaryDirectory(prefix="palworld-server-import-") as temp_name:
+            normalized = Path(temp_name) / "normalized"; normalized.mkdir()
+            self.normalize_local_save(source, normalized, lambda p, m: progress(20 + round(p * .15), "准备本地存档", m))
+            source_world = normalized / "SaveGames" / "imported-world"
+            files = sorted(p for p in source_world.rglob("*") if p.is_file())
+            stop(); completed = 0
+            try:
+                for path in files:
+                    relative = path.relative_to(source_world); destination = target.world_path and (Path(target.world_path) / relative)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = destination.with_name(destination.name + f".import-{uuid.uuid4().hex}.tmp")
+                    try: shutil.copy2(path, temporary); os.replace(temporary, destination)
+                    finally: temporary.unlink(missing_ok=True)
+                    completed += 1; progress(40 + round(completed / max(1, len(files)) * 50), "导入世界文件", f"已处理 {completed}/{len(files)} 个文件：{relative.as_posix()}")
+                progress(92, "启动服务器", "正在启动服务器"); start(); progress(100, "导入完成", f"已写入 {completed}/{len(files)} 个文件到世界 {target.world_id}")
+                return RestoreResult(True, str(source), "", ("world",), False, f"本地存档已导入到服务器世界 {target.world_id}：{completed}/{len(files)} 个文件")
+            except Exception as exc:
+                try: start(); restart = "服务器已重新启动"
+                except Exception as start_exc: restart = f"服务器重新启动失败：{start_exc}"
+                raise RuntimeError(f"本地存档导入失败，已处理 {completed}/{len(files)} 个文件；{restart}；错误：{exc}") from exc
 
     def import_source(self, source: Path, instance: ServerInstance, destination: Path, backup_type: str = "world", on_progress: Callable[[int, str], None] | None = None) -> Path:
         source = Path(source).expanduser().resolve()
@@ -591,6 +723,122 @@ class RestoreTransaction:
         estimated = sum(entry.size_bytes for entry in manifest.entries if entry.component in estimated_components) * 3
         return RestorePlan(str(package), manifest.source_instance_id, instance.id, selected, cross, version_mismatch, world_mismatch, version_mismatch or manifest.incomplete, estimated, tuple(summary), blocked_reason)
 
+    def restore_savegames(
+        self,
+        package: Path,
+        target_savegames: Path,
+        stop: Callable[[], None],
+        start: Callable[[], None],
+        on_progress: Callable[[int, str, str], None] | None = None,
+    ) -> RestoreResult:
+        """直接校验并覆盖 SaveGames 文件，不创建恢复点或执行复杂合并。"""
+        progress = lambda percent, stage, message: self._emit_progress(on_progress, percent, stage, message)
+        package = _require_file(Path(package), "备份文件")
+        progress(0, "读取备份", "正在读取备份文件")
+        manifest = self.packages.validate(package)
+        progress(10, "校验备份", "备份清单、CRC 和 SHA-256 校验通过")
+        target = Path(target_savegames).expanduser().resolve()
+        if not target.is_dir():
+            raise FileNotFoundError(f"目标服务器尚未创建 SaveGames 目录：{target}")
+        with tempfile.TemporaryDirectory(prefix="palworld-savegames-restore-") as temp_name:
+            extracted = Path(temp_name)
+            self.packages.extract(package, extracted, ("world",))
+            source_root = extracted / "payload" / "savegames"
+            files = sorted(path for path in source_root.rglob("*") if path.is_file()) if source_root.is_dir() else []
+            if not files:
+                raise ValueError("备份中缺少可恢复的 SaveGames 文件")
+            root = source_root.resolve()
+            progress(20, "准备目标目录", f"已找到 {len(files)} 个待恢复文件")
+            try:
+                stop()
+            except Exception as exc:
+                raise RuntimeError(f"停止服务器失败，未修改存档：{exc}") from exc
+            completed = 0
+            try:
+                progress(25, "停止服务器", "服务器已停止，开始逐文件替换")
+                for source in files:
+                    relative = source.resolve().relative_to(root)
+                    destination = (target / relative).resolve()
+                    if target != destination and target not in destination.parents:
+                        raise ValueError(f"备份文件路径越界：{relative.as_posix()}")
+                    if source.is_symlink():
+                        raise ValueError(f"备份文件包含符号链接：{relative.as_posix()}")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = destination.with_name(destination.name + f".restore-{uuid.uuid4().hex}.tmp")
+                    try:
+                        shutil.copy2(source, temporary)
+                        os.replace(temporary, destination)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    completed += 1
+                    percent = 30 + round(completed / len(files) * 60)
+                    progress(percent, "替换 SaveGames", f"已处理 {completed}/{len(files)} 个文件：{relative.as_posix()}")
+                progress(92, "启动服务器", "正在启动服务器")
+                try:
+                    start()
+                except Exception as exc:
+                    raise RuntimeError(f"存档文件已写入，但服务器启动失败：{exc}") from exc
+                progress(100, "恢复完成", f"已覆盖 {completed}/{len(files)} 个 SaveGames 文件")
+                return RestoreResult(True, str(package), "", ("world",), False, f"已覆盖 {completed}/{len(files)} 个 SaveGames 文件")
+            except Exception as exc:
+                try:
+                    start()
+                    restart = "服务器已重新启动"
+                except Exception as start_exc:
+                    restart = f"服务器重新启动失败：{start_exc}"
+                raise RuntimeError(f"SaveGames 恢复失败，已处理 {completed}/{len(files)} 个文件；{restart}；错误：{exc}") from exc
+
+    def restore_savegames_remote(
+        self,
+        package: Path,
+        target_savegames: str,
+        client,
+        platform_name: str,
+        stop: Callable[[], None],
+        start: Callable[[], None],
+        on_progress: Callable[[int, str, str], None] | None = None,
+    ) -> RestoreResult:
+        from .services import RemoteHostClient
+        progress = lambda percent, stage, message: self._emit_progress(on_progress, percent, stage, message)
+        package = _require_file(Path(package), "备份文件")
+        self.packages.validate(package)
+        with tempfile.TemporaryDirectory(prefix="palworld-savegames-remote-") as temp_name:
+            extracted = Path(temp_name); self.packages.extract(package, extracted, ("world",))
+            source_root = extracted / "payload" / "savegames"
+            files = sorted(path for path in source_root.rglob("*") if path.is_file()) if source_root.is_dir() else []
+            if not files: raise ValueError("备份中缺少可恢复的 SaveGames 文件")
+            progress(20, "准备目标目录", f"已找到 {len(files)} 个待恢复文件")
+            if platform_name == "windows":
+                q = RemoteHostClient._ps_literal
+                code, output, error = client.run_powershell(f"if(Test-Path -LiteralPath {q(target_savegames)} -PathType Container){{'ok'}}else{{'missing'}}")
+            else:
+                code, output, error = client.run(f"test -d {shlex.quote(target_savegames)} && printf ok || printf missing")
+            if code or output.strip().splitlines()[-1:] != ["ok"]:
+                raise FileNotFoundError(f"目标服务器尚未创建 SaveGames 目录：{target_savegames}")
+            stop(); completed = 0; token = uuid.uuid4().hex
+            try:
+                progress(25, "停止服务器", "服务器已停止，开始逐文件上传替换")
+                for source in files:
+                    relative = source.relative_to(source_root).as_posix()
+                    remote = ntpath.join(target_savegames, *relative.split("/")) if platform_name == "windows" else f"{target_savegames.rstrip('/')}/{relative}"
+                    remote_tmp = remote + f".restore-{token}-{completed}.tmp"
+                    client.upload_file(source, remote_tmp)
+                    if platform_name == "windows":
+                        q = RemoteHostClient._ps_literal
+                        script = f"$p={q(remote)};$t={q(remote_tmp)};New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p)|Out-Null;Move-Item -LiteralPath $t -Destination $p -Force"
+                        code, output, error = client.run_powershell(script)
+                    else:
+                        code, output, error = client.run(f"mkdir -p -- $(dirname {shlex.quote(remote)}) && mv -f -- {shlex.quote(remote_tmp)} {shlex.quote(remote)}")
+                    if code: raise RuntimeError(error.strip() or output.strip() or f"写入失败：{relative}")
+                    completed += 1; progress(30 + round(completed / len(files) * 60), "替换 SaveGames", f"已处理 {completed}/{len(files)} 个文件：{relative}")
+                progress(92, "启动服务器", "正在启动服务器")
+                start(); progress(100, "恢复完成", f"已覆盖 {completed}/{len(files)} 个 SaveGames 文件")
+                return RestoreResult(True, str(package), "", ("world",), False, f"已覆盖 {completed}/{len(files)} 个 SaveGames 文件")
+            except Exception as exc:
+                try: start(); restart = "服务器已重新启动"
+                except Exception as start_exc: restart = f"服务器重新启动失败：{start_exc}"
+                raise RuntimeError(f"远程 SaveGames 恢复失败，已处理 {completed}/{len(files)} 个文件；{restart}；错误：{exc}") from exc
+
     def execute_local(
         self,
         package: Path,
@@ -603,9 +851,11 @@ class RestoreTransaction:
         admin_password: str = "",
         server_password: str = "",
         player_uid: str = "",
+        on_progress: Callable[[int, str, str], None] | None = None,
     ) -> RestoreResult:
+        progress = lambda percent, stage, message: self._emit_progress(on_progress, percent, stage, message)
         package = _require_file(Path(package), "备份文件")
-        package = _require_file(Path(package), "备份文件")
+        progress(8, "恢复预检", "正在校验备份、安装目录和磁盘空间")
         plan = self.plan(package, instance, components)
         install_dir = Path(instance.install_dir).expanduser().resolve() if instance.install_dir else None
         if not install_dir or not install_dir.is_dir():
@@ -617,8 +867,10 @@ class RestoreTransaction:
         required_space = current_size * 2 + max(1, plan.estimated_bytes // 3)
         if shutil.disk_usage(saved.parent).free < required_space:
             raise RuntimeError("恢复空间不足，需要当前存档、暂存副本和回滚副本的总空间")
+        progress(15, "停止服务器", "正在停止服务器以保证存档一致性")
         stop()
         try:
+            progress(22, "创建恢复点", "正在创建恢复前的受保护恢复点")
             try:
                 restore_point = self.packages.create(instance, saved, repository.root, "restore-point", "恢复操作自动创建的恢复点")
             except Exception as exc:
@@ -631,23 +883,31 @@ class RestoreTransaction:
         staging = saved.with_name(f"{saved.name}.restore-{uuid.uuid4().hex}")
         try:
             try:
+                progress(35, "准备暂存目录", "正在复制当前存档并创建回滚副本")
                 staging.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(saved, staging)
             except Exception as exc:
                 raise _stage_error("创建恢复暂存目录", exc) from exc
             try:
+                progress(52, "写入恢复内容", "正在解包并写入所选恢复组件")
                 self._apply_to_staging(package, staging, plan.components, instance, admin_password, server_password, player_uid)
                 self._validate_staging(staging, plan.components)
             except Exception as exc:
                 raise _stage_error("准备恢复内容", exc) from exc
             saved.rename(rollback)
             staging.rename(saved)
+            progress(72, "替换存档", "暂存存档已通过校验，正在切换到目标目录")
+            progress(80, "启动服务器", "正在启动服务器并等待服务就绪")
             start()
+            progress(90, "健康检查", "正在等待服务器进程和游戏端口恢复")
             if not health():
                 raise RuntimeError("恢复后服务器健康检查失败")
+            progress(97, "清理恢复现场", "正在清理回滚目录并保留恢复点")
             shutil.rmtree(rollback, ignore_errors=True)
+            progress(100, "恢复完成", "存档已恢复，服务器健康检查通过")
             return RestoreResult(True, str(package), str(restore_point), plan.components, False, "恢复并完成健康检查")
         except Exception as exc:
+            progress(84, "自动回滚", "恢复失败，正在还原原存档并重启服务器")
             if saved.exists() and rollback.exists():
                 shutil.rmtree(saved, ignore_errors=True)
             if rollback.exists():
@@ -674,9 +934,12 @@ class RestoreTransaction:
         admin_password: str = "",
         server_password: str = "",
         player_uid: str = "",
+        on_progress: Callable[[int, str, str], None] | None = None,
     ) -> RestoreResult:
         from .services import BackupService, RemoteHostClient, WindowsRemotePath
 
+        progress = lambda percent, stage, message: self._emit_progress(on_progress, percent, stage, message)
+        progress(8, "恢复预检", "正在校验远程路径、备份包和磁盘空间")
         plan = self.plan(package, instance, components)
         platform_name = str(instance.remote_profile.get("platform") or "linux").lower()
         install_dir = str(instance.remote_profile.get("install_dir") or instance.install_dir)
@@ -694,8 +957,10 @@ class RestoreTransaction:
         self._check_remote_paths(client, platform_name, saved_path)
         self._ensure_remote_temp_dir(client, platform_name, tool_dir)
         self._check_remote_space(client, platform_name, saved_path, max(1, plan.estimated_bytes // 3))
+        progress(15, "停止服务器", "正在停止远程服务器以保证存档一致性")
         stop()
         try:
+            progress(22, "创建恢复点", "正在下载当前服务器完整恢复点")
             raw_restore_point = BackupService().create_remote(client, instance, repository.root, install_dir)
             if raw_restore_point is None: raise RuntimeError("无法创建恢复操作前的服务器恢复点")
             try:
@@ -717,6 +982,7 @@ class RestoreTransaction:
             payload = temp / "Saved"
             payload.mkdir()
             try:
+                progress(38, "准备恢复内容", "正在解包、合并并校验恢复组件")
                 self._build_remote_payload(package, payload, plan.components, instance, client, admin_password, server_password, player_uid)
                 self._validate_staging(payload, plan.components)
             except Exception as exc:
@@ -733,6 +999,7 @@ class RestoreTransaction:
                 raise RuntimeError(f"远程恢复归档生成失败：{local_archive}")
             local_hash = _sha256(local_archive)
             try:
+                progress(58, "上传恢复包", "正在上传恢复归档并校验 SHA-256")
                 client.upload_file(local_archive, remote_archive)
             except Exception as exc:
                 raise _stage_error("上传远程恢复压缩包", exc) from exc
@@ -747,21 +1014,50 @@ class RestoreTransaction:
                     self._replace_remote_windows(client, saved_path, staging, rollback, remote_archive, "world" in plan.components)
                 else:
                     self._replace_remote_linux(client, saved_path, staging, rollback, remote_archive, "world" in plan.components)
+                progress(76, "替换远程存档", "远程暂存目录已校验，正在原子切换")
+                progress(82, "启动服务器", "正在启动远程服务器并等待服务就绪")
                 start()
-                if not health():
+                progress(90, "健康检查", "正在等待远程进程和游戏端口恢复")
+                if not self._wait_for_health(health):
                     raise RuntimeError("恢复后服务器健康检查失败")
+                progress(97, "清理恢复现场", "正在清理远程临时归档和回滚目录")
                 self._cleanup_remote(client, platform_name, rollback, remote_archive)
+                progress(100, "恢复完成", "远程存档已恢复，健康检查通过")
                 return RestoreResult(True, str(package), str(restore_point), plan.components, False, "远程恢复并完成健康检查")
             except Exception as exc:
+                progress(84, "自动回滚", "远程恢复失败，正在还原原存档并重启服务器")
                 try:
                     try: stop()
                     except Exception: pass
                     self._rollback_remote(client, platform_name, saved_path, rollback, staging, remote_archive)
                     start()
-                    if not health(): raise RuntimeError("回滚后健康检查失败")
+                    if not self._wait_for_health(health): raise RuntimeError("回滚后健康检查失败")
                 except Exception as rollback_exc:
                     raise RuntimeError(f"远程恢复失败且自动回滚失败：{rollback_exc}；原错误：{exc}") from exc
                 raise RuntimeError(f"远程恢复失败，已自动回滚：{exc}") from exc
+
+    @staticmethod
+    def _emit_progress(callback, percent: int, stage: str, message: str) -> None:
+        if callback is None:
+            return
+        try:
+            callback(max(0, min(100, int(percent))), stage, message)
+        except Exception:
+            # 进度显示不能影响恢复事务本身。
+            pass
+
+    @staticmethod
+    def _wait_for_health(health: Callable[[], bool], timeout_seconds: float = 45.0, interval_seconds: float = 2.0) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                if health():
+                    return True
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(interval_seconds)
 
     @staticmethod
     def _check_remote_paths(client, platform_name: str, saved_path: str) -> None:

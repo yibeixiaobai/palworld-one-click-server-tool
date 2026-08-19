@@ -358,3 +358,11 @@ def test_remote_restore_uses_platform_atomic_replace_and_verified_restore_point(
         upload_paths = [command for kind, command in client.commands if kind == "upload"]
         assert upload_paths and "/tmp/restore-" in upload_paths[0]
         assert "/srv/palworld/target/_tools" not in upload_paths[0]
+
+
+def test_remote_restore_waits_for_server_health_after_restart(monkeypatch):
+    checks = iter([False, False, True])
+    sleeps = []
+    monkeypatch.setattr("palworld_console.backup_packages.time.sleep", lambda seconds: sleeps.append(seconds))
+    assert RestoreTransaction._wait_for_health(lambda: next(checks), timeout_seconds=10, interval_seconds=2)
+    assert sleeps == [2, 2]
