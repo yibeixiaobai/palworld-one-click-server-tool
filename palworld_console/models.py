@@ -43,6 +43,40 @@ class ServerWorldTarget:
 
 
 @dataclass(frozen=True)
+class PlayerIdentityMapping:
+    old_guid: str
+    new_guid: str
+    old_name: str = ""
+    new_name: str = ""
+    old_instance_id: str = ""
+    confirmed: bool = False
+    new_instance_id: str = ""
+    status: str = "pending"
+
+
+@dataclass
+class CoopMigrationSession:
+    instance_id: str
+    source_path: str
+    target_world_path: str
+    phase: str = "source_ready"
+    source_players: tuple[dict[str, Any], ...] = ()
+    baseline_player_files: tuple[str, ...] = ()
+    placeholder_players: tuple[dict[str, Any], ...] = ()
+    mappings: tuple[PlayerIdentityMapping, ...] = ()
+    backup_path: str = ""
+    source_world_hash: str = ""
+    package_path: str = ""
+    package_hash: str = ""
+    target_snapshot_path: str = ""
+    target_world_hash: str = ""
+    target_kind: str = "local"
+    target_platform: str = "windows"
+    pending_player_guids: tuple[str, ...] = ()
+    detail: str = ""
+
+
+@dataclass(frozen=True)
 class LocalSteamCmdState:
     root: str
     executable: str

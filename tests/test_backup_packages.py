@@ -8,7 +8,7 @@ import pytest
 
 from palworld_console.backup_packages import BackupPackageService, BackupRepository, RestoreTransaction
 from palworld_console.config_ini import PalWorldSettings, settings_path
-from palworld_console.models import ServerInstance
+from palworld_console.models import CoopMigrationSession, PlayerIdentityMapping, ServerInstance
 from palworld_console.services import BackupService
 from palworld_console.save_codec import PluginParsedSave
 from palworld_console.management import SaveGameService
@@ -190,6 +190,83 @@ def test_local_restore_point_failure_restarts_original_service(tmp_path: Path, m
     assert calls == ["stop", "start"]
 
 
+def test_coop_migration_session_roundtrip_and_mapping_validation(tmp_path: Path):
+    service = BackupPackageService()
+    session = CoopMigrationSession(
+        instance_id="server", source_path=str(tmp_path / "source"), target_world_path=str(tmp_path / "target"),
+        phase="waiting_placeholders", source_players=({"player_guid": "A" * 32, "nickname": "Alice", "instance_id": "instance-a"}, {"player_guid": "C" * 32, "nickname": "Bob", "instance_id": "instance-c"}),
+        baseline_player_files=("A" * 32 + ".sav", "C" * 32 + ".sav"), placeholder_players=({"player_guid": "B" * 32, "nickname": "Alice", "instance_id": "instance-b"},),
+    )
+    service.save_migration_session(tmp_path, session)
+    loaded = service.load_migration_session(tmp_path, "server")
+    assert loaded is not None and loaded.phase == "waiting_placeholders"
+    with pytest.raises(ValueError, match="全部"):
+        service.build_identity_mappings(loaded, {"A" * 32: "B" * 32}, tmp_path)
+    loaded = CoopMigrationSession(**{**loaded.__dict__, "source_players": (loaded.source_players[0],)})
+    mapped = service.build_identity_mappings(loaded, {"A" * 32: "B" * 32}, tmp_path)
+    assert mapped.mappings == (PlayerIdentityMapping("A" * 32, "B" * 32, "Alice", "Alice", "instance-a", True, "instance-b", "confirmed"),)
+    duplicate_session = CoopMigrationSession(**{**loaded.__dict__, "source_players": ({"player_guid": "A" * 32}, {"player_guid": "C" * 32})})
+    with pytest.raises(ValueError, match="重复"):
+        service.build_identity_mappings(duplicate_session, {"A" * 32: "B" * 32, "C" * 32: "B" * 32}, tmp_path)
+
+
+def test_prepare_restore_migration_preserves_downloaded_target_snapshot(tmp_path: Path, monkeypatch):
+    service = BackupPackageService(); instance = ServerInstance(id="server")
+    source_saved = make_saved(tmp_path / "source", "SOURCE")
+    package = service.create(instance, source_saved, tmp_path / "packages")
+    migration_root = tmp_path / "app" / "migrations" / instance.id / "restore"
+    target_saved = make_saved(migration_root / "snapshot", "TARGET")
+    marker = migration_root / "snapshot" / "download-complete.marker"; marker.write_text("ok", encoding="utf-8")
+    source_player = {"player_guid": "A" * 32, "nickname": "Source", "instance_id": "source-instance"}
+    target_player = {"player_guid": "B" * 32, "nickname": "Target", "instance_id": "target-instance"}
+    monkeypatch.setattr("palworld_console.backup_packages.PlmCodecPlugin.probe", lambda _self: (True, "ready"))
+    monkeypatch.setattr(BackupPackageService, "inspect_world_players", staticmethod(lambda world, _root=None: (source_player,) if "source-world" in str(world) else (target_player,)))
+
+    session = service.prepare_restore_migration(package, instance, target_saved, str(target_saved / "SaveGames" / "0" / "TARGET"), tmp_path / "app")
+
+    assert marker.read_text(encoding="utf-8") == "ok"
+    assert Path(session.target_snapshot_path, "Level.sav").is_file()
+    assert session.source_players == (source_player,)
+    assert session.placeholder_players == (target_player,)
+
+
+def test_restore_mapping_keeps_completed_players_and_only_maps_pending(tmp_path: Path):
+    service = BackupPackageService()
+    completed = PlayerIdentityMapping("A" * 32, "B" * 32, status="migrated")
+    session = CoopMigrationSession(
+        instance_id="server", source_path="source", target_world_path="target", phase="mapping_ready",
+        source_players=({"player_guid": "A" * 32}, {"player_guid": "C" * 32, "instance_id": "old-c"}),
+        placeholder_players=({"player_guid": "D" * 32, "instance_id": "new-d"},), mappings=(completed,),
+        pending_player_guids=("C" * 32,),
+    )
+
+    updated = service.confirm_restore_mappings(session, {"C" * 32: "D" * 32}, tmp_path)
+
+    assert updated.pending_player_guids == ()
+    assert updated.mappings[0].status == "migrated"
+    assert updated.mappings[1].old_guid == "C" * 32
+    assert updated.mappings[1].status == "confirmed"
+
+
+def test_refresh_restore_placeholders_only_returns_players_added_after_baseline(tmp_path: Path, monkeypatch):
+    service = BackupPackageService(); saved = make_saved(tmp_path / "snapshot", "WORLD")
+    world = saved / "SaveGames" / "0" / "WORLD"; players = world / "Players"
+    existing = "A" * 32 + ".sav"; pending = "C" * 32 + ".sav"; placeholder = "D" * 32 + ".sav"
+    (players / existing).write_bytes(b"existing"); (players / pending).write_bytes(b"pending"); (players / placeholder).write_bytes(b"placeholder")
+    decoded = ({"player_guid": "A" * 32}, {"player_guid": "C" * 32}, {"player_guid": "D" * 32, "nickname": "New"})
+    monkeypatch.setattr(BackupPackageService, "inspect_world_players", staticmethod(lambda *_args: decoded))
+    session = CoopMigrationSession(
+        instance_id="server", source_path="old", target_world_path="target", phase="waiting_placeholders",
+        baseline_player_files=(existing.upper(), pending.upper()), pending_player_guids=("C" * 32,), package_path="backup.pwcbackup",
+    )
+
+    updated = service.refresh_restore_placeholders(session, saved, tmp_path / "app")
+
+    assert tuple(service._player_guid(item) for item in updated.placeholder_players) == ("D" * 32,)
+    assert updated.phase == "mapping_ready"
+    assert Path(updated.source_path, "Players", placeholder).is_file()
+
+
 class FakePlmPlugin:
     def __init__(self, fail=False): self.fail = fail; self.patch = None
     def apply_patch(self, _source, patch, output): self.patch = patch; Path(output).write_bytes(b"merged")
@@ -314,6 +391,78 @@ class RemoteRestoreClient:
         return 0, "", ""
 
 
+@pytest.mark.parametrize("platform_name", ["linux", "windows"])
+def test_remote_savegames_restore_creates_parent_before_upload(tmp_path: Path, platform_name: str):
+    saved = make_saved(tmp_path / "source", "WORLD-NESTED")
+    world = saved / "SaveGames" / "0" / "WORLD-NESTED"
+    nested = world / "Players" / "nested" / "profile.sav"; nested.parent.mkdir(parents=True); nested.write_bytes(b"nested")
+    package = BackupPackageService().create(ServerInstance(id="source"), saved, tmp_path / "packages")
+
+    class ParentAwareClient:
+        def __init__(self): self.parent_ready = False; self.events = []
+        def run(self, command):
+            self.events.append(("run", command))
+            if command.startswith("test -d"): return 0, "ok", ""
+            if command.startswith("mkdir -p"):
+                self.parent_ready = True; return 0, "", ""
+            if command.startswith("mv -f"):
+                self.parent_ready = False; return 0, "", ""
+            if command.startswith("rm -f"): return 0, "", ""
+            return 0, "", ""
+        def run_powershell(self, script):
+            self.events.append(("powershell", script))
+            if "Test-Path" in script: return 0, "ok", ""
+            if "New-Item -ItemType Directory" in script:
+                self.parent_ready = True; return 0, "", ""
+            if "Move-Item" in script:
+                self.parent_ready = False; return 0, "", ""
+            return 0, "", ""
+        def upload_file(self, local, remote):
+            if not self.parent_ready: raise FileNotFoundError(2, "No such file", remote)
+            assert Path(local).is_file()
+            self.events.append(("upload", remote))
+
+    client = ParentAwareClient(); calls = []
+    target = r"D:\Pal\Saved\SaveGames" if platform_name == "windows" else "/srv/pal/Pal/Saved/SaveGames"
+    result = RestoreTransaction().restore_savegames_remote(
+        package, target, client, platform_name, lambda: calls.append("stop"), lambda: calls.append("start")
+    )
+
+    assert result.restored is True
+    assert calls == ["stop", "start"]
+    uploads = [value for kind, value in client.events if kind == "upload"]
+    assert len(uploads) == 3
+    assert any("Players" in path and "nested" in path for path in uploads)
+
+
+def test_remote_savegames_restore_translates_sftp_errno_and_restarts(tmp_path: Path):
+    saved = make_saved(tmp_path / "source", "WORLD-ERROR")
+    package = BackupPackageService().create(ServerInstance(id="source"), saved, tmp_path / "packages")
+
+    class MissingPathClient:
+        def __init__(self): self.cleaned = False
+        def run(self, command):
+            if command.startswith("test -d"): return 0, "ok", ""
+            if command.startswith("mkdir -p"): return 0, "", ""
+            if command.startswith("rm -f"): self.cleaned = True; return 0, "", ""
+            return 0, "", ""
+        def upload_file(self, _local, remote):
+            raise FileNotFoundError(2, "No such file", remote)
+
+    client = MissingPathClient(); calls = []
+    with pytest.raises(RuntimeError) as raised:
+        RestoreTransaction().restore_savegames_remote(
+            package, "/srv/pal/Pal/Saved/SaveGames", client, "linux",
+            lambda: calls.append("stop"), lambda: calls.append("start"),
+        )
+
+    message = str(raised.value)
+    assert "失败阶段：上传远程临时文件" in message
+    assert "远程路径不存在或 SFTP 无法访问" in message
+    assert "[Errno 2]" not in message
+    assert calls == ["stop", "start"]
+    assert client.cleaned is True
+
 def make_legacy_remote_snapshot(path: Path, saved: Path, windows=False) -> Path:
     if windows:
         target = path / "remote-current.zip"
@@ -363,6 +512,10 @@ def test_remote_restore_uses_platform_atomic_replace_and_verified_restore_point(
 def test_remote_restore_waits_for_server_health_after_restart(monkeypatch):
     checks = iter([False, False, True])
     sleeps = []
+    waits = []
     monkeypatch.setattr("palworld_console.backup_packages.time.sleep", lambda seconds: sleeps.append(seconds))
-    assert RestoreTransaction._wait_for_health(lambda: next(checks), timeout_seconds=10, interval_seconds=2)
+    monotonic = iter([0.0, 1.0, 3.0])
+    monkeypatch.setattr("palworld_console.backup_packages.time.monotonic", lambda: next(monotonic))
+    assert RestoreTransaction._wait_for_health(lambda: next(checks), timeout_seconds=10, interval_seconds=2, on_wait=lambda elapsed, remaining: waits.append((elapsed, remaining)))
     assert sleeps == [2, 2]
+    assert waits == [(1.0, 9.0), (3.0, 7.0)]

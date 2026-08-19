@@ -97,3 +97,53 @@ def test_helper_decodes_complete_pal_guild_and_base_relationships(monkeypatch):
     assert decoded["guilds"][0]["base_ids"] == ["base-1"]
     assert decoded["bases"][0]["worker_pal_ids"] == [pal_id]
     assert decoded["bases"][0]["container_ids"] == ["items-1"]
+
+
+def test_identity_migration_removes_placeholder_before_rebinding_guild_and_pals(tmp_path: Path, monkeypatch):
+    core = types.ModuleType("palsav.core"); core.decompress_sav_to_gvas = lambda _data: (b"", 49); core.compress_gvas_to_sav = lambda data, _save_type: data
+    gvas = types.ModuleType("palsav.gvas"); gvas.GvasFile = object
+    paltypes = types.ModuleType("palsav.paltypes"); paltypes.PALWORLD_TYPE_HINTS = {}; paltypes.PALWORLD_CUSTOM_PROPERTIES = {}
+    monkeypatch.setitem(sys.modules, "palsav", types.ModuleType("palsav")); monkeypatch.setitem(sys.modules, "palsav.core", core); monkeypatch.setitem(sys.modules, "palsav.gvas", gvas); monkeypatch.setitem(sys.modules, "palsav.paltypes", paltypes)
+    namespace = {"__name__": "plm_helper_migration_test"}; exec(compile(PLM_HELPER, "plm_helper.py", "exec"), namespace)
+    old_clean = "a" * 32; new_clean = "b" * 32
+    old_uid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"; new_uid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    old_instance = "old-instance"; new_instance = "new-instance"
+    world = {
+        "CharacterSaveParameterMap": {"value": [
+            {"key": {"PlayerUId": {"value": old_uid}, "InstanceId": {"value": old_instance}}, "sp": {"IsPlayer": {"value": True}}},
+            {"key": {"PlayerUId": {"value": new_uid}, "InstanceId": {"value": new_instance}}, "sp": {"IsPlayer": {"value": True}}},
+            {"key": {"InstanceId": {"value": "old-pal"}}, "sp": {"OwnerPlayerUId": {"value": old_uid}}},
+            {"key": {"InstanceId": {"value": "temp-pal"}}, "sp": {"OwnerPlayerUId": {"value": new_uid}}},
+        ]},
+        "GroupSaveDataMap": {"value": [{"value": {"GroupType": {"value": "Guild"}, "RawData": {"value": {
+            "individual_character_handle_ids": [{"instance_id": old_instance, "guid": old_uid}, {"instance_id": new_instance, "guid": new_uid}],
+            "admin_player_uid": old_uid, "players": [{"player_uid": old_uid}, {"player_uid": new_uid}],
+        }}}}]},
+    }
+    class FakeGvas:
+        def __init__(self, properties=None): self.properties = properties or {}
+        def write(self, _types): return b"encoded"
+    player = FakeGvas({"SaveData": {"value": {
+        "PlayerUId": {"value": old_uid},
+        "IndividualId": {"value": {"PlayerUId": {"value": old_uid}, "InstanceId": {"value": old_instance}}},
+    }}})
+    source = tmp_path / "world"; (source / "Players").mkdir(parents=True)
+    (source / "Level.sav").write_bytes(b"level"); (source / "Players" / f"{old_clean.upper()}.sav").write_bytes(b"old"); (source / "Players" / f"{new_clean.upper()}.sav").write_bytes(b"new")
+    mapping = tmp_path / "mapping.json"; mapping.write_text(json.dumps({"format": "palworld-console-identity-migration-v1", "mappings": [{"old_guid": old_clean, "new_guid": new_clean, "old_instance_id": old_instance, "new_instance_id": new_instance}]}), encoding="utf-8")
+    namespace["load"] = lambda _path: (FakeGvas(), 49, world)
+    namespace["read_gvas"] = lambda _path: (player, 49)
+    namespace["save_parameter"] = lambda entry: entry["sp"]
+    namespace["enum_value"] = lambda value: "EPalGroupType::Guild" if value else ""
+    namespace["decode"] = lambda _path: {"players": [{"player_guid": new_clean.upper()}]}
+
+    report = namespace["migrate_identities"](source, mapping, tmp_path / "output")
+
+    entries = world["CharacterSaveParameterMap"]["value"]
+    assert {entry["key"]["InstanceId"]["value"] for entry in entries} == {old_instance, "old-pal"}
+    assert entries[0]["key"]["PlayerUId"]["value"] == new_uid
+    assert entries[1]["sp"]["OwnerPlayerUId"]["value"] == new_uid
+    guild = world["GroupSaveDataMap"]["value"][0]["value"]["RawData"]["value"]
+    assert guild["admin_player_uid"] == new_uid
+    assert guild["players"] == [{"player_uid": new_uid}]
+    assert guild["individual_character_handle_ids"] == [{"instance_id": old_instance, "guid": new_uid}]
+    assert report["players"][0]["placeholder_hits"] == 1

@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+import ntpath
 import platform
 import re
 import sys
 import threading
+import time
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt, QProcess, QTimer
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QPushButton, QPlainTextEdit, QProgressBar, QProgressDialog, QScrollArea, QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QLineEdit, QVBoxLayout, QWidget, QInputDialog, QAbstractItemView, QStackedWidget)
@@ -162,6 +164,9 @@ class MainWindow(QMainWindow):
         self.install_task_active = False
         self.active_task_kind = ""
         self.install_progress_value = 0
+        self.backup_task_started_at = 0.0
+        self.backup_task_last_progress_at = 0.0
+        self.backup_task_message = ""
         self.rest_tunnel: SSHTunnelManager | None = None
         self.rcon_tunnel: SSHTunnelManager | None = None
         self.current_players: list[PlayerRecord] = []
@@ -181,6 +186,7 @@ class MainWindow(QMainWindow):
         self.update_cancel: threading.Event | None = None
         self.update_progress_dialog: QProgressDialog | None = None
         self._build_ui()
+        self.backup_task_timer = QTimer(self); self.backup_task_timer.setInterval(1000); self.backup_task_timer.timeout.connect(self._backup_task_heartbeat)
         self._refresh_instances()
         self._restore_ui_state()
         if sys.platform == "win32" and getattr(sys, "frozen", False):
@@ -413,11 +419,23 @@ class MainWindow(QMainWindow):
         local_menu.addAction("选择存档文件", self.import_local_save_file)
         local_menu.addAction("选择存档文件夹", self.import_local_save_directory)
         local_import.setMenu(local_menu); row.addWidget(local_import); self.backup_action_buttons.append(local_import)
+        migration_button = QPushButton("联机角色迁移"); migration_menu = QMenu(migration_button)
+        migration_menu.addAction("从本地联机存档恢复", self.start_coop_migration)
+        migration_menu.addAction("继续玩家迁移", self.finish_coop_migration)
+        migration_button.setMenu(migration_menu); row.addWidget(migration_button); self.backup_action_buttons.append(migration_button)
         for text, handler in (("导出", self.export_selected_backup), ("校验报告", self.export_selected_backup_report), ("恢复", self.restore), ("校验", self.verify_selected_backup), ("添加备注", self.note_selected_backup), ("保护/解锁", self.toggle_selected_backup_protection), ("删除", self.delete_selected_backup), ("刷新", self.refresh_backup_list)):
             b = QPushButton(text); b.clicked.connect(handler); row.addWidget(b); self.backup_action_buttons.append(b)
         row.addStretch(); l.addLayout(row)
         self.backup_summary = QLabel("默认创建仅含 SaveGames 的世界导出包；完整灾备包会包含脱敏配置。计划备份默认关闭，启用后每天 04:00，保留最近 14 份。")
         self.backup_summary.setWordWrap(True); l.addWidget(self.backup_summary)
+        task_group = QGroupBox("备份、恢复与玩家迁移进度"); task_layout = QVBoxLayout(task_group)
+        task_header = QHBoxLayout(); self.backup_task_stage = QLabel("暂无任务"); self.backup_task_percent = QLabel("0%")
+        task_header.addWidget(self.backup_task_stage); task_header.addStretch(); task_header.addWidget(self.backup_task_percent)
+        self.backup_task_progress = QProgressBar(); self.backup_task_progress.setRange(0, 100); self.backup_task_progress.setValue(0); self.backup_task_progress.setTextVisible(False)
+        self.backup_task_message_label = QLabel("等待创建备份、恢复存档或迁移玩家"); self.backup_task_message_label.setWordWrap(True)
+        self.backup_task_elapsed = QLabel("未运行"); self.backup_task_elapsed.setStyleSheet("color:#66727d;")
+        task_layout.addLayout(task_header); task_layout.addWidget(self.backup_task_progress); task_layout.addWidget(self.backup_task_message_label); task_layout.addWidget(self.backup_task_elapsed)
+        l.addWidget(task_group)
         split = QSplitter(Qt.Vertical)
         self.backup_table = QTableWidget(0, 10); self.backup_table.setHorizontalHeaderLabels(["状态", "类型", "来源实例", "世界 ID", "游戏版本", "组件", "大小", "创建时间", "校验", "备注"])
         self.backup_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.backup_table.setSelectionMode(QAbstractItemView.SingleSelection); self.backup_table.setSortingEnabled(True)
@@ -938,6 +956,15 @@ class MainWindow(QMainWindow):
             self.install_progress.setRange(0, 100)
             self.install_progress.setValue(progress.percent)
             self.install_percent.setText(f"{progress.percent}%")
+        if hasattr(self, "backup_task_progress") and self.active_task_kind == "backup":
+            self.backup_task_last_progress_at = time.monotonic()
+            self.backup_task_message = progress.message or progress.stage
+            self.backup_task_stage.setText(progress.stage)
+            self.backup_task_message_label.setText(self.backup_task_message)
+            if progress.indeterminate:
+                self.backup_task_progress.setRange(0, 0); self.backup_task_percent.setText("处理中")
+            else:
+                self.backup_task_progress.setRange(0, 100); self.backup_task_progress.setValue(progress.percent); self.backup_task_percent.setText(f"{progress.percent}%")
 
     def _install_succeeded(self, message: str):
         self._set_install_progress(TaskProgress(100, "安装完成", message))
@@ -1123,19 +1150,39 @@ class MainWindow(QMainWindow):
         self.install_task_active = True; self.active_task_kind = "backup"; self._set_install_controls_enabled(False)
         self.navigation.setEnabled(False)
         for button in getattr(self, "backup_action_buttons", []): button.setEnabled(False)
+        self.backup_task_started_at = time.monotonic(); self.backup_task_last_progress_at = self.backup_task_started_at; self.backup_task_message = "正在准备备份任务"
+        self.backup_task_stage.setStyleSheet(""); self.backup_task_message_label.setStyleSheet(""); self.backup_task_elapsed.setText("已运行 0 秒")
+        self.backup_task_timer.start()
         self._set_install_progress(TaskProgress(0, label, "正在准备备份任务", True))
 
     def _finish_backup_task(self, success=True):
+        self.backup_task_timer.stop()
         self.install_task_active = False; self.active_task_kind = ""; self._set_install_controls_enabled(True)
         self.navigation.setEnabled(True)
         for button in getattr(self, "backup_action_buttons", []): button.setEnabled(True)
         self.install_progress.setRange(0, 100)
         if success:
             self.install_progress.setValue(100); self.install_percent.setText("100%")
+            self.backup_task_progress.setRange(0, 100); self.backup_task_progress.setValue(100); self.backup_task_percent.setText("100%")
+            self.backup_task_stage.setText("任务完成"); self.backup_task_stage.setStyleSheet("color:#18794e;font-weight:600;")
+        else:
+            self.backup_task_progress.setRange(0, 100); self.backup_task_progress.setValue(self.install_progress_value); self.backup_task_percent.setText(f"{self.install_progress_value}%")
+            self.backup_task_stage.setStyleSheet("color:#b42318;font-weight:600;")
+        if self.backup_task_started_at:
+            self.backup_task_elapsed.setText(f"总耗时 {max(0, int(time.monotonic() - self.backup_task_started_at))} 秒")
+
+    def _backup_task_heartbeat(self):
+        if self.active_task_kind != "backup" or not self.backup_task_started_at: return
+        now = time.monotonic(); elapsed = max(0, int(now - self.backup_task_started_at)); stale = max(0, int(now - self.backup_task_last_progress_at))
+        self.backup_task_elapsed.setText(f"已运行 {elapsed} 秒 · 最近进度更新 {stale} 秒前")
+        if stale >= 8:
+            self.backup_task_message_label.setText(f"{self.backup_task_message} · 远程操作仍在执行，请勿关闭程序")
 
     def _backup_task_failed(self, error):
         message = self._friendly_backup_error(error)
-        self.append_log(f"备份任务失败：{message}"); self.install_stage.setText("备份失败"); self.install_message.setText(message); self._finish_backup_task(False); QMessageBox.critical(self, "备份失败", message)
+        self.append_log(f"备份任务失败：{message}"); self.install_stage.setText("备份失败"); self.install_message.setText(message)
+        self.backup_task_stage.setText("任务失败"); self.backup_task_message_label.setText(message); self.backup_task_message = message
+        self._finish_backup_task(False); QMessageBox.critical(self, "备份失败", message)
 
     def _selected_backup_path(self):
         if not hasattr(self, "backup_table") or self.backup_table.currentRow() < 0: return None
@@ -1167,15 +1214,100 @@ class MainWindow(QMainWindow):
         if not ok or name != self.selected.name: return
         reason, ok = QInputDialog.getText(self, "恢复原因", "请输入恢复或迁服原因：")
         if not ok or not reason.strip(): return
-        selected = self.selected; admin = self.storage.get_secret(selected.admin_secret_ref); server_password = self.storage.get_secret(selected.server_password_secret_ref)
+        selected = self.selected
         if selected.kind == "local":
             savegames = Path(selected.install_dir).expanduser().resolve() / "Pal" / "Saved" / "SaveGames"
             if not savegames.is_dir():
                 return QMessageBox.critical(self, "恢复前预检失败", f"目标服务器尚未创建 SaveGames 目录：\n{savegames}")
         self._begin_backup_task("恢复服务器存档")
+        has_players = any("/players/" in entry.path.casefold() and entry.path.casefold().endswith(".sav") for entry in manifest.entries)
+        if has_players:
+            ready, detail = PlmCodecPlugin(self.storage.root).probe()
+            if not ready:
+                self._finish_backup_task(False)
+                return QMessageBox.critical(self, "无法迁移备份玩家", f"备份包含玩家角色，必须先启用 PlM 插件。\n{detail}")
+            worker = Worker(lambda signals: self._prepare_restore_migration_task(signals, selected, package), with_signals=True)
+            worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress)
+            worker.signals.finished.connect(lambda payload: self._restore_migration_prepared(payload, reason)); worker.signals.error.connect(self._restore_failed); self.pool.start(worker); return
         worker = Worker(lambda signals: self._run_restore_transaction(signals, selected, package, reason), with_signals=True)
         worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress)
         worker.signals.finished.connect(lambda result: self._restore_done(result, reason)); worker.signals.error.connect(self._restore_failed); self.pool.start(worker)
+
+    def _prepare_restore_migration_task(self, signals, selected, package):
+        service = BackupPackageService(); repository = self._backup_repository(); root = Path(self.storage.root) / "migrations" / selected.id / "restore"; snapshot_root = root / "snapshot"
+        import shutil
+        if snapshot_root.exists(): shutil.rmtree(snapshot_root)
+        snapshot_root.mkdir(parents=True)
+        signals.progress.emit(TaskProgress(5, "恢复预检", "正在保存目标服务器当前世界", False))
+        if selected.kind == "local":
+            lifecycle = self.lifecycle if isinstance(self.lifecycle, LocalServerLifecycle) else LocalServerLifecycle(selected, signals.log.emit)
+            signals.progress.emit(TaskProgress(8, "停止服务器", "正在停止本机服务器以取得一致性快照", True))
+            saved = Path(selected.install_dir).expanduser().resolve() / "Pal" / "Saved"; lifecycle.stop()
+            try:
+                signals.progress.emit(TaskProgress(12, "创建恢复点", "正在打包恢复前完整世界", True))
+                restore_point = service.create(selected, saved, repository.root, "restore-point", "恢复玩家迁移前自动恢复点")
+                repository.set_metadata(restore_point, protected=True, verified_at=datetime.now().isoformat(timespec="seconds"))
+                signals.progress.emit(TaskProgress(18, "复制当前世界", "正在复制服务器当前存档用于身份解析", True))
+                shutil.copytree(saved, snapshot_root / "Saved")
+            finally: lifecycle.start()
+            signals.progress.emit(TaskProgress(24, "解析玩家身份", "正在解析备份玩家与服务器已有玩家", True))
+            target = service.detect_server_world(saved / "SaveGames")
+            session = service.prepare_restore_migration(package, selected, snapshot_root / "Saved", target.world_path, self.storage.root, "local", "windows")
+            return session, str(restore_point)
+        client = self._remote_client(); lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit); install_dir = str(selected.remote_profile.get("install_dir") or selected.install_dir); platform_name = str(selected.remote_profile.get("platform") or "linux").lower()
+        signals.progress.emit(TaskProgress(8, "停止远程服务器", "正在停止服务器以创建一致性快照", True))
+        lifecycle.stop()
+        try:
+            signals.progress.emit(TaskProgress(12, "下载恢复前快照", "正在远程打包并通过 SFTP 下载当前世界", True))
+            raw = BackupService().create_remote(client, selected, snapshot_root, install_dir)
+        finally: lifecycle.start()
+        if raw is None: raise RuntimeError("无法创建远程恢复前快照")
+        signals.progress.emit(TaskProgress(20, "校验远程快照", "快照下载完成，正在安全解包并校验", True))
+        saved_snapshot = service.extract_saved_snapshot(raw, snapshot_root / "extracted")
+        restore_point = repository.import_source(raw, selected); repository.set_metadata(restore_point, protected=True, verified_at=datetime.now().isoformat(timespec="seconds"), note="恢复玩家迁移前自动恢复点")
+        signals.progress.emit(TaskProgress(26, "解析玩家身份", "正在解析备份玩家与远程服务器已有玩家", True))
+        local_target = service.detect_server_world(saved_snapshot / "SaveGames")
+        relative = Path(local_target.world_path).relative_to(saved_snapshot / "SaveGames").as_posix()
+        if platform_name == "windows":
+            from .services import WindowsRemotePath
+            savegames = WindowsRemotePath.normalize(install_dir).rstrip("\\/") + "\\Pal\\Saved\\SaveGames"; remote_world = ntpath.join(savegames, *relative.split("/"))
+        else:
+            savegames = install_dir.rstrip("/") + "/Pal/Saved/SaveGames"; remote_world = savegames + "/" + relative
+        session = service.prepare_restore_migration(package, selected, saved_snapshot, remote_world, self.storage.root, "remote", platform_name)
+        return session, str(restore_point)
+
+    def _restore_migration_prepared(self, payload, reason):
+        session, restore_point = payload; service = BackupPackageService(); targets = list(session.placeholder_players); options = ["稍后迁移（玩家进入恢复后的服务器创建临时角色）"]
+        self._set_install_progress(TaskProgress(30, "等待玩家映射确认", "请在弹出的映射窗口中逐项确认玩家身份", False))
+        options.extend(f"{service._player_guid(item)} · {item.get('nickname') or '未命名'}" for item in targets)
+        confirmations = {}; used = set()
+        for player in session.source_players:
+            old_guid = service._player_guid(player); old_name = str(player.get("nickname") or "未命名")
+            suggested = 0
+            matches = [index for index, target in enumerate(targets, 1) if str(target.get("nickname") or "").casefold() == old_name.casefold()]
+            if len(matches) == 1: suggested = matches[0]
+            choice, ok = QInputDialog.getItem(self, "恢复玩家身份映射", f"备份角色：{old_name} ({old_guid})\n请选择该玩家在目标服务器的登录身份：", options, suggested, False)
+            if not ok: self._finish_backup_task(False); return
+            if choice.startswith("稍后迁移"): continue
+            new_guid = choice.split(" · ", 1)[0]
+            if new_guid in used: self._finish_backup_task(False); return QMessageBox.critical(self, "映射冲突", "同一个目标服务器身份不能分配给多个备份角色。")
+            used.add(new_guid); confirmations[old_guid] = new_guid
+        try: session = service.confirm_restore_mappings(session, confirmations, self.storage.root)
+        except Exception as exc: self._finish_backup_task(False); return QMessageBox.critical(self, "玩家映射失败", str(exc))
+        summary = f"将恢复世界并立即迁移 {len(session.mappings)} 个玩家；另有 {len(session.pending_player_guids)} 个玩家需要恢复后创建临时角色。"
+        if QMessageBox.question(self, "确认恢复和玩家迁移", summary) != QMessageBox.Yes: self._finish_backup_task(False); return
+        selected = self.selected; worker = Worker(lambda signals: self._deploy_restore_migration_task(signals, selected, session, restore_point), with_signals=True)
+        worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress); worker.signals.finished.connect(lambda result: self._restore_done(result, reason)); worker.signals.error.connect(self._restore_failed); self.pool.start(worker)
+
+    def _deploy_restore_migration_task(self, signals, selected, session, restore_point):
+        service = BackupPackageService(); signals.progress.emit(TaskProgress(32, "构建迁移候选", "正在解析 Level.sav、迁移玩家身份并二次校验", True))
+        session, report = service.build_restore_candidate(session, self.storage.root); signals.log.emit(f"候选世界验证通过：迁移 {report.get('migrated', 0)} 个玩家")
+        signals.progress.emit(TaskProgress(35, "候选验证通过", f"已完成 {report.get('migrated', 0)} 个玩家身份迁移，准备部署", False))
+        if selected.kind == "local":
+            lifecycle = self.lifecycle if isinstance(self.lifecycle, LocalServerLifecycle) else LocalServerLifecycle(selected, signals.log.emit)
+            return service.deploy_restore_candidate_local(session, lifecycle.stop, lifecycle.start, lambda: lifecycle.status() == "running", self.storage.root, restore_point, lambda p, s, m: signals.progress.emit(TaskProgress(p, s, m, False)))
+        client = self._remote_client(); lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit)
+        return service.deploy_restore_candidate_remote(session, client, lifecycle.stop, lifecycle.start, lambda: self._remote_health_ok(selected), self.storage.root, restore_point, lambda p, s, m: signals.progress.emit(TaskProgress(p, s, m, False)))
 
     def _run_restore_transaction(self, signals, selected, package, reason=""):
         try:
@@ -1210,7 +1342,9 @@ class MainWindow(QMainWindow):
         if self.selected:
             AuditService.record(self.selected, "恢复存档", str(self._selected_backup_path() or ""), result="失败", detail=error); self.storage.save_instances(self.instances); self._render_audit()
         message = self._friendly_backup_error(error)
-        self.append_log(f"恢复失败：{message}"); self.install_stage.setText("恢复失败"); self.install_message.setText(message); self._finish_backup_task(False); self.refresh_backup_list(); QMessageBox.critical(self, "恢复失败", message)
+        self.append_log(f"恢复失败：{message}"); self.install_stage.setText("恢复失败"); self.install_message.setText(message)
+        self.backup_task_stage.setText("恢复失败"); self.backup_task_message_label.setText(message); self.backup_task_message = message
+        self._finish_backup_task(False); self.refresh_backup_list(); QMessageBox.critical(self, "恢复失败", message)
 
     def import_backup_file(self):
         if not self.selected: return
@@ -1284,6 +1418,124 @@ class MainWindow(QMainWindow):
 
     def _local_save_import_done(self, result):
         self.append_log(result.detail); self._finish_backup_task(); self.refresh_status(); self.load_save_snapshot(); QMessageBox.information(self, "本地存档导入完成", result.detail)
+
+    def start_coop_migration(self):
+        if not self.selected: return
+        source, _ = QFileDialog.getOpenFileName(self, "选择本地联机存档来源", "", "存档来源 (*.zip *.tar.gz *.tgz *.pwcbackup *.sav);;所有文件 (*)")
+        if not source:
+            source = QFileDialog.getExistingDirectory(self, "选择本地联机存档文件夹")
+        if not source: return
+        selected = self.selected; source = Path(source).expanduser().resolve()
+        if self.install_task_active: return QMessageBox.information(self, "任务进行中", "当前服务器任务尚未结束。")
+        self._begin_backup_task("准备本地联机存档恢复")
+        def task(signals):
+            package = self._backup_repository().import_source(source, selected, on_progress=lambda p, m: signals.progress.emit(TaskProgress(min(20, p // 5), "导入本地联机存档", m, False)))
+            return self._prepare_restore_migration_task(signals, selected, package)
+        worker = Worker(task, with_signals=True); worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress)
+        worker.signals.finished.connect(lambda payload: self._restore_migration_prepared(payload, "本地联机存档恢复")); worker.signals.error.connect(self._backup_task_failed); self.pool.start(worker)
+
+    def _coop_deploy_done(self, result, session):
+        self._finish_backup_task(); self.refresh_status(); self.append_log(f"本地联机世界已部署：{session.detail}"); QMessageBox.information(self, "等待玩家创建临时角色", "世界已部署到专用服务器。请所有需要迁移的玩家分别进入服务器创建一次临时角色，然后退出服务器。完成后使用“联机角色迁移 → 刷新临时角色并迁移”。")
+
+    def finish_coop_migration(self):
+        if not self.selected: return
+        service = BackupPackageService(); session = service.load_migration_session(self.storage.root, self.selected.id)
+        if not session: return QMessageBox.information(self, "角色迁移", "没有找到待处理的迁移会话，请先恢复包含玩家的存档或部署本地联机世界。")
+        if session.package_path:
+            if session.phase == "complete": return QMessageBox.information(self, "玩家迁移", "当前恢复会话中的玩家身份已经全部迁移完成。")
+            if session.phase not in {"waiting_placeholders", "mapping_ready"}: return QMessageBox.information(self, "玩家迁移", f"当前迁移阶段为：{session.phase}")
+            self._begin_backup_task("继续玩家迁移")
+            if session.phase == "mapping_ready" and session.placeholder_players:
+                self._restore_continuation_prepared(session); return
+            selected = self.selected
+            worker = Worker(lambda signals: self._prepare_restore_continuation_task(signals, selected, session), with_signals=True)
+            worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress)
+            worker.signals.finished.connect(self._restore_continuation_prepared); worker.signals.error.connect(self._backup_task_failed); self.pool.start(worker); return
+        if session.phase not in {"world_deployed", "waiting_placeholders", "mapping_ready"}: return QMessageBox.information(self, "角色迁移", f"当前迁移阶段为：{session.phase}")
+        try: session = service.refresh_coop_placeholders(session, self.storage.root)
+        except Exception as exc: return QMessageBox.critical(self, "刷新临时角色失败", str(exc))
+        if not session.placeholder_players: return QMessageBox.information(self, "尚未发现临时角色", "请让玩家进入专用服务器创建角色并退出后再刷新。")
+        options = [f"{str(item.get('player_guid') or item.get('player_uid') or '').replace('-', '').upper()} · {item.get('nickname') or '未命名'}" for item in session.placeholder_players]
+        confirmations = {}
+        try:
+            for player in session.source_players:
+                old = str(player.get("player_guid") or player.get("player_uid") or "").replace("-", "").upper(); old_name = player.get("nickname") or "未命名"
+                choice, ok = QInputDialog.getItem(self, "确认玩家映射", f"本地角色：{old_name} ({old})\n请选择对应的专服临时角色：", options, 0, False)
+                if not ok: return
+                confirmations[old] = choice.split(" · ", 1)[0]
+            session = service.build_identity_mappings(session, confirmations, self.storage.root)
+        except Exception as exc: return QMessageBox.critical(self, "玩家映射失败", str(exc))
+        if QMessageBox.question(self, "执行角色迁移", f"确认迁移 {len(session.mappings)} 个玩家角色？迁移会停止服务器并创建迁移前备份。") != QMessageBox.Yes: return
+        selected = self.selected; self._begin_backup_task("迁移玩家角色")
+        def task(signals):
+            lifecycle = self.lifecycle if isinstance(self.lifecycle, LocalServerLifecycle) else LocalServerLifecycle(selected, signals.log.emit)
+            return service.apply_coop_migration(session, lifecycle.stop, lifecycle.start, lambda: lifecycle.status() == "running", self.storage.root, lambda p, s, m: signals.progress.emit(TaskProgress(p, s, m, False)))
+        worker = Worker(task, with_signals=True); worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress); worker.signals.finished.connect(self._coop_migration_done); worker.signals.error.connect(self._backup_task_failed); self.pool.start(worker)
+
+    def _prepare_restore_continuation_task(self, signals, selected, session):
+        import shutil
+        service = BackupPackageService(); root = Path(self.storage.root) / "migrations" / selected.id / "restore" / "continuation-snapshot"
+        if root.exists(): shutil.rmtree(root)
+        root.mkdir(parents=True)
+        signals.progress.emit(TaskProgress(5, "保存当前世界", "正在取得恢复后服务器世界快照", False))
+        try:
+            self._rest_client().save()
+        except Exception as exc:
+            signals.log.emit(f"REST 保存世界未完成，将在停服后读取磁盘存档：{exc}")
+        if selected.kind == "local":
+            lifecycle = self.lifecycle if isinstance(self.lifecycle, LocalServerLifecycle) else LocalServerLifecycle(selected, signals.log.emit)
+            target_world = Path(session.target_world_path).expanduser().resolve(); lifecycle.stop()
+            try:
+                savegames = root / "SaveGames"; savegames.mkdir()
+                shutil.copytree(target_world, savegames / target_world.name)
+            finally:
+                lifecycle.start()
+            return service.refresh_restore_placeholders(session, root, self.storage.root)
+        client = self._remote_client(); lifecycle = _remote_lifecycle_for(selected, client, signals.log.emit)
+        install_dir = str(selected.remote_profile.get("install_dir") or selected.install_dir)
+        lifecycle.stop()
+        try:
+            archive = BackupService().create_remote(client, selected, root, install_dir)
+        finally:
+            lifecycle.start()
+        if archive is None: raise RuntimeError("无法下载恢复后的远程世界快照")
+        saved = service.extract_saved_snapshot(archive, root / "extracted")
+        return service.refresh_restore_placeholders(session, saved, self.storage.root)
+
+    def _restore_continuation_prepared(self, session):
+        service = BackupPackageService()
+        if not session.placeholder_players:
+            self._finish_backup_task(False)
+            return QMessageBox.information(self, "尚未发现临时角色", "请让待迁移玩家进入恢复后的服务器创建临时角色并退出，然后再次继续迁移。")
+        pending = set(session.pending_player_guids); targets = list(session.placeholder_players)
+        options = ["暂不迁移"] + [f"{service._player_guid(item)} · {item.get('nickname') or '未命名'}" for item in targets]
+        confirmations = {}; used = {item.new_guid for item in session.mappings if item.status == "migrated"}
+        for player in session.source_players:
+            old_guid = service._player_guid(player)
+            if old_guid not in pending: continue
+            old_name = str(player.get("nickname") or "未命名")
+            matches = [index for index, target in enumerate(targets, 1) if str(target.get("nickname") or "").casefold() == old_name.casefold()]
+            suggested = matches[0] if len(matches) == 1 else 0
+            choice, ok = QInputDialog.getItem(self, "继续玩家身份迁移", f"备份角色：{old_name} ({old_guid})\n请选择刚在服务器创建的临时角色：", options, suggested, False)
+            if not ok: self._finish_backup_task(False); return
+            if choice == "暂不迁移": continue
+            new_guid = choice.split(" · ", 1)[0]
+            if new_guid in used:
+                self._finish_backup_task(False); return QMessageBox.critical(self, "映射冲突", "同一个服务器身份不能分配给多个备份角色。")
+            used.add(new_guid); confirmations[old_guid] = new_guid
+        if not confirmations:
+            self._finish_backup_task(False); return QMessageBox.information(self, "未选择玩家", "本次没有确认任何玩家映射，服务器存档未修改。")
+        try: session = service.confirm_restore_mappings(session, confirmations, self.storage.root)
+        except Exception as exc: self._finish_backup_task(False); return QMessageBox.critical(self, "玩家映射失败", str(exc))
+        if QMessageBox.question(self, "执行玩家迁移", f"本次将迁移 {len(confirmations)} 个玩家；完成后仍有 {len(session.pending_player_guids)} 个玩家待处理。") != QMessageBox.Yes:
+            self._finish_backup_task(False); return
+        selected = self.selected
+        worker = Worker(lambda signals: self._deploy_restore_migration_task(signals, selected, session, session.backup_path), with_signals=True)
+        worker.signals.log.connect(self.append_log); worker.signals.progress.connect(self._set_install_progress)
+        worker.signals.finished.connect(lambda result: self._restore_done(result, "继续玩家迁移")); worker.signals.error.connect(self._restore_failed); self.pool.start(worker)
+
+    def _coop_migration_done(self, result):
+        self._finish_backup_task(); self.refresh_status(); self.load_save_snapshot(); self.append_log(result.detail); QMessageBox.information(self, "角色迁移完成", result.detail)
 
     @staticmethod
     def _friendly_backup_error(error) -> str:

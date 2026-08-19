@@ -61,6 +61,30 @@ def test_progress_widget_supports_indeterminate_and_determinate_states(window):
     assert window.install_percent.text() == "64%"
 
 
+def test_backup_page_mirrors_task_progress_and_heartbeat(window, monkeypatch):
+    clock = iter([100.0, 100.0, 103.0, 112.0, 115.0])
+    monkeypatch.setattr(ui_module.time, "monotonic", lambda: next(clock))
+
+    window._begin_backup_task("恢复服务器存档")
+    assert window.backup_task_stage.text() == "恢复服务器存档"
+    assert window.backup_task_progress.maximum() == 0
+    assert window.backup_task_percent.text() == "处理中"
+
+    window._set_install_progress(TaskProgress(35, "构建迁移候选", "正在解析 Level.sav", False))
+    assert window.backup_task_progress.maximum() == 100
+    assert window.backup_task_progress.value() == 35
+    assert window.backup_task_percent.text() == "35%"
+
+    window._backup_task_heartbeat()
+    assert "远程操作仍在执行" in window.backup_task_message_label.text()
+    assert "最近进度更新" in window.backup_task_elapsed.text()
+
+    window._finish_backup_task()
+    assert window.backup_task_progress.value() == 100
+    assert window.backup_task_stage.text() == "任务完成"
+    assert window.navigation.isEnabled()
+
+
 def test_update_check_states_and_automatic_failure(window, monkeypatch):
     messages = []
     logs = []

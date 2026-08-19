@@ -158,6 +158,8 @@ class RemoteHostClient:
     def __init__(self, host: str, username: str, password: str = "", port: int = 22, key_path: str = "", passphrase: str = ""):
         self.host, self.username, self.password, self.port = host, username, password, port
         self.key_path, self.passphrase = key_path, passphrase
+        self.command_timeout = 300
+        self.transfer_timeout = 300
 
     def _connect(self):
         try:
@@ -180,8 +182,11 @@ class RemoteHostClient:
         client = self._connect()
         try:
             _, stdout, stderr = client.exec_command(command)
+            stdout.channel.settimeout(self.command_timeout)
             output, errors = stdout.read().decode(errors="replace"), stderr.read().decode(errors="replace")
             return stdout.channel.recv_exit_status(), output, errors
+        except TimeoutError as exc:
+            raise RuntimeError(f"远程命令执行超过 {self.command_timeout} 秒，任务已终止") from exc
         finally:
             client.close()
 
@@ -254,7 +259,11 @@ Get-Service sshd
         try:
             sftp = client.open_sftp()
             try:
+                sftp.get_channel().settimeout(self.transfer_timeout)
                 sftp.get(self._sftp_path(remote_path), str(local_path))
+            except TimeoutError as exc:
+                local_path.unlink(missing_ok=True)
+                raise RuntimeError(f"远程文件下载超过 {self.transfer_timeout} 秒：{remote_path}") from exc
             finally:
                 sftp.close()
         finally:
@@ -265,7 +274,10 @@ Get-Service sshd
         try:
             sftp = client.open_sftp()
             try:
+                sftp.get_channel().settimeout(self.transfer_timeout)
                 sftp.put(str(local_path), self._sftp_path(remote_path))
+            except TimeoutError as exc:
+                raise RuntimeError(f"远程文件上传超过 {self.transfer_timeout} 秒：{remote_path}") from exc
             finally:
                 sftp.close()
         finally:

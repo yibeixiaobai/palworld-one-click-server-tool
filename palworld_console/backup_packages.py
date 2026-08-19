@@ -14,13 +14,14 @@ import tempfile
 import time
 import uuid
 import zipfile
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
 from .config_ini import PalWorldSettings
-from .models import BackupEntry, BackupManifest, LocalSaveSource, RestorePlan, RestoreResult, ServerInstance, ServerWorldTarget
+from .models import BackupEntry, BackupManifest, CoopMigrationSession, LocalSaveSource, PlayerIdentityMapping, RestorePlan, RestoreResult, ServerInstance, ServerWorldTarget
+from .save_codec import PlmCodecPlugin
 
 
 SCHEMA = "palworld-console-backup-v1"
@@ -396,6 +397,308 @@ class BackupPackageService:
                 try: start(); restart = "服务器已重新启动"
                 except Exception as start_exc: restart = f"服务器重新启动失败：{start_exc}"
                 raise RuntimeError(f"本地存档导入失败，已处理 {completed}/{len(files)} 个文件；{restart}；错误：{exc}") from exc
+
+    @staticmethod
+    def _migration_path(root: Path, instance_id: str) -> Path:
+        return Path(root) / "migrations" / f"{instance_id}.json"
+
+    @staticmethod
+    def save_migration_session(root: Path, session: CoopMigrationSession) -> Path:
+        target = BackupPackageService._migration_path(root, session.instance_id); target.parent.mkdir(parents=True, exist_ok=True)
+        payload = asdict(session); payload["mappings"] = [asdict(item) for item in session.mappings]; payload["source_players"] = list(session.source_players); payload["placeholder_players"] = list(session.placeholder_players)
+        temporary = target.with_suffix(".tmp"); temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"); os.replace(temporary, target); return target
+
+    @staticmethod
+    def load_migration_session(root: Path, instance_id: str) -> CoopMigrationSession | None:
+        path = BackupPackageService._migration_path(root, instance_id)
+        if not path.is_file(): return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")); payload["mappings"] = tuple(PlayerIdentityMapping(**item) for item in payload.get("mappings", [])); payload["source_players"] = tuple(payload.get("source_players", [])); payload["placeholder_players"] = tuple(payload.get("placeholder_players", [])); return CoopMigrationSession(**payload)
+        except (OSError, ValueError, TypeError): return None
+
+    @staticmethod
+    def inspect_world_players(world: Path, app_root: Path | None = None) -> tuple[dict, ...]:
+        level = Path(world) / "Level.sav"; players_dir = Path(world) / "Players"
+        if not level.is_file() or not players_dir.is_dir(): raise FileNotFoundError("世界目录缺少 Level.sav 或 Players")
+        plugin = PlmCodecPlugin(app_root); ready, detail = plugin.probe()
+        if not ready: raise RuntimeError(f"PlM 插件不可用：{detail}")
+        decoded = plugin.decode(level); return tuple(decoded.get("players", ()))
+
+    def prepare_coop_migration(self, source_world: Path, instance_id: str, target_world: Path, storage_root: Path) -> CoopMigrationSession:
+        players = self.inspect_world_players(source_world)
+        files = tuple(sorted(path.name for path in (Path(source_world) / "Players").glob("*.sav")))
+        session = CoopMigrationSession(instance_id=instance_id, source_path=str(Path(source_world).resolve()), target_world_path=str(Path(target_world).resolve()), phase="source_ready", source_players=players, baseline_player_files=files)
+        self.save_migration_session(storage_root, session); return session
+
+    def refresh_coop_placeholders(self, session: CoopMigrationSession, storage_root: Path) -> CoopMigrationSession:
+        current = {path.name for path in (Path(session.target_world_path) / "Players").glob("*.sav")}
+        added = sorted(current - set(session.baseline_player_files)); placeholders = []
+        try: placeholders = list(self.inspect_world_players(Path(session.target_world_path)))
+        except Exception: placeholders = []
+        placeholders = [item for item in placeholders if str(item.get("player_guid", "")).upper() + ".sav" in current and str(item.get("player_guid", "")).upper() + ".sav" not in session.baseline_player_files]
+        updated = replace(session, phase="mapping_ready" if added else "waiting_placeholders", placeholder_players=tuple(placeholders), detail="检测到临时角色：" + ", ".join(added) if added else "尚未检测到新建角色")
+        self.save_migration_session(storage_root, updated); return updated
+
+    def build_identity_mappings(self, session: CoopMigrationSession, confirmations: dict[str, str], storage_root: Path) -> CoopMigrationSession:
+        source_by_uid = {str(item.get("player_guid") or item.get("player_uid") or "").replace("-", "").upper(): item for item in session.source_players}; target_by_uid = {str(item.get("player_guid") or item.get("player_uid") or "").replace("-", "").upper(): item for item in session.placeholder_players}
+        mappings = []; used = set()
+        for old_guid, new_guid in confirmations.items():
+            old_key = str(old_guid).replace("-", "").upper(); new_key = str(new_guid).replace("-", "").upper()
+            if old_key not in source_by_uid or new_key not in target_by_uid: raise ValueError("玩家映射引用了不存在的角色")
+            if old_key == new_key or new_key in used: raise ValueError("玩家映射包含相同或重复的新 GUID")
+            used.add(new_key); source = source_by_uid[old_key]; target = target_by_uid[new_key]
+            mappings.append(PlayerIdentityMapping(old_guid=old_key, new_guid=new_key, old_name=str(source.get("nickname") or ""), new_name=str(target.get("nickname") or ""), old_instance_id=str(source.get("instance_id") or ""), new_instance_id=str(target.get("instance_id") or ""), confirmed=True, status="confirmed"))
+        if len(mappings) != len(source_by_uid): raise ValueError("必须确认全部本地角色的迁移映射")
+        updated = replace(session, phase="mapping_ready", mappings=tuple(mappings), detail=f"已确认 {len(mappings)} 个玩家映射"); self.save_migration_session(storage_root, updated); return updated
+
+    def apply_coop_migration(self, session: CoopMigrationSession, stop: Callable[[], None], start: Callable[[], None], health: Callable[[], bool] | None = None, storage_root: Path | None = None, on_progress: Callable[[int, str, str], None] | None = None) -> RestoreResult:
+        if session.phase != "mapping_ready" or not session.mappings or not all(item.confirmed for item in session.mappings):
+            raise ValueError("玩家映射尚未全部确认")
+        world = Path(session.target_world_path).expanduser().resolve()
+        source = Path(session.source_path).expanduser().resolve()
+        if not world.is_dir() or not (world / "Level.sav").is_file(): raise FileNotFoundError("目标世界目录不存在或缺少 Level.sav")
+        if not source.is_dir() or not (source / "Level.sav").is_file(): raise FileNotFoundError("本地世界目录不存在或缺少 Level.sav")
+        progress = lambda p, s, m: RestoreTransaction._emit_progress(on_progress, p, s, m)
+        ready, detail = PlmCodecPlugin().probe()
+        if not ready: raise RuntimeError(f"PlM 插件不可用：{detail}")
+        with tempfile.TemporaryDirectory(prefix="palworld-coop-migration-") as temp_name:
+            temp = Path(temp_name); candidate = temp / "world"; progress(5, "准备迁移", "正在校验本地和专服角色")
+            # Build the candidate from the current server world so untouched players and world data remain intact.
+            shutil.copytree(world, candidate)
+            report = PlmCodecPlugin().migrate_identities(candidate, [asdict(item) for item in session.mappings], temp / "migrated")
+            migrated = temp / "migrated"
+            if not migrated.is_dir(): raise RuntimeError("身份迁移未生成候选世界")
+            progress(25, "候选验证", f"已完成 {report.get('migrated', 0)} 个玩家身份重绑定")
+            backup = world.with_name(world.name + f".migration-backup-{uuid.uuid4().hex}")
+            stop()
+            try:
+                progress(40, "创建迁移前备份", "正在保存当前专服世界")
+                shutil.copytree(world, backup)
+                if world.exists(): shutil.rmtree(world)
+                shutil.copytree(migrated, world)
+                progress(80, "写入迁移结果", "正在启动专服并检查迁移后的存档")
+                start()
+                if health and not RestoreTransaction._wait_for_health(health, on_wait=lambda elapsed, remaining: progress(min(98, 90 + int(elapsed / 6)), "等待服务器就绪", f"服务器启动检查中，已等待 {int(elapsed)} 秒，最多再等待 {int(remaining)} 秒")): raise RuntimeError("迁移后服务器健康检查失败")
+                if storage_root:
+                    updated = replace(session, phase="complete", backup_path=str(backup), detail=f"已迁移 {report.get('migrated', 0)} 个玩家")
+                    self.save_migration_session(storage_root, updated)
+                progress(100, "迁移完成", f"已完成 {report.get('migrated', 0)} 个玩家身份迁移")
+                return RestoreResult(True, str(source), str(backup), ("world", "players"), False, f"已完成 {report.get('migrated', 0)} 个玩家身份迁移")
+            except Exception as exc:
+                try:
+                    if world.exists(): shutil.rmtree(world)
+                    if backup.exists(): backup.rename(world)
+                    start()
+                except Exception as rollback_exc:
+                    raise RuntimeError(f"角色迁移失败且回滚失败：{rollback_exc}；原错误：{exc}") from exc
+                raise RuntimeError(f"角色迁移失败，已恢复迁移前世界：{exc}") from exc
+
+    def prepare_restore_migration(
+        self,
+        package: Path,
+        instance: ServerInstance,
+        target_saved_snapshot: Path,
+        target_world_path: str,
+        storage_root: Path,
+        target_kind: str = "local",
+        target_platform: str = "windows",
+    ) -> CoopMigrationSession:
+        package = _require_file(Path(package), "备份文件"); manifest = self.validate(package)
+        root = Path(storage_root) / "migrations" / instance.id / "restore"
+        root.mkdir(parents=True, exist_ok=True)
+        extracted = root / "package"
+        source_world = root / "source-world"
+        target_snapshot_world = root / "target-before"
+        for path in (extracted, source_world, target_snapshot_world, root / "candidate-input", root / "candidate", root / "rollback"):
+            if path.exists(): shutil.rmtree(path)
+        extracted.mkdir(parents=True)
+        self.extract(package, extracted, ("world",))
+        source_candidates = self._world_candidates(extracted / "payload")
+        if not source_candidates: raise ValueError("备份中未找到包含 Level.sav 的世界目录")
+        shutil.copytree(max(source_candidates, key=lambda item: item[1].stat().st_mtime)[1], source_world)
+        source_player_files = tuple(sorted(path.name.upper() for path in (source_world / "Players").glob("*.sav"))) if (source_world / "Players").is_dir() else ()
+        if not source_player_files:
+            raise ValueError("备份不包含 Players 玩家文件，无需执行玩家迁移")
+        ready, detail = PlmCodecPlugin(storage_root).probe()
+        if not ready: raise RuntimeError(f"备份包含玩家，必须启用 PlM 插件后才能恢复：{detail}")
+        source_players = self.inspect_world_players(source_world, storage_root)
+        target_saved_snapshot = Path(target_saved_snapshot).resolve()
+        target = self.detect_server_world(target_saved_snapshot / "SaveGames" if (target_saved_snapshot / "SaveGames").is_dir() else target_saved_snapshot)
+        shutil.copytree(Path(target.world_path), target_snapshot_world)
+        if (target_snapshot_world / "Players").is_dir():
+            target_players = self.inspect_world_players(target_snapshot_world, storage_root)
+        else:
+            target_players = tuple(PlmCodecPlugin(storage_root).decode(target_snapshot_world / "Level.sav").get("players", ()))
+        session = CoopMigrationSession(
+            instance_id=instance.id, source_path=str(source_world), target_world_path=str(target_world_path), phase="mapping_ready",
+            source_players=source_players, baseline_player_files=source_player_files, placeholder_players=target_players,
+            package_path=str(package), package_hash=_sha256(package), source_world_hash=_sha256(source_world / "Level.sav"),
+            target_snapshot_path=str(target_snapshot_world), target_world_hash=_sha256(target_snapshot_world / "Level.sav"),
+            target_kind=target_kind, target_platform=target_platform, pending_player_guids=tuple(self._player_guid(item) for item in source_players),
+            detail=f"源玩家 {len(source_players)}，目标身份 {len(target_players)}",
+        )
+        self.save_migration_session(storage_root, session); return session
+
+    @staticmethod
+    def _player_guid(player: dict) -> str:
+        return str(player.get("player_guid") or player.get("player_uid") or "").replace("-", "").upper()
+
+    def confirm_restore_mappings(self, session: CoopMigrationSession, confirmations: dict[str, str], storage_root: Path) -> CoopMigrationSession:
+        source = {self._player_guid(item): item for item in session.source_players}; targets = {self._player_guid(item): item for item in session.placeholder_players}
+        completed = [item for item in session.mappings if item.status == "migrated"]
+        mappings = list(completed); used = {item.new_guid for item in completed}
+        allowed = set(session.pending_player_guids) if session.pending_player_guids else set(source)
+        for old_guid, new_guid in confirmations.items():
+            old_key = str(old_guid).replace("-", "").upper(); new_key = str(new_guid).replace("-", "").upper()
+            if not new_key: continue
+            if old_key not in source or old_key not in allowed or new_key not in targets: raise ValueError("玩家映射引用了不存在或已完成迁移的角色")
+            if old_key == new_key or new_key in used: raise ValueError("玩家映射包含相同或重复的新 GUID")
+            used.add(new_key); old = source[old_key]; new = targets[new_key]
+            mappings.append(PlayerIdentityMapping(old_guid=old_key, new_guid=new_key, old_name=str(old.get("nickname") or ""), new_name=str(new.get("nickname") or ""), old_instance_id=str(old.get("instance_id") or ""), confirmed=True, new_instance_id=str(new.get("instance_id") or ""), status="confirmed"))
+        pending = tuple(guid for guid in session.pending_player_guids if guid not in {item.old_guid for item in mappings}) if session.pending_player_guids else tuple(guid for guid in source if guid not in {item.old_guid for item in mappings})
+        updated = replace(session, mappings=tuple(mappings), pending_player_guids=pending, phase="candidate_ready", detail=f"已确认 {len(mappings)} 个映射，待后续迁移 {len(pending)} 个")
+        self.save_migration_session(storage_root, updated); return updated
+
+    def refresh_restore_placeholders(self, session: CoopMigrationSession, current_saved_snapshot: Path, storage_root: Path) -> CoopMigrationSession:
+        if session.phase != "waiting_placeholders": raise ValueError(f"当前会话阶段不能刷新临时角色：{session.phase}")
+        current_saved_snapshot = Path(current_saved_snapshot).resolve()
+        target = self.detect_server_world(current_saved_snapshot / "SaveGames" if (current_saved_snapshot / "SaveGames").is_dir() else current_saved_snapshot)
+        current_world = Path(target.world_path)
+        current_files = {path.name.upper() for path in (current_world / "Players").glob("*.sav")}
+        added = current_files - set(session.baseline_player_files)
+        players = self.inspect_world_players(current_world, storage_root)
+        placeholders = tuple(item for item in players if f"{self._player_guid(item)}.SAV" in added)
+        root = Path(storage_root) / "migrations" / session.instance_id / "restore"
+        current_copy = root / "current-world"
+        if current_copy.exists(): shutil.rmtree(current_copy)
+        shutil.copytree(current_world, current_copy)
+        phase = "mapping_ready" if placeholders else "waiting_placeholders"
+        detail = f"检测到 {len(placeholders)} 个新建临时角色" if placeholders else "尚未检测到新增临时角色"
+        updated = replace(
+            session, source_path=str(current_copy), source_world_hash=_sha256(current_copy / "Level.sav"),
+            target_snapshot_path=str(current_copy), target_world_hash=_sha256(current_copy / "Level.sav"),
+            placeholder_players=placeholders, phase=phase, detail=detail,
+        )
+        self.save_migration_session(storage_root, updated); return updated
+
+    def build_restore_candidate(self, session: CoopMigrationSession, storage_root: Path) -> tuple[CoopMigrationSession, dict]:
+        if _sha256(Path(session.package_path)) != session.package_hash or _sha256(Path(session.source_path) / "Level.sav") != session.source_world_hash:
+            raise RuntimeError("恢复包或源世界在确认映射后发生变化，请重新开始恢复")
+        root = Path(storage_root) / "migrations" / session.instance_id / "restore"; candidate_input = root / "candidate-input"; candidate = root / "candidate"
+        for path in (candidate_input, candidate):
+            if path.exists(): shutil.rmtree(path)
+        shutil.copytree(session.source_path, candidate_input)
+        target_players = Path(session.target_snapshot_path) / "Players"; candidate_players = candidate_input / "Players"; candidate_players.mkdir(exist_ok=True)
+        active_mappings = tuple(item for item in session.mappings if item.status == "confirmed")
+        for mapping in active_mappings:
+            source = target_players / f"{mapping.new_guid}.sav"
+            if not source.is_file(): raise FileNotFoundError(f"目标身份玩家文件不存在：{source.name}")
+            shutil.copy2(source, candidate_players / source.name)
+        if active_mappings:
+            report = PlmCodecPlugin(storage_root).migrate_identities(candidate_input, [asdict(item) for item in active_mappings], candidate)
+        else:
+            shutil.copytree(candidate_input, candidate); report = {"migrated": 0, "players": []}
+        decoded = self.inspect_world_players(candidate, storage_root)
+        active = [self._player_guid(item) for item in decoded]
+        for mapping in session.mappings:
+            if active.count(mapping.new_guid) != 1: raise RuntimeError(f"候选世界中的目标玩家 GUID 数量异常：{mapping.new_guid}")
+            if mapping.old_guid in active: raise RuntimeError(f"候选世界仍引用旧玩家 GUID：{mapping.old_guid}")
+        baseline = tuple(sorted(path.name.upper() for path in (candidate / "Players").glob("*.sav")))
+        updated = replace(session, phase="deploying", baseline_player_files=baseline, detail=f"候选验证通过，已迁移 {report.get('migrated', 0)} 个玩家")
+        self.save_migration_session(storage_root, updated); return updated, report
+
+    def extract_saved_snapshot(self, archive: Path, destination: Path) -> Path:
+        archive = _require_file(Path(archive), "服务器存档快照")
+        if destination.exists(): shutil.rmtree(destination)
+        destination.mkdir(parents=True)
+        if zipfile.is_zipfile(archive): self._extract_legacy_zip(archive, destination)
+        elif tarfile.is_tarfile(archive): self._extract_legacy_tar(archive, destination)
+        else: raise ValueError("服务器存档快照不是受支持的 ZIP/TAR 格式")
+        candidates = [path for path in (destination, *destination.rglob("*")) if path.is_dir() and (path / "SaveGames").is_dir()]
+        if not candidates: raise ValueError("服务器快照中未找到 Saved/SaveGames")
+        return min(candidates, key=lambda path: len(path.parts))
+
+    def deploy_restore_candidate_local(self, session: CoopMigrationSession, stop: Callable[[], None], start: Callable[[], None], health: Callable[[], bool], storage_root: Path, restore_point: str = "", on_progress: Callable[[int, str, str], None] | None = None) -> RestoreResult:
+        progress = lambda p, s, m: RestoreTransaction._emit_progress(on_progress, p, s, m)
+        target = Path(session.target_world_path).resolve(); candidate = Path(storage_root) / "migrations" / session.instance_id / "restore" / "candidate"
+        if not target.is_dir() or not candidate.is_dir(): raise FileNotFoundError("服务器目标世界或恢复候选不存在")
+        if _sha256(target / "Level.sav") != session.target_world_hash: raise RuntimeError("服务器存档在映射确认后发生变化，请重新执行恢复预检")
+        rollback = Path(storage_root) / "migrations" / session.instance_id / "restore" / "rollback"
+        if rollback.exists(): shutil.rmtree(rollback)
+        progress(35, "创建恢复点", "候选已验证，正在停止服务器")
+        stop()
+        try:
+            shutil.copytree(target, rollback)
+            replacement = target.with_name(target.name + f".restore-{uuid.uuid4().hex}"); shutil.copytree(candidate, replacement)
+            shutil.rmtree(target); replacement.rename(target)
+            progress(82, "启动服务器", "服务器世界已替换，正在等待健康检查")
+            start()
+            if not RestoreTransaction._wait_for_health(health, on_wait=lambda elapsed, remaining: progress(min(98, 82 + int(elapsed / 4)), "等待服务器就绪", f"服务器启动检查中，已等待 {int(elapsed)} 秒，最多再等待 {int(remaining)} 秒")): raise RuntimeError("恢复后服务器健康检查失败")
+            players = self.inspect_world_players(target, storage_root); active = [self._player_guid(item) for item in players]
+            for mapping in session.mappings:
+                if active.count(mapping.new_guid) != 1: raise RuntimeError(f"服务器复查未找到唯一目标玩家：{mapping.new_guid}")
+            phase = "waiting_placeholders" if session.pending_player_guids else "complete"
+            migrated = tuple(replace(item, status="migrated") if item.status == "confirmed" else item for item in session.mappings)
+            updated = replace(session, mappings=migrated, phase=phase, backup_path=restore_point or str(rollback), detail=f"世界恢复完成；已迁移 {len(migrated)} 个玩家；待迁移 {len(session.pending_player_guids)} 个")
+            self.save_migration_session(storage_root, updated); progress(100, "恢复完成", updated.detail)
+            return RestoreResult(True, session.package_path, updated.backup_path, ("world", "players"), False, updated.detail)
+        except Exception as exc:
+            try:
+                if target.exists(): shutil.rmtree(target)
+                if rollback.exists(): shutil.copytree(rollback, target)
+                start()
+            except Exception as rollback_exc: raise RuntimeError(f"恢复失败且回滚失败：{rollback_exc}；原错误：{exc}") from exc
+            raise RuntimeError(f"恢复失败，已恢复原世界：{exc}") from exc
+
+    def deploy_restore_candidate_remote(self, session: CoopMigrationSession, client, stop: Callable[[], None], start: Callable[[], None], health: Callable[[], bool], storage_root: Path, restore_point: str = "", on_progress: Callable[[int, str, str], None] | None = None) -> RestoreResult:
+        from .services import RemoteHostClient
+        progress = lambda p, s, m: RestoreTransaction._emit_progress(on_progress, p, s, m); platform_name = session.target_platform.lower()
+        candidate = Path(storage_root) / "migrations" / session.instance_id / "restore" / "candidate"
+        if not candidate.is_dir(): raise FileNotFoundError("恢复候选目录不存在")
+        check = Path(storage_root) / "migrations" / session.instance_id / "restore" / "remote-current-Level.sav"; check.parent.mkdir(parents=True, exist_ok=True)
+        remote_level = ntpath.join(session.target_world_path, "Level.sav") if platform_name == "windows" else f"{session.target_world_path}/Level.sav"
+        client.download_file(remote_level, check)
+        if _sha256(check) != session.target_world_hash: raise RuntimeError("远程服务器存档在映射确认后发生变化，请重新执行恢复预检")
+        token = uuid.uuid4().hex; archive = check.parent / ("candidate.zip" if platform_name == "windows" else "candidate.tar.gz")
+        if platform_name == "windows":
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as bundle:
+                for path in candidate.rglob("*"):
+                    if path.is_file(): bundle.write(path, path.relative_to(candidate).as_posix())
+            remote_archive = ntpath.join(ntpath.dirname(session.target_world_path), f"restore-{token}.zip")
+        else:
+            with tarfile.open(archive, "w:gz") as bundle:
+                for path in candidate.iterdir(): bundle.add(path, arcname=path.name, recursive=True)
+            remote_archive = f"/tmp/palworld-restore-{token}.tar.gz"
+        progress(48, "上传候选世界", f"正在上传候选归档：{archive.name}")
+        client.upload_file(archive, remote_archive); rollback = session.target_world_path + f".rollback-{token}"; staging = session.target_world_path + f".restore-{token}"
+        progress(55, "上传候选世界", "候选世界已上传，正在停止服务器")
+        stop()
+        try:
+            if platform_name == "windows":
+                q = RemoteHostClient._ps_literal
+                script = f"$ErrorActionPreference='Stop';$target={q(session.target_world_path)};$stage={q(staging)};$rollback={q(rollback)};Remove-Item -LiteralPath $stage,$rollback -Recurse -Force -ErrorAction SilentlyContinue;New-Item -ItemType Directory -Force -Path $stage|Out-Null;Expand-Archive -LiteralPath {q(remote_archive)} -DestinationPath $stage -Force;if(-not(Test-Path -LiteralPath (Join-Path $stage 'Level.sav'))){{throw '候选世界缺少 Level.sav'}};Move-Item -LiteralPath $target -Destination $rollback;Move-Item -LiteralPath $stage -Destination $target"
+                code, output, error = client.run_powershell(script)
+            else:
+                script = f"set -euo pipefail; rm -rf -- {shlex.quote(staging)} {shlex.quote(rollback)}; mkdir -p -- {shlex.quote(staging)}; tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(staging)}; test -s {shlex.quote(staging + '/Level.sav')}; mv -- {shlex.quote(session.target_world_path)} {shlex.quote(rollback)}; mv -- {shlex.quote(staging)} {shlex.quote(session.target_world_path)}"
+                code, output, error = client.run(script)
+            if code: raise RuntimeError(error.strip() or output.strip() or "远程候选世界替换失败")
+            progress(82, "启动服务器", "远程世界已替换，正在等待健康检查"); start()
+            if not RestoreTransaction._wait_for_health(health, on_wait=lambda elapsed, remaining: progress(min(96, 82 + int(elapsed / 4)), "等待远程服务器就绪", f"远程服务器启动检查中，已等待 {int(elapsed)} 秒，最多再等待 {int(remaining)} 秒")): raise RuntimeError("远程恢复后服务器健康检查失败")
+            readback = check.parent / "remote-readback-Level.sav"; client.download_file(remote_level, readback)
+            decoded = PlmCodecPlugin(storage_root).decode(readback); active = [self._player_guid(item) for item in decoded.get("players", [])]
+            for mapping in session.mappings:
+                if active.count(mapping.new_guid) != 1: raise RuntimeError(f"远程服务器复查未找到唯一目标玩家：{mapping.new_guid}")
+            phase = "waiting_placeholders" if session.pending_player_guids else "complete"; migrated = tuple(replace(item, status="migrated") if item.status == "confirmed" else item for item in session.mappings); detail = f"世界恢复完成；已迁移 {len(migrated)} 个玩家；待迁移 {len(session.pending_player_guids)} 个"
+            updated = replace(session, mappings=migrated, phase=phase, backup_path=restore_point, detail=detail); self.save_migration_session(storage_root, updated)
+            RestoreTransaction._cleanup_remote(client, platform_name, rollback, remote_archive); progress(100, "恢复完成", detail)
+            return RestoreResult(True, session.package_path, restore_point, ("world", "players"), False, detail)
+        except Exception as exc:
+            try:
+                try: stop()
+                except Exception: pass
+                RestoreTransaction._rollback_remote(client, platform_name, session.target_world_path, rollback, staging, remote_archive); start()
+            except Exception as rollback_exc: raise RuntimeError(f"远程恢复失败且回滚失败：{rollback_exc}；原错误：{exc}") from exc
+            raise RuntimeError(f"远程恢复失败，已恢复原世界：{exc}") from exc
 
     def import_source(self, source: Path, instance: ServerInstance, destination: Path, backup_type: str = "world", on_progress: Callable[[int, str], None] | None = None) -> Path:
         source = Path(source).expanduser().resolve()
@@ -815,29 +1118,58 @@ class RestoreTransaction:
                 code, output, error = client.run(f"test -d {shlex.quote(target_savegames)} && printf ok || printf missing")
             if code or output.strip().splitlines()[-1:] != ["ok"]:
                 raise FileNotFoundError(f"目标服务器尚未创建 SaveGames 目录：{target_savegames}")
-            stop(); completed = 0; token = uuid.uuid4().hex
+            stop(); completed = 0; token = uuid.uuid4().hex; failed_relative = ""; remote_tmp = ""; failed_stage = ""
             try:
                 progress(25, "停止服务器", "服务器已停止，开始逐文件上传替换")
                 for source in files:
                     relative = source.relative_to(source_root).as_posix()
+                    failed_relative = relative
+                    failed_stage = "读取本地解包文件"
+                    if not source.is_file(): raise FileNotFoundError(f"解包后的备份文件不存在：{source}")
                     remote = ntpath.join(target_savegames, *relative.split("/")) if platform_name == "windows" else f"{target_savegames.rstrip('/')}/{relative}"
                     remote_tmp = remote + f".restore-{token}-{completed}.tmp"
+                    failed_stage = "创建远程目标父目录"
+                    if platform_name == "windows":
+                        q = RemoteHostClient._ps_literal; parent = ntpath.dirname(remote)
+                        code, output, error = client.run_powershell(f"$ErrorActionPreference='Stop';New-Item -ItemType Directory -Force -Path {q(parent)}|Out-Null")
+                    else:
+                        parent = remote.rsplit("/", 1)[0]
+                        code, output, error = client.run(f"mkdir -p -- {shlex.quote(parent)}")
+                    if code: raise RuntimeError(error.strip() or output.strip() or f"无法创建远程目录：{parent}")
+                    failed_stage = "上传远程临时文件"
+                    progress(30 + round(completed / len(files) * 60), "上传 SaveGames 文件", f"正在上传 {completed + 1}/{len(files)}：{relative}")
                     client.upload_file(source, remote_tmp)
+                    failed_stage = "原子替换目标文件"
                     if platform_name == "windows":
                         q = RemoteHostClient._ps_literal
-                        script = f"$p={q(remote)};$t={q(remote_tmp)};New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p)|Out-Null;Move-Item -LiteralPath $t -Destination $p -Force"
+                        script = f"$ErrorActionPreference='Stop';Move-Item -LiteralPath {q(remote_tmp)} -Destination {q(remote)} -Force"
                         code, output, error = client.run_powershell(script)
                     else:
-                        code, output, error = client.run(f"mkdir -p -- $(dirname {shlex.quote(remote)}) && mv -f -- {shlex.quote(remote_tmp)} {shlex.quote(remote)}")
+                        code, output, error = client.run(f"mv -f -- {shlex.quote(remote_tmp)} {shlex.quote(remote)}")
                     if code: raise RuntimeError(error.strip() or output.strip() or f"写入失败：{relative}")
-                    completed += 1; progress(30 + round(completed / len(files) * 60), "替换 SaveGames", f"已处理 {completed}/{len(files)} 个文件：{relative}")
+                    completed += 1; remote_tmp = ""; failed_relative = ""; failed_stage = ""
+                    progress(30 + round(completed / len(files) * 60), "替换 SaveGames", f"已处理 {completed}/{len(files)} 个文件：{relative}")
                 progress(92, "启动服务器", "正在启动服务器")
                 start(); progress(100, "恢复完成", f"已覆盖 {completed}/{len(files)} 个 SaveGames 文件")
                 return RestoreResult(True, str(package), "", ("world",), False, f"已覆盖 {completed}/{len(files)} 个 SaveGames 文件")
             except Exception as exc:
+                if remote_tmp:
+                    try:
+                        if platform_name == "windows":
+                            client.run_powershell(f"Remove-Item -LiteralPath {RemoteHostClient._ps_literal(remote_tmp)} -Force -ErrorAction SilentlyContinue")
+                        else:
+                            client.run(f"rm -f -- {shlex.quote(remote_tmp)}")
+                    except Exception:
+                        pass
                 try: start(); restart = "服务器已重新启动"
                 except Exception as start_exc: restart = f"服务器重新启动失败：{start_exc}"
-                raise RuntimeError(f"远程 SaveGames 恢复失败，已处理 {completed}/{len(files)} 个文件；{restart}；错误：{exc}") from exc
+                failure = f"；失败文件：{failed_relative}；失败阶段：{failed_stage}" if failed_relative else ""
+                if isinstance(exc, OSError) and getattr(exc, "errno", None) == 2:
+                    missing = getattr(exc, "filename", None) or remote_tmp or failed_relative
+                    detail = f"远程路径不存在或 SFTP 无法访问：{missing}。程序已尝试创建目标父目录，请检查远程安装路径和 SSH 用户写入权限"
+                else:
+                    detail = str(exc)
+                raise RuntimeError(f"远程 SaveGames 恢复失败，已处理 {completed}/{len(files)} 个文件{failure}；{restart}；错误：{detail}") from exc
 
     def execute_local(
         self,
@@ -1018,7 +1350,7 @@ class RestoreTransaction:
                 progress(82, "启动服务器", "正在启动远程服务器并等待服务就绪")
                 start()
                 progress(90, "健康检查", "正在等待远程进程和游戏端口恢复")
-                if not self._wait_for_health(health):
+                if not self._wait_for_health(health, on_wait=lambda elapsed, remaining: progress(min(96, 90 + int(elapsed / 8)), "等待服务器就绪", f"远程服务器启动检查中，已等待 {int(elapsed)} 秒，最多再等待 {int(remaining)} 秒")):
                     raise RuntimeError("恢复后服务器健康检查失败")
                 progress(97, "清理恢复现场", "正在清理远程临时归档和回滚目录")
                 self._cleanup_remote(client, platform_name, rollback, remote_archive)
@@ -1031,7 +1363,7 @@ class RestoreTransaction:
                     except Exception: pass
                     self._rollback_remote(client, platform_name, saved_path, rollback, staging, remote_archive)
                     start()
-                    if not self._wait_for_health(health): raise RuntimeError("回滚后健康检查失败")
+                    if not self._wait_for_health(health, on_wait=lambda elapsed, remaining: progress(88, "验证回滚", f"正在确认回滚后的服务器状态，已等待 {int(elapsed)} 秒")): raise RuntimeError("回滚后健康检查失败")
                 except Exception as rollback_exc:
                     raise RuntimeError(f"远程恢复失败且自动回滚失败：{rollback_exc}；原错误：{exc}") from exc
                 raise RuntimeError(f"远程恢复失败，已自动回滚：{exc}") from exc
@@ -1047,15 +1379,19 @@ class RestoreTransaction:
             pass
 
     @staticmethod
-    def _wait_for_health(health: Callable[[], bool], timeout_seconds: float = 45.0, interval_seconds: float = 2.0) -> bool:
-        deadline = time.monotonic() + timeout_seconds
+    def _wait_for_health(health: Callable[[], bool], timeout_seconds: float = 45.0, interval_seconds: float = 2.0, on_wait: Callable[[float, float], None] | None = None) -> bool:
+        started = time.monotonic(); deadline = started + timeout_seconds
         while True:
             try:
                 if health():
                     return True
             except Exception:
                 pass
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if on_wait:
+                try: on_wait(now - started, max(0.0, deadline - now))
+                except Exception: pass
+            if now >= deadline:
                 return False
             time.sleep(interval_seconds)
 
