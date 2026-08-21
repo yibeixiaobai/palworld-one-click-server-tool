@@ -38,8 +38,9 @@ def _write_xgp_world(root, save_id="A1", players=("0001",)):
 
 
 class FakeCodec:
-    def __init__(self):
+    def __init__(self, payload=None):
         self.calls = []
+        self.payload = payload
 
     def convert_file(self, source: Path, output: Path):
         self.calls.append((Path(source), Path(output)))
@@ -56,6 +57,8 @@ class FakeCodec:
         return {"steam_id": "76561198000000000", "palworld_uid": "ABCD", "nosteam_uid": "1234"}
 
     def decode(self, _level: Path):
+        if self.payload is not None:
+            return self.payload
         return {
             "players": [
                 {"player_uid": "42", "pals": [{"individual_id": "pal-a", "level": 90, "melee": 120}]},
@@ -347,3 +350,31 @@ def test_palbox_expansion_builds_verified_world_and_protects_existing_output(tmp
     assert report["new_slots"] == 960
     assert (destination / "Level.sav").read_bytes() == b"level"
     assert Path(report["backup"]).joinpath("old.txt").read_text() == "old"
+
+
+def test_exclusions_are_normalized_and_persisted(tmp_path: Path):
+    service = SaveToolsService(tmp_path, codec=FakeCodec())
+    saved = service.save_exclusions({"players": [" B ", "A", "A"], "guilds": ["g1"], "bases": []})
+    assert saved == {"players": ["A", "B"], "guilds": ["g1"], "bases": []}
+    assert service.load_exclusions() == saved
+
+
+def test_base_blueprint_export_and_inspection(tmp_path: Path):
+    world = tmp_path / "world"; world.mkdir(); (world / "Level.sav").write_bytes(b"x")
+    payload = {"players": [], "guilds": [], "bases": [{"base_id": "base-1", "name": "North", "guild_id": "g1", "position": {"x": 1, "y": 2, "z": 3}, "worker_pal_ids": ["pal-1"], "container_ids": ["c1"]}]}
+    service = SaveToolsService(tmp_path, codec=FakeCodec(payload))
+    output = tmp_path / "base.json"
+    report = service.export_base_blueprint(world, "base-1", output)
+    assert report["base_id"] == "base-1"
+    assert service.inspect_base_blueprint(output)["worker_count"] == 1
+
+
+def test_cleanup_plan_respects_exclusions(tmp_path: Path):
+    world = tmp_path / "world"; world.mkdir(); (world / "Level.sav").write_bytes(b"x")
+    payload = {"players": [{"player_guid": "A", "last_seen": 1}], "guilds": [{"guild_id": "g1", "players": []}], "bases": [{"base_id": "b1", "guild_id": ""}]}
+    service = SaveToolsService(tmp_path, codec=FakeCodec(payload))
+    plan = service.build_cleanup_plan(world, {"players": ["A"], "guilds": [], "bases": []})
+    assert plan["read_only"] is True
+    assert plan["candidates"]["inactive_players"] == []
+    assert plan["candidates"]["empty_guilds"] == ["g1"]
+    assert plan["candidates"]["orphan_bases"] == ["b1"]

@@ -483,6 +483,8 @@ class MainWindow(QMainWindow):
             ("恢复地图迷雾", self.restore_save_map, "备份并清除 LocalData.sav 的迷雾与隐藏地点标志，保留地图标记。"),
             ("扩容 Palbox", self.expand_save_palbox, "按稳定玩家身份扩展 Palbox 槽位，生成经过二次解析的新世界目录。"),
             ("地图与存档诊断", self.open_save_diagnostics, "解析玩家、公会、基地和帕鲁关系并显示基地坐标。"),
+            ("清理预览", self.preview_save_cleanup, "按排除列表生成只读清理候选，不直接修改存档。"),
+            ("导出基地蓝图", self.export_base_blueprint_dialog, "将基地结构、坐标、工作帕鲁和容器关系导出为可审阅 JSON。"),
         ):
             button = QPushButton(text); button.setToolTip(tip); button.clicked.connect(handler); cl.addWidget(button)
         cl.addStretch(); l.addWidget(conversion)
@@ -497,6 +499,37 @@ class MainWindow(QMainWindow):
         ready, detail = PlmCodecPlugin(self.storage.root).probe(); self.save_tool_engine_status = QLabel(("存档 helper 可用：" if ready else "存档 helper 只读降级：") + detail); self.save_tool_engine_status.setWordWrap(True); self.save_tool_engine_status.setStyleSheet("color:#087f5b;" if ready else "color:#8a4b08;"); sl.addWidget(self.save_tool_engine_status)
         self.save_tool_result = QPlainTextEdit(); self.save_tool_result.setReadOnly(True); self.save_tool_result.setMaximumHeight(120); self.save_tool_result.setPlaceholderText("转换、迁移和校验结果将在这里显示"); sl.addWidget(self.save_tool_result); l.addWidget(status)
         return w
+
+    def preview_save_cleanup(self):
+        source = self._current_save_tool_source()
+        if source is None: return
+        try:
+            service = SaveToolsService(self.storage.root)
+            plan = service.build_cleanup_plan(source)
+            self.save_tool_result.setPlainText(json.dumps(plan, ensure_ascii=False, indent=2))
+            self._set_save_tool_progress(TaskProgress(100, "清理预览完成", "仅生成候选，未修改存档"))
+        except Exception as exc:
+            self._save_tool_failed(str(exc))
+
+    def export_base_blueprint_dialog(self):
+        source = self._current_save_tool_source()
+        if source is None: return
+        try:
+            service = SaveToolsService(self.storage.root)
+            source = service.materialize_source(source, getattr(self, "save_tool_selected_world_id", ""))
+            _level, payload = service.load_world_snapshot(source)
+            bases = [base for base in payload.get("bases", []) if base.get("base_id")]
+            if not bases: return QMessageBox.information(self, "导出基地蓝图", "当前世界没有可导出的基地。")
+            labels = [f"{base.get('name') or '未命名基地'} · {base['base_id']}" for base in bases]
+            label, ok = QInputDialog.getItem(self, "选择基地", "要导出的基地：", labels, 0, False)
+            if not ok: return
+            output, _ = QFileDialog.getSaveFileName(self, "保存基地蓝图", "base-blueprint.json", "基地蓝图 (*.json)")
+            if not output: return
+            report = service.export_base_blueprint(source, bases[labels.index(label)]["base_id"], Path(output))
+            self.save_tool_result.setPlainText(json.dumps(report, ensure_ascii=False, indent=2))
+            self._set_save_tool_progress(TaskProgress(100, "基地蓝图已导出", report["output"]))
+        except Exception as exc:
+            self._save_tool_failed(str(exc))
 
     def _backup_tab(self):
         w = QWidget(); l = QVBoxLayout(w); row = QHBoxLayout()

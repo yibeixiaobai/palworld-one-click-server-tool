@@ -40,6 +40,88 @@ class SaveToolsService:
         self.storage_root = Path(storage_root or Path.home() / ".palworld-console")
         self.package_root = self.storage_root / "conversion-packages"
         self.codec = codec or PlmCodecPlugin(self.storage_root)
+        self.exclusions_path = self.storage_root / "save-tool-exclusions.json"
+
+    def load_exclusions(self) -> dict[str, list[str]]:
+        """Load persistent cleanup exclusions used by administrator workflows."""
+        try:
+            payload = json.loads(self.exclusions_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            payload = {}
+        return {
+            key: sorted({str(value).strip() for value in payload.get(key, []) if str(value).strip()})
+            for key in ("players", "guilds", "bases")
+        }
+
+    def save_exclusions(self, exclusions: dict[str, list[str]]) -> dict[str, list[str]]:
+        """Persist normalized player/guild/base IDs atomically."""
+        normalized = {
+            key: sorted({str(value).strip() for value in exclusions.get(key, []) if str(value).strip()})
+            for key in ("players", "guilds", "bases")
+        }
+        self.exclusions_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.exclusions_path.with_name(self.exclusions_path.name + f".{uuid.uuid4().hex}.tmp")
+        try:
+            temp.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temp, self.exclusions_path)
+        finally:
+            temp.unlink(missing_ok=True)
+        return normalized
+
+    def export_base_blueprint(self, source: Path, base_id: str, output: Path) -> dict:
+        """Export a portable, redacted base blueprint from a decoded world."""
+        _level, payload = self.load_world_snapshot(source)
+        wanted = str(base_id).strip()
+        base = next((item for item in payload.get("bases", []) if str(item.get("base_id") or "") == wanted), None)
+        if base is None:
+            raise ValueError(f"找不到基地：{wanted}")
+        blueprint = {
+            "format": "palworld-console-base-blueprint-v1",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "base": json.loads(json.dumps(base, ensure_ascii=False)),
+        }
+        output = Path(output).expanduser().resolve(); output.parent.mkdir(parents=True, exist_ok=True)
+        temp = output.with_name(output.name + f".{uuid.uuid4().hex}.tmp")
+        try:
+            temp.write_text(json.dumps(blueprint, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temp, output)
+        finally:
+            temp.unlink(missing_ok=True)
+        return {"format": blueprint["format"], "base_id": wanted, "output": str(output), "sha256": _sha256(output)}
+
+    @staticmethod
+    def inspect_base_blueprint(path: Path) -> dict:
+        path = Path(path).expanduser().resolve()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"基地蓝图不是有效 JSON：{exc}") from exc
+        if payload.get("format") != "palworld-console-base-blueprint-v1":
+            raise ValueError("不支持的基地蓝图格式")
+        base = payload.get("base")
+        if not isinstance(base, dict) or not str(base.get("base_id") or ""):
+            raise ValueError("基地蓝图缺少稳定 base_id")
+        return {"base_id": str(base["base_id"]), "name": str(base.get("name") or ""), "guild_id": str(base.get("guild_id") or ""), "position": dict(base.get("position") or {}), "worker_count": len(base.get("worker_pal_ids") or []), "container_count": len(base.get("container_ids") or [])}
+
+    def build_cleanup_plan(self, source: Path, exclusions: dict[str, list[str]] | None = None, inactive_days: int = 30) -> dict:
+        """Produce a deterministic, reviewable cleanup plan without mutating a save."""
+        _level, payload = self.load_world_snapshot(source)
+        excluded = exclusions if exclusions is not None else self.load_exclusions()
+        excluded = {key: {str(value) for value in excluded.get(key, [])} for key in ("players", "guilds", "bases")}
+        cutoff = datetime.now(timezone.utc).timestamp() - max(0, int(inactive_days)) * 86400
+        def old(item: dict) -> bool:
+            for key in ("last_seen", "last_login", "last_online"):
+                value = item.get(key)
+                if isinstance(value, (int, float)):
+                    return float(value) < cutoff
+            return False
+        players = list(payload.get("players") or []); guilds = list(payload.get("guilds") or []); bases = list(payload.get("bases") or [])
+        player_ids = [self._player_guid(item) for item in players]
+        duplicate_players = sorted({uid for uid in player_ids if uid and player_ids.count(uid) > 1})
+        empty_guilds = sorted(str(item.get("guild_id") or "") for item in guilds if item.get("guild_id") and not (item.get("players") or item.get("member_uids")))
+        orphan_bases = sorted(str(item.get("base_id") or "") for item in bases if item.get("base_id") and not str(item.get("guild_id") or ""))
+        inactive_players = sorted(self._player_guid(item) for item in players if self._player_guid(item) and old(item))
+        return {"source": str(Path(source).expanduser().resolve()), "inactive_days": int(inactive_days), "excluded": {key: sorted(values) for key, values in excluded.items()}, "candidates": {"duplicate_players": [uid for uid in duplicate_players if uid not in excluded["players"]], "inactive_players": [uid for uid in inactive_players if uid not in excluded["players"]], "empty_guilds": [gid for gid in empty_guilds if gid not in excluded["guilds"]], "orphan_bases": [bid for bid in orphan_bases if bid not in excluded["bases"]]}, "mutations": 0, "read_only": True}
 
     def detect_sources(self) -> tuple[LocalSaveSource, ...]:
         sources = list(BackupPackageService().detect_local_save_sources())
