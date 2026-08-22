@@ -130,3 +130,24 @@ def test_player_repository_migrates_legacy_pals_table_without_losing_rows(tmp_pa
     assert "individual_id" in columns
     assert repository.connection.execute("SELECT COUNT(*) FROM pals").fetchone()[0] == 1
     repository.close()
+
+
+def test_player_repository_purge_player_removes_all_role_details(tmp_path):
+    repository = PlayerRepository(tmp_path / "players.db")
+    payload = {"players": [{"player_uid": "200", "nickname": "Alice", "pals": [{"individual_id": "pal-1"}], "items": {"CommonContainerId": [{"SlotIndex": 0, "ItemId": "wood"}]}}], "guilds": [{"guild_id": "g1", "players": [{"player_uid": "200"}]}], "bases": []}
+    repository.upsert_save_snapshot("server-1", payload)
+    repository.audit_player("server-1", "200", "测试")
+    counts = repository.purge_player("server-1", "200")
+    assert counts["players"] == 1
+    assert repository.player_detail("server-1", "200") == {}
+    assert repository.connection.execute("SELECT COUNT(*) FROM player_audit_events WHERE player_uid='200'").fetchone()[0] == 0
+    repository.close()
+
+
+def test_player_repository_purge_instance_clears_world_cache(tmp_path):
+    repository = PlayerRepository(tmp_path / "players.db")
+    repository.upsert_save_snapshot("server-1", {"players": [{"player_uid": "200"}], "guilds": [{"guild_id": "g1", "players": []}], "bases": [{"base_id": "b1", "guild_id": "g1"}]})
+    repository.purge_instance("server-1")
+    assert repository.list_players("server-1") == []
+    assert repository.connection.execute("SELECT COUNT(*) FROM guilds WHERE instance_id='server-1'").fetchone()[0] == 0
+    repository.close()

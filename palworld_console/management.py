@@ -338,7 +338,8 @@ class SaveTransaction:
                 validation = self.service.validate(candidate)
                 if not validation.valid:
                     raise RuntimeError("存档二次解析失败: " + "; ".join(validation.errors))
-                os.replace(candidate, save_path)
+                shutil.copy2(candidate, save_path)
+                candidate.unlink(missing_ok=True)
                 deployed = True
             start()
             if not health():

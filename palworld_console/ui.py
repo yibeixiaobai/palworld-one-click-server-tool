@@ -3,13 +3,14 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
+import json
 import ntpath
 import platform
 import re
 import sys
 import threading
 import time
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt, QProcess, QTimer
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt, QProcess, QTimer, QItemSelectionModel
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGraphicsScene, QGraphicsView, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox, QPushButton, QPlainTextEdit, QProgressBar, QProgressDialog, QScrollArea, QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem, QLineEdit, QVBoxLayout, QWidget, QInputDialog, QAbstractItemView, QStackedWidget)
 from PySide6.QtCore import QSettings
@@ -30,7 +31,8 @@ from .wine_migration import WineMigrationPreflight, WineMigrationService
 from .settings_schema import CATEGORIES, PRESETS, SETTING_BY_KEY, SETTING_DEFINITIONS
 from .storage import AppStorage
 from .backup_packages import BackupPackageService, BackupRepository, RestoreTransaction
-from .save_tools import SaveToolsService
+from .save_tools import CleanupSelection, SaveToolsService
+from .world_transactions import WorldDirectoryTransaction
 from .updater import ReleaseInfo, UpdateService
 
 
@@ -168,6 +170,56 @@ class SaveDiagnosticsDialog(QDialog):
             for column, value in enumerate((finding.severity, finding.category, finding.object_type, finding.object_id, finding.message, "是" if finding.repairable else "否")): table.setItem(row, column, QTableWidgetItem(str(value)))
         split.addWidget(table); split.setSizes([360, 240])
         buttons = QDialogButtonBox(QDialogButtonBox.Close); buttons.rejected.connect(self.reject); layout.addWidget(buttons)
+
+
+class CleanupPlanDialog(QDialog):
+    def __init__(self, plan: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("存档清理预览")
+        self.resize(820, 520)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"离线阈值：{plan.get('inactive_days', 30)} 天。重复 UID 仅诊断，不可勾选；默认不选择任何候选。"))
+        self.persist_exclusions = QCheckBox("将本次未选择的可执行候选加入持久化排除列表")
+        layout.addWidget(self.persist_exclusions)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["选择", "类别", "对象", "关联关系", "状态", "ID"])
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        for item in plan.get("items", []):
+            row = self.table.rowCount(); self.table.insertRow(row)
+            check = QTableWidgetItem(); check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            selectable = bool(item.get("selectable")); check.setCheckState(Qt.Unchecked)
+            if not selectable: check.setFlags(Qt.ItemIsEnabled); check.setToolTip(item.get("blocked_reason") or "不可执行")
+            self.table.setItem(row, 0, check)
+            self.table.setItem(row, 1, QTableWidgetItem({"inactive_player": "长期离线玩家", "duplicate_player": "重复玩家", "empty_guild": "空公会", "orphan_base": "孤立基地"}.get(item.get("kind"), str(item.get("kind")))))
+            self.table.setItem(row, 2, QTableWidgetItem(str(item.get("label") or item.get("id"))))
+            self.table.setItem(row, 3, QTableWidgetItem(str(item.get("relation") or "-")))
+            status = "可执行" if selectable else str(item.get("blocked_reason") or "排除项")
+            self.table.setItem(row, 4, QTableWidgetItem(status)); self.table.setItem(row, 5, QTableWidgetItem(str(item.get("id") or "")))
+            self.table.item(row, 0).setData(Qt.UserRole, item)
+        layout.addWidget(self.table, 1)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept); self.buttons.rejected.connect(self.reject); layout.addWidget(self.buttons)
+
+    def selection(self) -> CleanupSelection:
+        players=[]; guilds=[]; bases=[]
+        for row in range(self.table.rowCount()):
+            check=self.table.item(row,0); meta=check.data(Qt.UserRole) if check else {}
+            if check and check.checkState() == Qt.Checked:
+                if meta.get("kind") == "inactive_player": players.append(str(meta.get("id")))
+                elif meta.get("kind") == "empty_guild": guilds.append(str(meta.get("id")))
+                elif meta.get("kind") == "orphan_base": bases.append(str(meta.get("id")))
+        return CleanupSelection(tuple(players), tuple(guilds), tuple(bases))
+
+    def exclusions_for_unchecked(self) -> dict[str, list[str]]:
+        result = {"players": [], "guilds": [], "bases": []}
+        if not self.persist_exclusions.isChecked(): return result
+        for row in range(self.table.rowCount()):
+            check = self.table.item(row, 0); meta = check.data(Qt.UserRole) if check else {}
+            if check and check.checkState() != Qt.Checked and meta.get("selectable"):
+                key = {"inactive_player": "players", "empty_guild": "guilds", "orphan_base": "bases"}.get(meta.get("kind"))
+                if key: result[key].append(str(meta.get("id")))
+        return result
 
 
 class MainWindow(QMainWindow):
@@ -384,7 +436,9 @@ class MainWindow(QMainWindow):
         inventory_editor = QHBoxLayout(); self.inventory_selected_label = QLabel("选择背包槽位后可修改数量"); inventory_editor.addWidget(self.inventory_selected_label, 1); self.inventory_quantity = QSpinBox(); self.inventory_quantity.setRange(0, 999999); inventory_editor.addWidget(self.inventory_quantity); self.stage_inventory_button = QPushButton("加入修改草稿"); self.stage_inventory_button.clicked.connect(self.stage_selected_inventory); inventory_editor.addWidget(self.stage_inventory_button); inv_l.addLayout(inventory_editor); self.player_inventory_tab_index = self.player_detail_tabs.addTab(inventory, "背包 0")
         relations = QWidget(); rel_l = QVBoxLayout(relations); self.player_relations_summary = QLabel("尚未载入公会与基地关系"); self.player_relations_summary.setWordWrap(True); rel_l.addWidget(self.player_relations_summary); rel_split = QSplitter(Qt.Vertical); self.player_guild_members_table = QTableWidget(0, 3); self.player_guild_members_table.setHorizontalHeaderLabels(["公会成员", "角色 UID", "身份"]); self.player_guild_members_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_guild_members_table.horizontalHeader().setStretchLastSection(True); rel_split.addWidget(self.player_guild_members_table); self.player_bases_table = QTableWidget(0, 7); self.player_bases_table.setHorizontalHeaderLabels(["基地", "基地 ID", "坐标", "工作帕鲁", "工作容器", "关联容器", "状态"]); self.player_bases_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents); self.player_bases_table.horizontalHeader().setStretchLastSection(True); rel_split.addWidget(self.player_bases_table); rel_split.setSizes([220, 320]); rel_l.addWidget(rel_split, 1); self.player_relations_tab_index = self.player_detail_tabs.addTab(relations, "公会与基地 0")
         operations = QWidget(); op_l = QVBoxLayout(operations); operation_row = QHBoxLayout();
-        for text, handler in (("广播", self.broadcast), ("踢出", self.kick_player), ("封禁", self.ban_player), ("按 ID 解封", self.unban_player), ("保存世界", self.rest_save)): b=QPushButton(text); b.clicked.connect(handler); operation_row.addWidget(b)
+        for text, handler in (("广播", self.broadcast), ("踢出", self.kick_player), ("封禁", self.ban_player), ("按 ID 解封", self.unban_player), ("保存世界", self.rest_save)):
+            b=QPushButton(text); b.clicked.connect(handler); operation_row.addWidget(b)
+        self.clear_player_button = QPushButton("清除当前角色"); self.clear_player_button.setStyleSheet("color:#b42318;"); self.clear_player_button.clicked.connect(self.clear_current_player); operation_row.addWidget(self.clear_player_button)
         operation_row.addStretch(); op_l.addLayout(operation_row); op_l.addWidget(QLabel("踢出、封禁和存档写回会记录审计；高风险写回必须输入实例名称与操作原因。")); op_l.addStretch(); self.player_detail_tabs.addTab(operations, "管理操作")
         save_actions = QHBoxLayout(); self.preview_save_button = QPushButton("预览差异"); self.preview_save_button.clicked.connect(self.preview_save_changes); save_actions.addWidget(self.preview_save_button); revert = QPushButton("撤销全部修改"); revert.clicked.connect(self.revert_save_changes); save_actions.addWidget(revert); self.apply_save_button = QPushButton("保存到服务器"); self.apply_save_button.clicked.connect(self.apply_save_changes); self.apply_save_button.setStyleSheet("color:#b42318;"); save_actions.addWidget(self.apply_save_button); self.retry_save_button = QPushButton("重试上次保存"); self.retry_save_button.clicked.connect(self.apply_save_changes); self.retry_save_button.setVisible(False); save_actions.addWidget(self.retry_save_button); save_actions.addStretch(); dl.addLayout(save_actions)
         self.player_view_stack.addWidget(self.player_detail_page); self.player_view_stack.setCurrentWidget(self.player_list_page); self.save_document = None; self.save_scalar_values = {}; self.save_working_path = None; self._refresh_plm_plugin_status(); self._refresh_localization_status(); self.player_detail_tabs.setEnabled(False); return w
@@ -501,13 +555,21 @@ class MainWindow(QMainWindow):
         return w
 
     def preview_save_cleanup(self):
-        source = self._current_save_tool_source()
-        if source is None: return
+        if not self.selected: return QMessageBox.information(self, "清理预览", "请先选择服务器实例。")
         try:
-            service = SaveToolsService(self.storage.root)
-            plan = service.build_cleanup_plan(source)
-            self.save_tool_result.setPlainText(json.dumps(plan, ensure_ascii=False, indent=2))
-            self._set_save_tool_progress(TaskProgress(100, "清理预览完成", "仅生成候选，未修改存档"))
+            source = self._world_local_path()
+            service = SaveToolsService(self.storage.root, PlmCodecPlugin(self.storage.root))
+            inactive_days, ok = QInputDialog.getInt(self, "清理阈值", "长期未活动天数：", 30, 0, 3650)
+            if not ok: return
+            plan = service.build_cleanup_plan(source, inactive_days=inactive_days)
+            dialog = CleanupPlanDialog(plan, self)
+            if dialog.exec() != QDialog.Accepted: return
+            selection = dialog.selection()
+            if dialog.persist_exclusions.isChecked():
+                current = service.load_exclusions(); pending = dialog.exclusions_for_unchecked()
+                service.save_exclusions({key: sorted(set(current.get(key, [])) | set(pending.get(key, []))) for key in ("players", "guilds", "bases")})
+            self.save_tool_result.setPlainText(json.dumps({"plan": plan, "selection": selection.to_dict()}, ensure_ascii=False, indent=2))
+            self._run_world_cleanup(selection, "按清理预览执行")
         except Exception as exc:
             self._save_tool_failed(str(exc))
 
@@ -541,8 +603,21 @@ class MainWindow(QMainWindow):
         import_button = QPushButton("导入"); import_menu = QMenu(import_button)
         import_menu.addAction("导入文件", self.import_backup_file); import_menu.addAction("导入 Saved/SaveGames 目录", self.import_backup_directory)
         import_button.setMenu(import_menu); row.addWidget(import_button); self.backup_action_buttons.append(import_button)
-        for text, handler in (("导出", self.export_selected_backup), ("校验报告", self.export_selected_backup_report), ("恢复", self.restore), ("校验", self.verify_selected_backup), ("添加备注", self.note_selected_backup), ("保护/解锁", self.toggle_selected_backup_protection), ("删除", self.delete_selected_backup), ("刷新", self.refresh_backup_list)):
+        for text, handler in (("导出", self.export_selected_backup), ("校验报告", self.export_selected_backup_report), ("恢复", self.restore), ("校验", self.verify_selected_backup), ("添加备注", self.note_selected_backup), ("保护/解锁", self.toggle_selected_backup_protection), ("删除", self.delete_selected_backup), ("重置当前世界", self.reset_current_world), ("刷新", self.refresh_backup_list)):
             b = QPushButton(text); b.clicked.connect(handler); row.addWidget(b); self.backup_action_buttons.append(b)
+        select_button = QPushButton("选择")
+        select_menu = QMenu(select_button)
+        select_menu.addAction("全选", self.select_all_backups)
+        select_menu.addAction("反选", self.invert_backup_selection)
+        select_menu.addAction("清空选择", self.clear_backup_selection)
+        select_button.setMenu(select_menu); row.addWidget(select_button); self.backup_action_buttons.append(select_button)
+        batch_button = QPushButton("批量操作")
+        batch_menu = QMenu(batch_button)
+        batch_menu.addAction("批量校验", self.verify_selected_backups)
+        batch_menu.addAction("批量保护/解除保护", self.toggle_selected_backups_protection)
+        batch_menu.addAction("批量导出", self.export_selected_backups)
+        batch_menu.addAction("批量删除", self.delete_selected_backups)
+        batch_button.setMenu(batch_menu); row.addWidget(batch_button); self.backup_action_buttons.append(batch_button)
         row.addStretch(); l.addLayout(row)
         self.backup_summary = QLabel("默认创建仅含 SaveGames 的世界导出包；完整灾备包会包含脱敏配置。计划备份默认关闭，启用后每天 04:00，保留最近 14 份。")
         self.backup_summary.setWordWrap(True); l.addWidget(self.backup_summary)
@@ -556,9 +631,11 @@ class MainWindow(QMainWindow):
         l.addWidget(task_group)
         split = QSplitter(Qt.Vertical)
         self.backup_table = QTableWidget(0, 10); self.backup_table.setHorizontalHeaderLabels(["状态", "类型", "来源实例", "世界 ID", "游戏版本", "组件", "大小", "创建时间", "校验", "备注"])
-        self.backup_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.backup_table.setSelectionMode(QAbstractItemView.SingleSelection); self.backup_table.setSortingEnabled(True)
+        self.backup_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.backup_table.setSelectionMode(QAbstractItemView.ExtendedSelection); self.backup_table.setSortingEnabled(True)
         self.backup_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch); self.backup_table.horizontalHeader().setSectionResizeMode(9, QHeaderView.Stretch)
+        self.backup_selection_label = QLabel("已选择 0 个备份；恢复操作要求单选")
         self.backup_table.itemSelectionChanged.connect(self.show_backup_details); split.addWidget(self.backup_table)
+        l.addWidget(self.backup_selection_label)
         self.backup_details = QPlainTextEdit(); self.backup_details.setReadOnly(True); self.backup_details.setPlaceholderText("选择备份查看文件、校验和可恢复组件"); split.addWidget(self.backup_details); split.setSizes([420, 220]); l.addWidget(split); return w
 
     def _ops_tab(self):
@@ -1310,9 +1387,106 @@ class MainWindow(QMainWindow):
         self._finish_backup_task(False); QMessageBox.critical(self, "备份失败", message)
 
     def _selected_backup_path(self):
-        if not hasattr(self, "backup_table") or self.backup_table.currentRow() < 0: return None
-        item = self.backup_table.item(self.backup_table.currentRow(), 0)
-        return Path(str(item.data(Qt.UserRole))) if item and item.data(Qt.UserRole) else None
+        paths = self._selected_backup_paths()
+        return paths[0] if paths else None
+
+    def _selected_backup_paths(self) -> list[Path]:
+        if not hasattr(self, "backup_table"): return []
+        rows = sorted({index.row() for index in self.backup_table.selectionModel().selectedRows()})
+        if not rows and self.backup_table.currentRow() >= 0: rows = [self.backup_table.currentRow()]
+        paths=[]; seen=set()
+        for row in rows:
+            item = self.backup_table.item(row, 0)
+            if not item or not item.data(Qt.UserRole): continue
+            path=Path(str(item.data(Qt.UserRole))).expanduser().resolve()
+            if path not in seen: paths.append(path); seen.add(path)
+        return paths
+
+    def _update_backup_selection_label(self):
+        if hasattr(self, "backup_selection_label"):
+            count=len(self._selected_backup_paths()); self.backup_selection_label.setText(f"已选择 {count} 个备份；恢复操作要求单选")
+
+    def select_all_backups(self):
+        if not hasattr(self, "backup_table"): return
+        self.backup_table.selectAll(); self._update_backup_selection_label()
+
+    def invert_backup_selection(self):
+        if not hasattr(self, "backup_table"): return
+        selection=self.backup_table.selectionModel(); selected={index.row() for index in selection.selectedRows()}
+        self.backup_table.clearSelection()
+        for row in range(self.backup_table.rowCount()):
+            if row not in selected:
+                selection.select(self.backup_table.model().index(row, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        self._update_backup_selection_label()
+
+    def clear_backup_selection(self):
+        if hasattr(self, "backup_table"): self.backup_table.clearSelection(); self._update_backup_selection_label()
+
+    def _backup_records_for_paths(self, paths):
+        by_path={Path(item["path"]).resolve(): item for item in getattr(self, "backup_records", [])}
+        return [(path, by_path.get(path)) for path in paths]
+
+    def verify_selected_backups(self):
+        paths=self._selected_backup_paths()
+        if not paths: return QMessageBox.information(self, "批量校验", "请先选择一个或多个备份。")
+        valid=[path for path in paths if path.suffix.lower()==".pwcbackup"]
+        if not valid: return QMessageBox.information(self, "批量校验", "所选备份没有可校验的 .pwcbackup 文件。")
+        def verify():
+            reports=[]
+            repository=self._backup_repository()
+            for path in valid:
+                manifest=BackupPackageService().validate(path); repository.set_metadata(path, verified_at=datetime.now().isoformat(timespec="seconds")); reports.append(path.name)
+            return reports
+        self.run_async(verify, lambda reports: (self.refresh_backup_list(), QMessageBox.information(self, "批量校验完成", f"已校验 {len(reports)} 个备份。")))
+
+    def toggle_selected_backups_protection(self):
+        paths=self._selected_backup_paths()
+        if not paths: return QMessageBox.information(self, "批量保护", "请先选择一个或多个备份。")
+        records=self._backup_records_for_paths(paths); protected=[bool(record and record.get("protected")) for _, record in records]
+        action="解除保护" if protected and all(protected) else "保护"
+        if QMessageBox.question(self, f"批量{action}", f"确认对 {len(paths)} 个备份执行“{action}”？") != QMessageBox.Yes: return
+        try:
+            repository=self._backup_repository()
+            for path, record in records: repository.set_metadata(path, protected=not bool(record and record.get("protected")))
+            self.refresh_backup_list(); QMessageBox.information(self, "批量保护完成", f"已处理 {len(paths)} 个备份。")
+        except Exception as exc: QMessageBox.critical(self, "批量保护失败", str(exc))
+
+    def export_selected_backups(self):
+        paths=self._selected_backup_paths()
+        if not paths: return QMessageBox.information(self, "批量导出", "请先选择一个或多个备份。")
+        paths=[path for path in paths if path.suffix.lower()==".pwcbackup"]
+        if not paths: return QMessageBox.information(self, "批量导出", "所选备份没有可导出的 .pwcbackup 文件。")
+        target=QFileDialog.getExistingDirectory(self, "选择批量导出目录", str(Path.home()))
+        if not target: return
+        destination=Path(target)
+        if any((destination / path.name).exists() for path in paths) and QMessageBox.question(self, "覆盖导出文件", "目标目录中存在同名备份，确认覆盖？") != QMessageBox.Yes: return
+        def export():
+            service=BackupPackageService(); exported=[]
+            for path in paths: exported.append(service.export(path, destination / path.name, overwrite=True))
+            return exported
+        self.run_async(export, lambda exported: QMessageBox.information(self, "批量导出完成", f"已导出 {len(exported)} 个备份到：\n{destination}"))
+
+    def delete_selected_backups(self):
+        paths=self._selected_backup_paths()
+        if not paths: return QMessageBox.information(self, "批量删除", "请先选择一个或多个备份。")
+        records=self._backup_records_for_paths(paths); protected=[path.name for path, record in records if record and record.get("protected")]
+        detail=f"确认删除 {len(paths)} 个备份？"
+        if protected: detail += "\n\n受保护备份将跳过：\n" + "\n".join(protected[:20])
+        if QMessageBox.warning(self, "批量删除备份", detail, QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes: return
+        try:
+            repository=self._backup_repository(); deleted=[]; skipped=[]; errors=[]
+            for path, record in records:
+                try:
+                    repository.delete(path); deleted.append(path.name)
+                except PermissionError: skipped.append(path.name)
+                except Exception as exc: errors.append(f"{path.name}: {exc}")
+            if self.selected and self.selected.last_backup in {str(path) for path in paths if path.name in deleted}: self.selected.last_backup=""; self.storage.save_instances(self.instances)
+            self.refresh_backup_list()
+            summary=f"已删除 {len(deleted)} 个"
+            if skipped: summary += f"，跳过受保护 {len(skipped)} 个"
+            if errors: summary += f"，失败 {len(errors)} 个\n" + "\n".join(errors[:10])
+            QMessageBox.information(self, "批量删除完成", summary)
+        except Exception as exc: QMessageBox.critical(self, "批量删除失败", str(exc))
 
     def restore(self):
         if not self.selected: return
@@ -2395,6 +2569,8 @@ class MainWindow(QMainWindow):
         selected_pal = getattr(self, "selected_pal_edit", {})
         pal_editable = bool(enabled and selected_pal.get("individual_id") and selected_pal.get("pal_index") is not None)
         for editor in self.pal_editors.values(): editor.setEnabled(pal_editable)
+        if hasattr(self, "clear_player_button"):
+            self.clear_player_button.setEnabled(bool(enabled and self.active_player_uid and not self.player_center.has_pending(self.selected.id, self.active_player_uid)))
 
     def _render_player_relations(self, detail: dict):
         guild = detail.get("guild") or {}; members = list(detail.get("guild_members") or []); bases = list(detail.get("bases") or []); completeness = detail.get("completeness") or {}
@@ -3363,6 +3539,104 @@ class MainWindow(QMainWindow):
         self.append_log(f"存档事务失败，草稿已保留，可重试：{error}")
         QMessageBox.critical(self, "存档事务失败", f"{error}\n\n当前修改草稿仍保留，可在重新同步确认基线后重试。")
 
+    def _world_local_path(self) -> Path:
+        if not self.save_working_path:
+            raise RuntimeError("请先同步当前服务器存档")
+        return Path(self.save_working_path).expanduser().resolve().parent
+
+    def _world_remote_path(self) -> str:
+        if not self.save_remote_path:
+            raise RuntimeError("请先同步当前服务器存档")
+        if self.selected and self.selected.kind == "local": return str(Path(self.save_remote_path).parent)
+        platform_name = str(self.selected.remote_profile.get("platform") or "linux").lower() if self.selected else "linux"
+        return ntpath.dirname(str(self.save_remote_path)) if platform_name == "windows" else str(self.save_remote_path).rsplit("/", 1)[0]
+
+    def _create_world_backup(self, selected):
+        repository = self._backup_repository(selected)
+        if selected.kind == "local":
+            saved = Path(selected.install_dir).expanduser().resolve() / "Pal" / "Saved"
+            return BackupPackageService().create(selected, saved, repository.root, "restore-point", "破坏性存档操作前自动恢复点")
+        client = self._remote_client(); install_dir = str(selected.remote_profile.get("install_dir") or selected.install_dir)
+        raw = BackupService().create_remote(client, selected, repository.root, install_dir)
+        if raw is None: raise RuntimeError("远程服务器没有可备份的 Saved 数据")
+        try:
+            package = repository.import_source(raw, selected, "restore-point")
+            BackupPackageService().validate(package)
+            return package
+        finally:
+            Path(raw).unlink(missing_ok=True)
+
+    def _run_world_cleanup(self, selection: CleanupSelection, reason: str, session_key=None):
+        if not self.selected: return
+        selected = self.selected
+        if selection.empty: return QMessageBox.information(self, "存档清理", "没有选择可清理对象。")
+        entered, ok = QInputDialog.getText(self, "确认存档清理", f"将清理角色 {len(selection.players)} 个、公会 {len(selection.guilds)} 个、基地 {len(selection.bases)} 个。请输入实例名称“{selected.name}”确认：")
+        if not ok or entered != selected.name: return
+        self._begin_backup_task("正在清理存档")
+        def run(signals):
+            lifecycle = self._remote_lifecycle() if selected.kind == "remote" else self.lifecycle
+            service = SaveToolsService(self.storage.root, PlmCodecPlugin(self.storage.root))
+            try:
+                if selected.kind == "remote":
+                    client = self._remote_client(); platform_name = str(selected.remote_profile.get("platform") or "linux").lower(); remote_world = ntpath.dirname(str(self.save_remote_path)) if platform_name == "windows" else str(self.save_remote_path).rsplit("/", 1)[0]
+                    result = WorldDirectoryTransaction().execute_remote(client, remote_world, platform_name, lambda source, output: service.clean_world(source, selection, output), lambda: self._create_world_backup(selected), lifecycle.stop, lifecycle.start, lambda: self._remote_health_ok(selected))
+                else:
+                    result = WorldDirectoryTransaction().execute_local(self._world_local_path(), lambda source, output: service.clean_world(source, selection, output), lambda: self._create_world_backup(selected), lifecycle.stop, lifecycle.start, lambda: lifecycle.status() == "running")
+                return result
+            finally:
+                self._close_rest_tunnel()
+        worker = Worker(run, with_signals=True); worker.signals.finished.connect(lambda result: self._world_cleanup_done(result, reason, session_key)); worker.signals.error.connect(self._destructive_operation_failed); self.pool.start(worker)
+
+    def _world_cleanup_done(self, result, reason, session_key=None):
+        if self.selected and session_key:
+            self.player_repository.purge_player(self.selected.id, session_key[1]); self.player_edit_sessions.pop(session_key, None); self.player_center.mark_saved(*session_key)
+        if self.selected:
+            AuditService.record(self.selected, "清理存档", result.world_path, result="成功", detail=f"备份={result.backup_path}；{reason}")
+            self.storage.save_instances(self.instances); self._render_audit()
+        self._finish_backup_task(); self.append_log(f"存档清理完成，备份：{result.backup_path}"); self.load_save_snapshot(); self.refresh_status()
+
+    def clear_current_player(self):
+        if not self.selected or not self.active_player_uid: return QMessageBox.information(self, "清除角色", "请先选择存档角色。")
+        uid = self.active_player_uid; detail = self.player_repository.player_detail(self.selected.id, uid); player = detail.get("player") or {}; completeness = detail.get("completeness") or {}
+        if player.get("online"): return QMessageBox.warning(self, "无法清除", "目标角色当前在线，请玩家离线后重新同步。")
+        if self.player_center.has_pending(self.selected.id, uid): return QMessageBox.warning(self, "无法清除", "当前角色存在未保存修改，请先保存或撤销草稿。")
+        blocked=[]
+        if completeness.get("pals") == "partial" or completeness.get("inventory") == "partial" or completeness.get("guild") == "partial" or completeness.get("bases") == "partial": blocked.append("角色关联数据不完整")
+        guild=detail.get("guild") or {}; members=detail.get("guild_members") or []; bases=detail.get("bases") or []
+        if guild.get("is_admin") or str(guild.get("admin_player_uid") or "") == uid: blocked.append("角色是公会会长")
+        if len(members) <= 1 and bases: blocked.append("清除后会留下孤立基地")
+        if blocked: return QMessageBox.warning(self, "无法清除角色", "\n".join(dict.fromkeys(blocked)))
+        summary = f"角色：{player.get('nickname') or uid}\nUID：{uid}\n帕鲁：{len(detail.get('pals') or [])} 只\n背包：{len(detail.get('items') or [])} 项\n公会：{guild.get('name') or '无'}\n\n将删除服务器角色、个人帕鲁/背包和本地角色历史。"
+        if QMessageBox.warning(self, "确认清除角色", summary, QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes: return
+        self._run_world_cleanup(CleanupSelection(players=(uid,)), "单角色清除", (self.selected.id, uid))
+
+    def _destructive_operation_failed(self, error):
+        self._finish_backup_task(False); message=self._friendly_backup_error(error); self.install_stage.setText("破坏性操作失败"); self.install_message.setText(message); QMessageBox.critical(self, "存档操作失败", message)
+
+    def reset_current_world(self):
+        if not self.selected: return QMessageBox.information(self, "重置世界", "请先选择服务器实例。")
+        try: world = self._world_local_path() if self.selected.kind == "local" else self._world_remote_path()
+        except Exception as exc: return QMessageBox.warning(self, "无法重置世界", str(exc))
+        if QMessageBox.warning(self, "确认重置当前世界", f"仅移除当前活动世界并自动生成新世界：\n{world}\n\n配置、模组和其他世界不会被删除。", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes: return
+        entered, ok = QInputDialog.getText(self, "再次确认", f"请输入实例名称“{self.selected.name}”以继续：")
+        if not ok or entered != self.selected.name: return
+        self._begin_backup_task("正在重置当前世界"); selected=self.selected
+        def run(signals):
+            lifecycle = self._remote_lifecycle() if selected.kind == "remote" else self.lifecycle
+            try:
+                if selected.kind == "remote":
+                    result=WorldDirectoryTransaction().reset_remote(self._remote_client(), world, str(selected.remote_profile.get("platform") or "linux"), lambda: self._create_world_backup(selected), lifecycle.stop, lifecycle.start, lambda: self._remote_health_ok(selected))
+                else:
+                    result=WorldDirectoryTransaction().reset_local(Path(world), lambda: self._create_world_backup(selected), lifecycle.stop, lifecycle.start, lambda: lifecycle.status() == "running")
+                return result
+            finally: self._close_rest_tunnel()
+        worker=Worker(run, with_signals=True); worker.signals.finished.connect(self._world_reset_done); worker.signals.error.connect(self._destructive_operation_failed); self.pool.start(worker)
+
+    def _world_reset_done(self, result):
+        if self.selected:
+            self.player_repository.purge_instance(self.selected.id); AuditService.record(self.selected, "重置当前世界", result.world_path, result="成功", detail=f"备份={result.backup_path}"); self.storage.save_instances(self.instances); self._render_audit()
+        self.active_player_uid=""; self._finish_backup_task(); self.append_log(f"当前世界已重置，备份：{result.backup_path}"); self.load_save_snapshot(); self.refresh_status(); QMessageBox.information(self, "世界重置完成", "服务器已生成并验证新世界，原世界已作为备份保留。")
+
     def _refresh_plm_plugin_status(self):
         if not hasattr(self, "plm_plugin_status"): return
         ready, detail = PlmCodecPlugin(self.storage.root).probe()
@@ -3504,7 +3778,7 @@ class MainWindow(QMainWindow):
 
     def refresh_backup_list(self, preferred_path: Path | None = None):
         if not hasattr(self, "backup_table") or not self.selected: return
-        selected_path = preferred_path.resolve() if preferred_path else self._selected_backup_path()
+        selected_paths = {preferred_path.resolve()} if preferred_path else set(self._selected_backup_paths())
         records = self._backup_repository().list(); self.backup_records = records
         self.backup_table.setSortingEnabled(False); self.backup_table.setRowCount(len(records))
         type_labels = {"world": "世界导出", "disaster": "完整灾备", "restore-point": "恢复点"}
@@ -3522,11 +3796,24 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(str(value)); item.setData(Qt.UserRole, str(path)); self.backup_table.setItem(row, column, item)
         self.backup_table.setSortingEnabled(True)
         if records:
-            selected_row = next((row for row, record in enumerate(records) if selected_path and Path(record["path"]) == selected_path), 0)
-            self.backup_table.selectRow(selected_row)
+            self.backup_table.clearSelection()
+            selection = self.backup_table.selectionModel()
+            matching = [row for row, record in enumerate(records) if Path(record["path"]).resolve() in selected_paths]
+            if not matching: matching = [0]
+            for row in matching:
+                selection.select(self.backup_table.model().index(row, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows)
+            self._update_backup_selection_label()
         else: self.backup_details.clear()
 
     def show_backup_details(self):
+        self._update_backup_selection_label()
+        selected_paths = self._selected_backup_paths()
+        if not selected_paths:
+            self.backup_details.clear()
+            return
+        if len(selected_paths) > 1:
+            self.backup_details.setPlainText(f"已选择 {len(selected_paths)} 个备份。\n\n批量操作可用于校验、保护/解除保护、导出和删除；恢复操作必须保持单选。")
+            return
         path = self._selected_backup_path()
         if not path or not hasattr(self, "backup_details"): return
         record = next((item for item in getattr(self, "backup_records", []) if Path(item["path"]) == path), None)

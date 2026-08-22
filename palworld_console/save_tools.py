@@ -7,10 +7,10 @@ import shutil
 import tempfile
 import uuid
 import zipfile
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .backup_packages import BackupPackageService
 from .gamepass import GamePassWorld, default_wgs_root, discover_worlds, extract_world, find_user_containers
@@ -19,6 +19,20 @@ from .save_codec import PlmCodecPlugin
 
 
 CONVERSION_FORMAT = "palworld-console-conversion-v1"
+
+
+@dataclass(frozen=True)
+class CleanupSelection:
+    players: tuple[str, ...] = ()
+    guilds: tuple[str, ...] = ()
+    bases: tuple[str, ...] = ()
+
+    @property
+    def empty(self) -> bool:
+        return not (self.players or self.guilds or self.bases)
+
+    def to_dict(self) -> dict[str, list[str]]:
+        return {"players": list(self.players), "guilds": list(self.guilds), "bases": list(self.bases)}
 
 
 def _sha256(path: Path) -> str:
@@ -121,7 +135,44 @@ class SaveToolsService:
         empty_guilds = sorted(str(item.get("guild_id") or "") for item in guilds if item.get("guild_id") and not (item.get("players") or item.get("member_uids")))
         orphan_bases = sorted(str(item.get("base_id") or "") for item in bases if item.get("base_id") and not str(item.get("guild_id") or ""))
         inactive_players = sorted(self._player_guid(item) for item in players if self._player_guid(item) and old(item))
-        return {"source": str(Path(source).expanduser().resolve()), "inactive_days": int(inactive_days), "excluded": {key: sorted(values) for key, values in excluded.items()}, "candidates": {"duplicate_players": [uid for uid in duplicate_players if uid not in excluded["players"]], "inactive_players": [uid for uid in inactive_players if uid not in excluded["players"]], "empty_guilds": [gid for gid in empty_guilds if gid not in excluded["guilds"]], "orphan_bases": [bid for bid in orphan_bases if bid not in excluded["bases"]]}, "mutations": 0, "read_only": True}
+        guild_by_uid = {str(member.get("player_uid") or ""): guild for guild in guilds for member in (guild.get("players") or []) if member.get("player_uid")}
+        base_container_counts: dict[str, int] = {}
+        for base in bases:
+            for container in [base.get("worker_container_id"), *(base.get("container_ids") or [])]:
+                if container: base_container_counts[str(container)] = base_container_counts.get(str(container), 0) + 1
+        items: list[dict[str, Any]] = []
+        for uid in duplicate_players:
+            items.append({"kind": "duplicate_player", "id": uid, "label": uid, "selectable": False, "excluded": uid in excluded["players"], "blocked_reason": "重复 UID 无法自动判断应保留的原始条目", "relation": "仅诊断"})
+        for uid in inactive_players:
+            player = next((item for item in players if self._player_guid(item) == uid), {})
+            guild = guild_by_uid.get(str(player.get("player_uid") or uid)); blocked = ""; relation = "无公会"
+            if player.get("inventory_status") not in (None, "", "complete") or any(pal.get("data_status", "complete") != "complete" for pal in player.get("pals") or []): blocked = "角色个人数据解析不完整"
+            if guild:
+                members = list(guild.get("players") or []); relation = f"公会 {guild.get('name') or guild.get('guild_id')}，成员 {len(members)}，基地 {len(guild.get('base_ids') or [])}"
+                if guild.get("data_status", "complete") != "complete": blocked = "公会关系解析不完整"
+                elif str(guild.get("admin_player_uid") or "") == str(player.get("player_uid") or uid): blocked = "角色是公会会长"
+                elif len(members) <= 1 and guild.get("base_ids"): blocked = "清除后会留下无成员公会和关联基地"
+            is_excluded = uid in excluded["players"]
+            items.append({"kind": "inactive_player", "id": uid, "label": str(player.get("nickname") or uid), "selectable": not blocked and not is_excluded, "excluded": is_excluded, "blocked_reason": blocked, "relation": relation})
+        for guild_id in empty_guilds:
+            guild = next((item for item in guilds if str(item.get("guild_id") or "") == guild_id), {}); blocked = ""
+            if guild.get("data_status", "complete") != "complete": blocked = "公会数据解析不完整"
+            elif guild.get("base_ids"): blocked = "空公会仍有关联基地"
+            is_excluded = guild_id in excluded["guilds"]
+            items.append({"kind": "empty_guild", "id": guild_id, "label": str(guild.get("name") or guild_id), "selectable": not blocked and not is_excluded, "excluded": is_excluded, "blocked_reason": blocked, "relation": f"基地 {len(guild.get('base_ids') or [])}"})
+        for base_id in orphan_bases:
+            base = next((item for item in bases if str(item.get("base_id") or "") == base_id), {})
+            containers = [str(value) for value in [base.get("worker_container_id"), *(base.get("container_ids") or [])] if value]
+            problems = [part for part in str(base.get("read_only_reason") or "").split("；") if part and part != "基地缺少公会归属"]
+            if any(base_container_counts.get(value, 0) != 1 for value in containers): problems.append("存在被其他基地引用的容器")
+            blocked = "；".join(dict.fromkeys(problems)); is_excluded = base_id in excluded["bases"]
+            items.append({"kind": "orphan_base", "id": base_id, "label": str(base.get("name") or base_id), "selectable": not blocked and not is_excluded, "excluded": is_excluded, "blocked_reason": blocked, "relation": f"工作帕鲁 {len(base.get('worker_pal_ids') or [])}，容器 {len(containers)}"})
+        return {"source": str(Path(source).expanduser().resolve()), "inactive_days": int(inactive_days), "excluded": {key: sorted(values) for key, values in excluded.items()}, "candidates": {"duplicate_players": [uid for uid in duplicate_players if uid not in excluded["players"]], "inactive_players": [uid for uid in inactive_players if uid not in excluded["players"]], "empty_guilds": [gid for gid in empty_guilds if gid not in excluded["guilds"]], "orphan_bases": [bid for bid in orphan_bases if bid not in excluded["bases"]]}, "items": items, "mutations": 0, "read_only": True}
+
+    def clean_world(self, source: Path, selection: CleanupSelection, output: Path) -> dict[str, Any]:
+        """Build a verified cleaned world copy; deployment is handled separately."""
+        if selection.empty: raise ValueError("没有选择可清理对象")
+        return self.codec.clean_world(Path(source), selection.to_dict(), Path(output))
 
     def detect_sources(self) -> tuple[LocalSaveSource, ...]:
         sources = list(BackupPackageService().detect_local_save_sources())
@@ -331,7 +382,8 @@ class SaveToolsService:
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 backup_path = output.with_name(output.name + f".{stamp}.bak")
                 shutil.copy2(output, backup_path); backup = str(backup_path)
-            os.replace(candidate, output)
+            shutil.copy2(candidate, output)
+            candidate.unlink(missing_ok=True)
         return {**report, "output": str(output), "backup": backup, "sha256": _sha256(output)}
 
     def steam_id_to_uid(self, value: str) -> dict[str, str]:
@@ -357,7 +409,8 @@ class SaveToolsService:
             if output.exists():
                 backup_path = output.with_name(output.name + f".{datetime.now():%Y%m%d-%H%M%S}.bak")
                 shutil.copy2(output, backup_path); backup = str(backup_path)
-            os.replace(candidate, output)
+            shutil.copy2(candidate, output)
+            candidate.unlink(missing_ok=True)
         return {**report, "output": str(output), "backup": backup, "sha256": _sha256(output)}
 
     def resolve_level_path(self, source: Path) -> Path:

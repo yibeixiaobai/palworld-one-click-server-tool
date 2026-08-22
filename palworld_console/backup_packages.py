@@ -1336,7 +1336,8 @@ class RestoreTransaction:
             if saved.exists() and rollback.exists():
                 shutil.rmtree(saved, ignore_errors=True)
             if rollback.exists():
-                rollback.rename(saved)
+                shutil.copytree(rollback, saved, dirs_exist_ok=True)
+                shutil.rmtree(rollback, ignore_errors=True)
             shutil.rmtree(staging, ignore_errors=True)
             try:
                 start()

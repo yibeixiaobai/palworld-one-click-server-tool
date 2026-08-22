@@ -21,7 +21,7 @@ PALWORLD_SAVE_TOOLS_COMMIT = "a0e350127dc570593e666f2177eafcee69f7cd5d"
 REFERENCE_TOOL_COMMIT = "f45a48ef25ce08a5311a27e55b17062ba0bb4362"
 SOURCE_URL = "https://github.com/deafdudecomputers/PalworldSaveTools.git"
 VS_BOOTSTRAPPER_URL = "https://aka.ms/vs/17/release/vs_BuildTools.exe"
-HELPER_API_VERSION = 8
+HELPER_API_VERSION = 9
 SAVE_PATCH_FORMAT = "palworld-console-save-patch-v2"
 IDENTITY_MIGRATION_FORMAT = "palworld-console-identity-migration-v1"
 
@@ -37,6 +37,7 @@ class SaveCodecPlugin(Protocol):
     def steam_id_to_uid(self, steam_id: str) -> dict[str, str]: ...
     def restore_map(self, source_path: Path, output_path: Path) -> dict[str, Any]: ...
     def expand_palbox(self, world_path: Path, player_guid: str, slots: int, output_path: Path) -> dict[str, Any]: ...
+    def clean_world(self, world_path: Path, selection: dict[str, list[str]], output_path: Path) -> dict[str, Any]: ...
 
 
 @dataclass
@@ -204,6 +205,16 @@ class PlmCodecPlugin:
     def expand_palbox(self, world_path: Path, player_guid: str, slots: int, output_path: Path) -> dict[str, Any]:
         result = self._run(["expand-palbox", "--world", str(world_path), "--player-guid", str(player_guid), "--slots", str(slots), "--output", str(output_path)])
         return json.loads(result)
+
+    def clean_world(self, world_path: Path, selection: dict[str, list[str]], output_path: Path) -> dict[str, Any]:
+        work = self.root / "work"; work.mkdir(parents=True, exist_ok=True)
+        selection_path = work / f"cleanup-{uuid.uuid4().hex}.json"
+        selection_path.write_text(json.dumps(selection, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            result = self._run(["clean-world", "--world", str(world_path), "--selection", str(selection_path), "--output", str(output_path)], timeout=900)
+            return json.loads(result)
+        finally:
+            selection_path.unlink(missing_ok=True)
 
     def verify_roundtrip(self, level_path: Path, expected_patch: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = self.decode(level_path)
@@ -750,6 +761,91 @@ def patch(level,manifest,output):
     if invalid_guilds:raise RuntimeError("guild targets must match exactly once: "+",".join(sorted(invalid_guilds)))
     if invalid_bases:raise RuntimeError("base targets must match exactly once: "+",".join(sorted(invalid_bases)))
     output_data=compress_gvas_to_sav(gvas.write(PALWORLD_CUSTOM_PROPERTIES),save_type); Path(output).write_bytes(output_data)
+
+def clean_world(world_path, selection_path, output_path):
+    """Create and validate a world copy after conservative role/world cleanup."""
+    import shutil
+    world_path=Path(world_path); output_path=Path(output_path)
+    if output_path.exists(): shutil.rmtree(output_path)
+    shutil.copytree(world_path, output_path)
+    level_path=output_path/"Level.sav"; players_path=output_path/"Players"
+    if not level_path.is_file() or not players_path.is_dir(): raise RuntimeError("世界目录缺少 Level.sav 或 Players")
+    selection=json.loads(Path(selection_path).read_text(encoding="utf-8"))
+    wanted_players={str(value).replace("-","").upper() for value in selection.get("players",[]) if str(value).strip()}
+    wanted_guilds={str(value) for value in selection.get("guilds",[]) if str(value).strip()}
+    wanted_bases={str(value) for value in selection.get("bases",[]) if str(value).strip()}
+    if not (wanted_players or wanted_guilds or wanted_bases): raise RuntimeError("清理选择为空")
+    gvas,save_type,world=load(level_path)
+    player_entries=[]; selected_entries=[]; instance_ids=set(); pal_ids=set(); player_uids={}
+    for entry in world.get("CharacterSaveParameterMap",{}).get("value",[]):
+        raw_uid=entry.get("key",{}).get("PlayerUId",{}).get("value")
+        uid=clean_guid(raw_uid) or str(uid_text(raw_uid)).replace("-","").upper()
+        sp=save_parameter(entry)
+        if sp.get("IsPlayer",{}).get("value"):
+            player_entries.append((uid,entry))
+            if uid in wanted_players: selected_entries.append((uid,entry)); instance_ids.add(str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower())
+    if len(selected_entries)!=len(wanted_players):
+        missing=sorted(wanted_players-{uid for uid,_ in selected_entries}); raise RuntimeError("目标角色不存在或 UID 不唯一："+",".join(missing))
+    guild_entries=[]; guild_by_player={}; selected_guild_entries=[]
+    for group in world.get("GroupSaveDataMap",{}).get("value",[]):
+        if enum_value(group.get("value",{}).get("GroupType"))!="EPalGroupType::Guild": continue
+        raw=group.get("value",{}).get("RawData",{}).get("value") or {}; gid=str(raw.get("group_id") or "")
+        guild_entries.append((gid,group,raw))
+        members=[clean_guid(member.get("player_uid")) or str(uid_text(member.get("player_uid"))).replace("-","").upper() for member in raw.get("players",[]) or []]
+        for member_uid in members: guild_by_player[member_uid]=(gid,raw,members)
+        if gid in wanted_guilds: selected_guild_entries.append((gid,group,raw))
+    if len(selected_guild_entries)!=len(wanted_guilds): raise RuntimeError("目标公会不存在或 ID 不唯一")
+    base_entries=[]; selected_base_entries=[]
+    for entry in world.get("BaseCampSaveData",{}).get("value",[]):
+        bid=str(entry.get("key") or ""); raw=entry.get("value",{}).get("RawData",{}).get("value") or {}; base_entries.append((bid,entry,raw))
+        if bid in wanted_bases: selected_base_entries.append((bid,entry,raw))
+    if len(selected_base_entries)!=len(wanted_bases): raise RuntimeError("目标基地不存在或 ID 不唯一")
+    for uid,_ in selected_entries:
+        guild=guild_by_player.get(uid)
+        if guild:
+            gid,raw,members=guild; admin=clean_guid(raw.get("admin_player_uid")) or str(uid_text(raw.get("admin_player_uid"))).replace("-","").upper()
+            if admin==uid: raise RuntimeError("角色是公会会长，拒绝清除："+uid)
+            base_ids=[bid for bid,_,base_raw in base_entries if str(base_raw.get("group_id_belong_to") or "")==gid]
+            if len(members)<=1 and base_ids: raise RuntimeError("清除角色后会留下孤立基地："+uid)
+    for gid,_,raw in selected_guild_entries:
+        members=raw.get("players",[]) or []
+        if members: raise RuntimeError("只能清除空公会："+gid)
+    container_ids=set(); removed_files=0
+    for uid,_ in selected_entries:
+        file_guid=uid
+        player_path=players_path/(file_guid+".sav")
+        if not player_path.is_file():
+            candidates=list(players_path.glob("*.sav")); player_path=next((path for path in candidates if clean_guid(path.stem)==uid),player_path)
+        if not player_path.is_file(): raise RuntimeError("角色文件不存在："+uid)
+        player_gvas=read_gvas(player_path)[0]; save_data=player_gvas.properties.get("SaveData",{}).get("value",{}); inventory=save_data.get("InventoryInfo",{}).get("value",{})
+        for prop in PLAYER_CONTAINER_KEYS:
+            ref=inventory.get(prop,{}).get("value",{}).get("ID",{}).get("value") if isinstance(inventory.get(prop),dict) else None
+            if ref: container_ids.add(str(ref))
+        player_path.unlink(); removed_files+=1
+        for entry in world.get("CharacterSaveParameterMap",{}).get("value",[]):
+            sp=save_parameter(entry); owner=sp.get("OwnerPlayerUId",{}).get("value")
+            if (clean_guid(owner) or str(uid_text(owner)).replace("-","").upper())==uid: pal_ids.add(str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower())
+    kept=[]
+    for entry in world.get("CharacterSaveParameterMap",{}).get("value",[]):
+        instance=str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower(); sp=save_parameter(entry); owner=sp.get("OwnerPlayerUId",{}).get("value")
+        owner_uid=clean_guid(owner) or str(uid_text(owner)).replace("-","").upper()
+        if instance in instance_ids or instance in pal_ids or owner_uid in wanted_players: continue
+        kept.append(entry)
+    world.setdefault("CharacterSaveParameterMap", {"value": []})["value"]=kept
+    kept_groups=[]
+    for gid,group,raw in guild_entries:
+        if gid in wanted_guilds: continue
+        raw["players"]=[member for member in (raw.get("players",[]) or []) if (clean_guid(member.get("player_uid")) or str(uid_text(member.get("player_uid"))).replace("-","").upper()) not in wanted_players]
+        kept_groups.append(group)
+    world.setdefault("GroupSaveDataMap", {"value": []})["value"]=kept_groups
+    world.setdefault("BaseCampSaveData", {"value": []})["value"]= [entry for bid,entry,_ in base_entries if bid not in wanted_bases]
+    world.setdefault("ItemContainerSaveData", {"value": []})["value"]=[container for container in world.get("ItemContainerSaveData",{}).get("value",[]) if container_id(container) not in container_ids]
+    level_path.write_bytes(compress_gvas_to_sav(gvas.write(PALWORLD_CUSTOM_PROPERTIES),save_type))
+    decoded=decode(level_path); remaining={clean_guid(item.get("player_guid")) or str(item.get("player_uid","")).replace("-","").upper() for item in decoded.get("players",[])}
+    if remaining & wanted_players: raise RuntimeError("清理后二次解析仍发现目标角色")
+    if wanted_guilds and any(str(item.get("guild_id") or "") in wanted_guilds for item in decoded.get("guilds",[])): raise RuntimeError("清理后二次解析仍发现目标公会")
+    if wanted_bases and any(str(item.get("base_id") or "") in wanted_bases for item in decoded.get("bases",[])): raise RuntimeError("清理后二次解析仍发现目标基地")
+    return {"output":str(output_path),"counts":{"players":len(wanted_players),"guilds":len(wanted_guilds),"bases":len(wanted_bases),"player_files":removed_files,"containers":len(container_ids),"pals":len(pal_ids)}}
 def guid(value):
     clean=str(value or "").replace("-","").lower()
     if len(clean)!=32 or any(c not in "0123456789abcdef" for c in clean):raise RuntimeError("GUID 必须是 32 位十六进制")
@@ -973,6 +1069,7 @@ def main():
     convert=sub.add_parser("convert");convert.add_argument("--source",required=True);convert.add_argument("--output",required=True)
     map_restore=sub.add_parser("restore-map");map_restore.add_argument("--source",required=True);map_restore.add_argument("--output",required=True)
     palbox=sub.add_parser("expand-palbox");palbox.add_argument("--world",required=True);palbox.add_argument("--player-guid",required=True);palbox.add_argument("--slots",required=True,type=int);palbox.add_argument("--output",required=True)
+    cleanup=sub.add_parser("clean-world");cleanup.add_argument("--world",required=True);cleanup.add_argument("--selection",required=True);cleanup.add_argument("--output",required=True)
     steam=sub.add_parser("steam-uid");steam.add_argument("--steam-id",required=True)
     args=parser.parse_args()
     if args.cmd=="probe":
@@ -985,6 +1082,7 @@ def main():
     elif args.cmd=="convert":print(json.dumps(convert_file(args.source,args.output),ensure_ascii=False))
     elif args.cmd=="restore-map":print(json.dumps(restore_map(args.source,args.output),ensure_ascii=False))
     elif args.cmd=="expand-palbox":print(json.dumps(expand_palbox(args.world,args.player_guid,args.slots,args.output),ensure_ascii=False))
+    elif args.cmd=="clean-world":print(json.dumps(clean_world(args.world,args.selection,args.output),ensure_ascii=False))
     else:print(json.dumps(steam_uid(args.steam_id),ensure_ascii=False))
 if __name__=="__main__":main()
 '''

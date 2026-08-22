@@ -6,6 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import QItemSelectionModel
 
 from palworld_console.models import ConfigSyncResult, PlayerRecord, ServerInstance, TaskProgress, UninstallResult
 from palworld_console.backup_packages import BackupPackageService, RestoreTransaction
@@ -196,6 +197,27 @@ def test_imported_backup_is_selected_after_refresh(window, tmp_path):
     imported = window._backup_repository().import_source(source, window.selected)
     window.refresh_backup_list(imported)
     assert window._selected_backup_path() == imported
+
+
+def test_backup_page_supports_extended_selection_and_preserves_multiple_rows(window, tmp_path):
+    window.storage.root = tmp_path / "storage"
+    install = tmp_path / "server"
+    world = install / "Pal" / "Saved" / "SaveGames" / "0" / "WORLD-BATCH"
+    (world / "Players").mkdir(parents=True)
+    (world / "Level.sav").write_bytes(b"save")
+    first = BackupPackageService().create(window.selected, install / "Pal" / "Saved", window._backup_repository().root, "world")
+    second = BackupPackageService().create(window.selected, install / "Pal" / "Saved", window._backup_repository().root, "world")
+
+    window.refresh_backup_list()
+    assert window.backup_table.selectionMode() == ui_module.QAbstractItemView.ExtendedSelection
+    window.backup_table.clearSelection()
+    selection = window.backup_table.selectionModel()
+    selection.select(window.backup_table.model().index(0, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows)
+    selection.select(window.backup_table.model().index(1, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows)
+
+    assert set(window._selected_backup_paths()) == {first.resolve(), second.resolve()}
+    assert "已选择 2 个备份" in window.backup_selection_label.text()
+    assert "恢复操作必须保持单选" in window.backup_details.toPlainText()
 
 
 def test_restore_dialog_requires_advanced_confirmation_for_incomplete_package(window, tmp_path, monkeypatch):

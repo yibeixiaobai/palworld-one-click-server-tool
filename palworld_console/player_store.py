@@ -378,5 +378,35 @@ class PlayerRepository:
     def set_note(self, instance_id: str, uid: str, note: str) -> None:
         self.connection.execute("UPDATE players SET note=? WHERE instance_id=? AND player_uid=?", (note, instance_id, uid)); self.connection.commit()
 
+    def purge_player(self, instance_id: str, uid: str) -> dict[str, int]:
+        """Permanently remove one role and all locally cached role details."""
+        tables = ("player_snapshots", "pals", "inventory_items", "guild_memberships", "player_aliases", "player_audit_events", "players")
+        counts: dict[str, int] = {}
+        try:
+            self.connection.execute("BEGIN")
+            for table in tables:
+                cursor = self.connection.execute(f"DELETE FROM {table} WHERE instance_id=? AND player_uid=?", (instance_id, uid))
+                counts[table] = max(0, int(cursor.rowcount))
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return counts
+
+    def purge_instance(self, instance_id: str) -> dict[str, int]:
+        """Clear all derived player-center state after a complete world reset."""
+        tables = ("player_snapshots", "pals", "inventory_items", "guild_memberships", "player_aliases", "player_audit_events", "players", "guilds", "bases", "save_sync_runs")
+        counts: dict[str, int] = {}
+        try:
+            self.connection.execute("BEGIN")
+            for table in tables:
+                cursor = self.connection.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
+                counts[table] = max(0, int(cursor.rowcount))
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return counts
+
     def close(self) -> None:
         self.connection.close()

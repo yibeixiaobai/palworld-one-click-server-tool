@@ -3,15 +3,16 @@ name: Release Windows
 on:
   workflow_dispatch:
     inputs:
-      bump_type:
-        description: Version component to increment
+      version:
+        description: Release version (for example 1.0.0)
         required: true
-        default: patch
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+        default: 1.0.0
+        type: string
+      overwrite:
+        description: Replace an existing tag/release with the same version
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -44,11 +45,12 @@ jobs:
       - name: Install version tooling
         run: python -m pip install --upgrade pip packaging
 
-      - name: Calculate release version
+      - name: Set release version
         id: version
         run: |
-          $version = python -m palworld_console.versioning --file palworld_console/VERSION --bump "${{ inputs.bump_type }}"
-          if ($LASTEXITCODE -ne 0) { throw "Version increment failed" }
+          $version = "${{ inputs.version }}"
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Version must use X.Y.Z format" }
+          Set-Content -Path palworld_console/VERSION -Value $version -NoNewline
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "Releasing v$version"
 
@@ -70,21 +72,41 @@ jobs:
           }
 
       - name: Install Inno Setup
-        run: choco install innosetup --no-progress -y
+        run: |
+          $existing = @(
+            (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source,
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path ${env:ProgramFiles} 'Inno Setup 6\ISCC.exe')
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          if (-not $existing) { choco install innosetup --no-progress -y }
 
       - name: Build installer and checksum
         id: assets
         run: |
           New-Item -ItemType Directory -Force release | Out-Null
-          $compiler = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          $compiler = @(
+            (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source,
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path ${env:ProgramFiles} 'Inno Setup 6\ISCC.exe')
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $compiler) { throw 'Inno Setup compiler (ISCC.exe) not found' }
           $source = (Resolve-Path .\dist\PalworldConsole.exe).Path
           $output = (Resolve-Path .\release).Path
           & $compiler "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceExe=$source" "/DOutputDir=$output" .\installer\PalworldConsole.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
           $installer = Join-Path $output "PalworldConsole-Setup-v${{ steps.version.outputs.version }}.exe"
-          $hash = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
-          "$hash *$(Split-Path -Leaf $installer)" | Set-Content -Path (Join-Path $output "SHA256SUMS.txt") -Encoding ascii
+          $portableRoot = Join-Path $output "PalworldConsole-${{ steps.version.outputs.version }}-win-x64"
+          New-Item -ItemType Directory -Force $portableRoot | Out-Null
+          Copy-Item .\dist\PalworldConsole.exe (Join-Path $portableRoot 'PalworldConsole.exe')
+          Compress-Archive -Path $portableRoot -DestinationPath (Join-Path $output "PalworldConsole-${{ steps.version.outputs.version }}-win-x64.zip") -Force
+          $assets = Get-ChildItem $output -File | Where-Object { $_.Extension -in '.exe', '.zip' }
+          $checksums = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 $asset.FullName).Hash.ToLowerInvariant()
+            "$hash *$($asset.Name)"
+          }
+          $checksums | Set-Content -Path (Join-Path $output "SHA256SUMS.txt") -Encoding ascii
           "installer=$installer" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "portable=$(Join-Path $output "PalworldConsole-${{ steps.version.outputs.version }}-win-x64.zip")" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "checksums=$(Join-Path $output 'SHA256SUMS.txt')" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       # Authenticode signing can be inserted here before checksums are generated.
@@ -105,11 +127,52 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $tag = "v${{ steps.version.outputs.version }}"
+          if ("${{ inputs.overwrite }}" -eq 'true') {
+            gh release delete $tag --yes --cleanup-tag 2>$null
+            git push origin ":refs/tags/$tag" 2>$null
+          }
+          @'
+          ## 中文
+
+          Palworld Console 1.0.0 是面向 Windows x64 的稳定首发版本，提供自包含安装器与便携 ZIP。
+
+          ### 功能
+          - 本机 Windows Dedicated Server 的安装、更新、启动、停止、重启、卸载与健康诊断。
+          - 通过 SSH 管理远程 Linux 或 Windows Server，自动识别 systemd、WinSW、路径、权限与服务端状态。
+          - SteamCMD、配置、玩家、RCON、白名单、计划任务与端口诊断。
+          - Workshop、ZIP、URL、UE4SS Mods、NativeMods 和迁移包管理。
+          - `.pwcbackup` 备份、恢复、导入导出、跨实例迁移、保留策略及 CRC/SHA-256 校验。
+          - Steam/Game Pass 存档导入、转换、联机角色身份迁移与可复核转换包。
+
+          ### 注意事项
+          - 原生 Linux 服务端不启用官方模组安装；可浏览和下载 Workshop 包。
+          - 高风险存档和玩家操作会要求停服、备份与健康检查。
+          - 安装包未使用 Authenticode 签名，Windows SmartScreen 可能显示来源警告；请使用 SHA-256 校验下载完整性。
+
+          ## English
+
+          Palworld Console 1.0.0 is the first stable Windows x64 release, shipped as a self-contained installer and portable ZIP.
+
+          ### Features
+          - Install, update, start, stop, restart, uninstall, and diagnose local Windows Dedicated Servers.
+          - Manage remote Linux or Windows Server instances over SSH with automatic OS, service, path, permission, and server detection.
+          - SteamCMD, configuration, player, RCON, whitelist, scheduled task, and port diagnostics.
+          - Workshop, ZIP, URL, UE4SS Mods, NativeMods, and migration package management.
+          - `.pwcbackup` backup, restore, import/export, cross-instance migration, retention, CRC, and SHA-256 verification.
+          - Steam/Game Pass save import, conversion, online identity migration, and reviewable conversion packages.
+
+          ### Notes
+          - Official mod installation is disabled for native Linux servers; Workshop packages can still be browsed and downloaded.
+          - High-risk save and player operations require server stop, backups, and health checks.
+          - The installer is not Authenticode-signed, so Windows SmartScreen may warn; use SHA-256 to verify downloads.
+          '@ | Set-Content release-notes.md -Encoding utf8
           gh release create "v${{ steps.version.outputs.version }}" `
             "${{ steps.assets.outputs.installer }}" `
+            "${{ steps.assets.outputs.portable }}" `
             "${{ steps.assets.outputs.checksums }}" `
             --title "v${{ steps.version.outputs.version }}" `
-            --generate-notes `
+            --notes-file release-notes.md `
             --verify-tag
 
       - name: Upload workflow artifacts
@@ -118,4 +181,5 @@ jobs:
           name: PalworldConsole-v${{ steps.version.outputs.version }}
           path: |
             release/PalworldConsole-Setup-v${{ steps.version.outputs.version }}.exe
+            release/PalworldConsole-${{ steps.version.outputs.version }}-win-x64.zip
             release/SHA256SUMS.txt
