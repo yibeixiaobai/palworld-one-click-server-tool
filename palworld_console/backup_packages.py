@@ -30,6 +30,7 @@ MAX_UNCOMPRESSED = 50 * 1024**3
 MAX_COMPRESSION_RATIO = 250
 SECRET_FIELDS = ("AdminPassword", "ServerPassword")
 WORLD_TRANSIENT_DIRS = {"backup", "backups", ".backup", ".backups"}
+TEMPORARY_IDENTITY_LEVEL_LIMIT = 3
 
 
 def _require_file(path: Path, label: str) -> Path:
@@ -431,6 +432,14 @@ class BackupPackageService:
                 payload["latest_snapshot_path"] = payload.get("target_snapshot_path", "")
                 payload["latest_snapshot_hash"] = payload.get("target_world_hash", "")
                 payload["snapshot_generation"] = 0
+            if int(payload.get("schema_version") or 0) < 3:
+                payload["schema_version"] = 3
+                payload.setdefault("player_sync_source", "legacy-cache")
+                payload.setdefault("player_sync_detail", "旧迁移会话，继续迁移时重新同步")
+                payload.setdefault("player_sync_stale", True)
+                payload.setdefault("source_world_deployed", bool(payload.get("mappings") and any(item.status == "migrated" for item in payload["mappings"])))
+                payload.setdefault("content_report", {})
+                payload.setdefault("client_data_package_path", "")
             return CoopMigrationSession(**payload)
         except (OSError, ValueError, TypeError): return None
 
@@ -460,7 +469,7 @@ class BackupPackageService:
         session = CoopMigrationSession(instance_id=instance_id, source_path=str(source), original_source_path=str(source), target_world_path=str(Path(target_world).resolve()), phase="source_ready", source_players=players, baseline_player_files=files, source_world_hash=_sha256(source / "Level.sav"), original_source_hash=_sha256(source / "Level.sav"), source_player_hashes=hashes)
         self.save_migration_session(storage_root, session); return session
 
-    def refresh_coop_placeholders(self, session: CoopMigrationSession, storage_root: Path) -> CoopMigrationSession:
+    def refresh_coop_placeholders(self, session: CoopMigrationSession, storage_root: Path, online_players: Iterable[object] = (), online_error: str = "") -> CoopMigrationSession:
         current = {path.name for path in (Path(session.target_world_path) / "Players").glob("*.sav")}
         added = sorted(current - set(session.baseline_player_files)); placeholders = []
         try: placeholders = list(self.inspect_world_players(Path(session.target_world_path), storage_root))
@@ -470,7 +479,8 @@ class BackupPackageService:
             raise RuntimeError(updated.detail) from exc
         current_folded = {name.casefold() for name in current}; baseline_folded = {name.casefold() for name in session.baseline_player_files}
         placeholders = [item for item in placeholders if f"{self._player_guid(item)}.sav".casefold() in current_folded and f"{self._player_guid(item)}.sav".casefold() not in baseline_folded]
-        updated = replace(session, phase="mapping_ready" if added else "waiting_placeholders", placeholder_players=tuple(placeholders), detail="检测到临时角色：" + ", ".join(added) if added else "尚未检测到新建角色")
+        placeholders, sync = self.sync_migration_player_center(session.instance_id, Path(session.target_world_path), storage_root, placeholders, online_players, online_error)
+        updated = replace(session, phase="mapping_ready" if placeholders else "waiting_placeholders", placeholder_players=tuple(placeholders), player_sync_source=sync["source"], player_sync_detail=sync["detail"], player_sync_stale=sync["stale"], detail=sync["detail"] if placeholders else "尚未检测到玩家中心内 3 级以下的新建角色；" + sync["detail"])
         self.save_migration_session(storage_root, updated); return updated
 
     def build_identity_mappings(self, session: CoopMigrationSession, confirmations: dict[str, str], storage_root: Path) -> CoopMigrationSession:
@@ -537,6 +547,8 @@ class BackupPackageService:
         storage_root: Path,
         target_kind: str = "local",
         target_platform: str = "windows",
+        online_players: Iterable[object] = (),
+        online_error: str = "",
     ) -> CoopMigrationSession:
         package = _require_file(Path(package), "备份文件"); manifest = self.validate(package)
         root = Path(storage_root) / "migrations" / instance.id / "restore"
@@ -564,8 +576,11 @@ class BackupPackageService:
             target_players = self.inspect_world_players(target_snapshot_world, storage_root)
         else:
             target_players = tuple(PlmCodecPlugin(storage_root).decode(target_snapshot_world / "Level.sav").get("players", ()))
+        target_players, sync = self.sync_migration_player_center(instance.id, target_snapshot_world, storage_root, target_players, online_players, online_error)
         source_hash = _sha256(source_world / "Level.sav")
-        source_hashes = tuple({"guid": self._player_guid(item), "hash": _sha256(source_world / "Players" / str(item.get("player_file") or (self._player_guid(item) + ".sav")))} for item in source_players if (source_world / "Players" / str(item.get("player_file") or (self._player_guid(item) + ".sav"))).is_file())
+        source_hashes = tuple({"guid": self._player_guid(item), "file": str(item.get("player_file") or (self._player_guid(item) + ".sav")), "hash": _sha256(source_world / "Players" / str(item.get("player_file") or (self._player_guid(item) + ".sav")))} for item in source_players if (source_world / "Players" / str(item.get("player_file") or (self._player_guid(item) + ".sav"))).is_file())
+        source_files = self._world_file_hashes(source_world, exclude_identity=True)
+        source_local_data = {path.relative_to(source_world).as_posix(): _sha256(path) for path in source_world.rglob("LocalData.sav") if path.is_file()}
         snapshot_hash = _sha256(target_snapshot_world / "Level.sav")
         session = CoopMigrationSession(
             instance_id=instance.id, source_path=str(source_world), target_world_path=str(target_world_path), phase="mapping_ready",
@@ -573,13 +588,249 @@ class BackupPackageService:
             package_path=str(package), package_hash=_sha256(package), source_world_hash=source_hash, original_source_path=str(source_world), original_source_hash=source_hash, source_player_hashes=source_hashes,
             target_snapshot_path=str(target_snapshot_world), target_world_hash=snapshot_hash, latest_snapshot_path=str(target_snapshot_world), latest_snapshot_hash=snapshot_hash, snapshot_generation=0,
             target_kind=target_kind, target_platform=target_platform, pending_player_guids=tuple(self._player_guid(item) for item in source_players),
-            detail=f"源玩家 {len(source_players)}，目标身份 {len(target_players)}",
+            player_sync_source=sync["source"], player_sync_detail=sync["detail"], player_sync_stale=sync["stale"],
+            content_report={"source_baseline": {"non_identity_files": source_files, "local_data": source_local_data}},
+            detail=f"源玩家 {len(source_players)}，玩家中心低等级临时身份 {len(target_players)}；{sync['detail']}",
         )
         self.save_migration_session(storage_root, session); return session
 
     @staticmethod
     def _player_guid(player: dict) -> str:
         return str(player.get("player_guid") or player.get("player_uid") or "").replace("-", "").upper()
+
+    @staticmethod
+    def temporary_identity_targets(targets: Iterable[dict], player_center_records: Iterable[object]) -> tuple[dict, ...]:
+        """Return active player-center identities below level 3, enriched with current display data."""
+        low_level_by_uid: dict[str, object] = {}
+        for record in player_center_records:
+            value = record.get if isinstance(record, dict) else lambda key, default=None: getattr(record, key, default)
+            uid = str(value("player_uid", "") or value("player_guid", "") or "").replace("-", "").strip().upper()
+            try:
+                level = int(value("level", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not uid or level >= TEMPORARY_IDENTITY_LEVEL_LIMIT or str(value("save_status", "unknown")).casefold() == "missing":
+                continue
+            low_level_by_uid[uid] = record
+        result = []
+        for target in targets:
+            uid = str(target.get("player_uid") or target.get("player_guid") or "").replace("-", "").strip().upper()
+            record = low_level_by_uid.get(uid)
+            if record is None:
+                continue
+            value = record.get if isinstance(record, dict) else lambda key, default=None: getattr(record, key, default)
+            item = dict(target)
+            record_level = int(value("level", 0) or 0)
+            if record_level or "level" in item:
+                item["level"] = record_level
+            current_name = str(value("name", "") or value("nickname", "") or "").strip()
+            if current_name:
+                item["nickname"] = current_name
+            result.append(item)
+        return tuple(result)
+
+    @classmethod
+    def temporary_identity_targets_from_player_center(cls, instance_id: str, targets: Iterable[dict], storage_root: Path) -> tuple[dict, ...]:
+        from .player_store import PlayerRepository
+
+        repository = PlayerRepository(Path(storage_root) / "players.db")
+        try:
+            records = repository.list_players(instance_id)
+        finally:
+            repository.close()
+        return cls.temporary_identity_targets(targets, records)
+
+    @classmethod
+    def sync_migration_player_center(
+        cls,
+        instance_id: str,
+        world: Path,
+        storage_root: Path,
+        parsed_players: Iterable[dict],
+        online_players: Iterable[object] = (),
+        online_error: str = "",
+    ) -> tuple[tuple[dict, ...], dict]:
+        """Refresh one instance from the stopped-world snapshot and optionally enrich it with REST identities."""
+        from .player_store import PlayerRepository
+
+        parsed_players = tuple(parsed_players)
+        repository = PlayerRepository(Path(storage_root) / "players.db")
+        snapshot_error = ""
+        synced_count = 0
+        try:
+            try:
+                payload = PlmCodecPlugin(storage_root).decode(Path(world) / "Level.sav")
+                run_id = repository.begin_sync(instance_id)
+                try:
+                    synced_count = repository.upsert_save_snapshot(instance_id, payload)
+                    repository.finish_sync(run_id, "success", synced_count)
+                except Exception as exc:
+                    repository.finish_sync(run_id, "failed", detail=str(exc))
+                    raise
+            except Exception as exc:
+                snapshot_error = str(exc)
+            if online_players:
+                repository.overlay_online(instance_id, list(online_players))
+            records = repository.list_players(instance_id)
+            targets = cls.temporary_identity_targets(parsed_players, records)
+        finally:
+            repository.close()
+        if not targets:
+            snapshot_records = [
+                {
+                    "player_uid": str(item.get("player_uid") or item.get("player_guid") or "").replace("-", "").upper(),
+                    "nickname": str(item.get("nickname") or ""),
+                    "level": int(item.get("level") or 0),
+                    "save_status": "active",
+                }
+                for item in parsed_players
+            ]
+            targets = cls.temporary_identity_targets(parsed_players, snapshot_records)
+        stale = bool(online_error or snapshot_error)
+        source = "snapshot+rest" if not stale else ("snapshot+cache" if not snapshot_error else "cache")
+        problems = [value for value in (f"REST：{online_error}" if online_error else "", f"存档同步：{snapshot_error}" if snapshot_error else "") if value]
+        detail = f"已同步当前服务器存档玩家 {synced_count} 个，临时身份 {len(targets)} 个"
+        if problems:
+            detail += "；使用缓存补充身份信息（" + "；".join(problems) + "）"
+        return targets, {"source": source, "detail": detail, "stale": stale, "synced_count": synced_count}
+
+    @staticmethod
+    def _world_file_hashes(world: Path, *, exclude_identity: bool = False) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for path in sorted(Path(world).rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(world).as_posix()
+            folded = relative.casefold()
+            if folded.endswith("localdata.sav"):
+                continue
+            if exclude_identity and (folded == "level.sav" or (folded.startswith("players/") and folded.endswith(".sav"))):
+                continue
+            result[relative] = _sha256(path)
+        return result
+
+    @classmethod
+    def _create_client_data_package(cls, session: CoopMigrationSession, source_world: Path, storage_root: Path) -> tuple[str, dict]:
+        files = tuple(path for path in sorted(Path(source_world).rglob("LocalData.sav")) if path.is_file())
+        if not files:
+            return "", {"status": "missing", "message": "源存档未提供 LocalData.sav", "files": []}
+        root = Path(storage_root) / "migrations" / session.instance_id / "restore"
+        package = root / "client-data.zip"
+        entries = []
+        for index, path in enumerate(files):
+            relative = path.relative_to(source_world).as_posix()
+            safe = _safe_relative(relative)
+            archive_name = f"files/{index:03d}/{safe.as_posix()}"
+            entries.append({"source_path": relative, "archive_path": archive_name, "size": path.stat().st_size, "sha256": _sha256(path)})
+        manifest = {
+            "schema": "palworld-console-client-data-v1",
+            "instance_id": session.instance_id,
+            "source_world": str(source_world),
+            "applicable_player_guids": [cls._player_guid(item) for item in session.source_players if cls._player_guid(item)],
+            "files": entries,
+            "created_at": _utc_now(),
+        }
+        temporary = package.with_name(f".{package.name}.{uuid.uuid4().hex}.tmp")
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as bundle:
+                bundle.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+                for path, entry in zip(files, entries):
+                    bundle.write(path, entry["archive_path"])
+            cls.verify_client_data_package(temporary)
+            os.replace(temporary, package)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return str(package), {"status": "ready", "path": str(package), "files": entries}
+
+    @staticmethod
+    def verify_client_data_package(package: Path) -> dict:
+        package = _require_file(Path(package), "客户端数据包")
+        with zipfile.ZipFile(package, "r") as bundle:
+            manifest = json.loads(bundle.read("manifest.json"))
+            if manifest.get("schema") != "palworld-console-client-data-v1":
+                raise ValueError("客户端数据包清单格式不受支持")
+            names = set(bundle.namelist())
+            for entry in manifest.get("files") or []:
+                archive_path = _safe_relative(str(entry.get("archive_path") or "")).as_posix()
+                if archive_path not in names:
+                    raise ValueError(f"客户端数据包缺少文件：{archive_path}")
+                data = bundle.read(archive_path)
+                if len(data) != int(entry.get("size") or -1) or hashlib.sha256(data).hexdigest() != entry.get("sha256"):
+                    raise ValueError(f"客户端数据包校验失败：{archive_path}")
+        return manifest
+
+    @classmethod
+    def _validate_restore_candidate(cls, session: CoopMigrationSession, source: Path, candidate: Path, decoded: Iterable[dict], initial_full_deploy: bool, storage_root: Path) -> dict:
+        decoded = tuple(decoded)
+        active = [cls._player_guid(item) for item in decoded]
+        source_by_guid = {cls._player_guid(item): item for item in session.source_players}
+        candidate_by_guid = {cls._player_guid(item): item for item in decoded}
+        plugin = PlmCodecPlugin(storage_root)
+        candidate_world = plugin.decode(candidate / "Level.sav") if initial_full_deploy or any(item.status == "confirmed" for item in session.mappings) else {}
+
+        def guid_values(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    yield from guid_values(key); yield from guid_values(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value: yield from guid_values(item)
+            elif isinstance(value, str):
+                normalized = value.replace("-", "").upper()
+                if len(normalized) == 32 and all(character in "0123456789ABCDEF" for character in normalized):
+                    yield normalized
+
+        candidate_guids = set(guid_values(candidate_world))
+        player_reports = []
+        for mapping in session.mappings:
+            if active.count(mapping.new_guid) != 1:
+                raise RuntimeError(f"候选世界中的目标玩家 GUID 数量异常：{mapping.new_guid}")
+            if mapping.old_guid != mapping.new_guid and mapping.old_guid in active:
+                raise RuntimeError(f"候选世界仍引用旧玩家 GUID：{mapping.old_guid}")
+            if mapping.status != "confirmed":
+                continue
+            if mapping.old_guid != mapping.new_guid and mapping.old_guid in candidate_guids:
+                raise RuntimeError(f"候选世界的角色、公会或世界引用中仍残留旧 GUID：{mapping.old_guid}")
+            source_player = source_by_guid.get(mapping.old_guid, {})
+            candidate_player = candidate_by_guid.get(mapping.new_guid, {})
+            source_pals = {str(item.get("individual_id") or ""): item for item in source_player.get("pals", ()) if item.get("individual_id")}
+            candidate_pals = {str(item.get("individual_id") or ""): item for item in candidate_player.get("pals", ()) if item.get("individual_id")}
+            if source_pals != candidate_pals:
+                raise RuntimeError(f"候选世界中玩家 {mapping.old_name or mapping.old_guid} 的帕鲁数据不完整或发生变化")
+
+            def inventory(player):
+                return {
+                    (str(item.get("ContainerId") or container), int(item.get("SlotIndex") or 0)): dict(item)
+                    for container, rows in (player.get("items") or {}).items() for item in rows or []
+                }
+
+            if inventory(source_player) != inventory(candidate_player):
+                raise RuntimeError(f"候选世界中玩家 {mapping.old_name or mapping.old_guid} 的背包、钱包或装备容器不一致")
+            ignored = {"player_guid", "player_uid", "instance_id", "player_file", "source", "pals", "items"}
+            source_semantic = {key: value for key, value in source_player.items() if key not in ignored}
+            candidate_semantic = {key: value for key, value in candidate_player.items() if key not in ignored}
+            if source_semantic != candidate_semantic:
+                raise RuntimeError(f"候选世界中玩家 {mapping.old_name or mapping.old_guid} 的角色属性或扩展字段发生变化")
+            player_reports.append({"old_guid": mapping.old_guid, "new_guid": mapping.new_guid, "pals": len(source_pals), "items": len(inventory(source_player)), "semantic_verified": True})
+
+        report = {"mode": "source-authoritative" if initial_full_deploy else "server-incremental", "players": player_reports}
+        if initial_full_deploy:
+            source_files = cls._world_file_hashes(source, exclude_identity=True)
+            candidate_files = cls._world_file_hashes(candidate, exclude_identity=True)
+            if source_files != candidate_files:
+                missing = sorted(set(source_files) - set(candidate_files))
+                changed = sorted(path for path in set(source_files) & set(candidate_files) if source_files[path] != candidate_files[path])
+                extra = sorted(set(candidate_files) - set(source_files))
+                raise RuntimeError(f"候选世界附属文件不完整：缺少 {missing[:3]}，变化 {changed[:3]}，新增 {extra[:3]}")
+            source_world = plugin.decode(source / "Level.sav")
+            for section, key in (("guilds", "guild_id"), ("bases", "base_id")):
+                expected = {str(item.get(key) or "") for item in source_world.get(section, ()) if item.get(key)}
+                actual = {str(item.get(key) or "") for item in candidate_world.get(section, ()) if item.get(key)}
+                if expected != actual:
+                    raise RuntimeError(f"候选世界的{section}集合与联机源世界不一致")
+                report[section] = {"count": len(expected), "verified": True}
+            report["non_identity_files"] = {"count": len(source_files), "verified": True}
+        return report
 
     @classmethod
     def available_identity_targets(cls, old_guid: str, targets: Iterable[dict], used_guids: Iterable[str] = ()) -> tuple[dict, ...]:
@@ -611,7 +862,7 @@ class BackupPackageService:
         updated = replace(session, mappings=tuple(mappings), pending_player_guids=pending, phase="candidate_ready", detail=f"已确认 {len(mappings)} 个映射，待后续迁移 {len(pending)} 个")
         self.save_migration_session(storage_root, updated); return updated
 
-    def refresh_restore_placeholders(self, session: CoopMigrationSession, current_saved_snapshot: Path, storage_root: Path) -> CoopMigrationSession:
+    def refresh_restore_placeholders(self, session: CoopMigrationSession, current_saved_snapshot: Path, storage_root: Path, online_players: Iterable[object] = (), online_error: str = "") -> CoopMigrationSession:
         if session.phase != "waiting_placeholders": raise ValueError(f"当前会话阶段不能刷新临时角色：{session.phase}")
         current_saved_snapshot = Path(current_saved_snapshot).resolve()
         target = self.detect_server_world(current_saved_snapshot / "SaveGames" if (current_saved_snapshot / "SaveGames").is_dir() else current_saved_snapshot)
@@ -620,16 +871,17 @@ class BackupPackageService:
         added = current_files - set(session.baseline_player_files)
         players = self.inspect_world_players(current_world, storage_root)
         placeholders = tuple(item for item in players if f"{self._player_guid(item)}.SAV" in added)
+        placeholders, sync = self.sync_migration_player_center(session.instance_id, current_world, storage_root, placeholders, online_players, online_error)
         root = Path(storage_root) / "migrations" / session.instance_id / "restore"
         current_copy = root / "current-world"
         if current_copy.exists(): shutil.rmtree(current_copy)
         shutil.copytree(current_world, current_copy)
         phase = "mapping_ready" if placeholders else "waiting_placeholders"
-        detail = f"检测到 {len(placeholders)} 个新建临时角色" if placeholders else "尚未检测到新增临时角色"
+        detail = (f"检测到 {len(placeholders)} 个玩家中心低等级临时角色；" if placeholders else "尚未检测到玩家中心内 3 级以下的新增临时角色；") + sync["detail"]
         snapshot_hash = _sha256(current_copy / "Level.sav")
         # Keep source_path as a legacy alias for callers that display the latest snapshot;
         # original_source_path remains immutable and is used for all future merges.
-        updated = replace(session, source_path=str(current_copy), source_world_hash=snapshot_hash, target_snapshot_path=str(current_copy), target_world_hash=snapshot_hash, latest_snapshot_path=str(current_copy), latest_snapshot_hash=snapshot_hash, snapshot_generation=session.snapshot_generation + 1, placeholder_players=placeholders, phase=phase, detail=detail)
+        updated = replace(session, source_path=str(current_copy), source_world_hash=snapshot_hash, target_snapshot_path=str(current_copy), target_world_hash=snapshot_hash, latest_snapshot_path=str(current_copy), latest_snapshot_hash=snapshot_hash, snapshot_generation=session.snapshot_generation + 1, placeholder_players=placeholders, phase=phase, player_sync_source=sync["source"], player_sync_detail=sync["detail"], player_sync_stale=sync["stale"], detail=detail)
         self.save_migration_session(storage_root, updated); return updated
 
     def refresh_restore_target_snapshot(self, session: CoopMigrationSession, current_saved_snapshot: Path, storage_root: Path) -> CoopMigrationSession:
@@ -660,12 +912,26 @@ class BackupPackageService:
         if session.package_path and session.package_hash and _sha256(Path(session.package_path)) != session.package_hash: raise RuntimeError("恢复包在确认映射后发生变化，请重新关联原始转换包")
         if not original.is_dir() or not (original / "Level.sav").is_file(): raise RuntimeError("不可变原始联机存档不存在，请重新关联原始联机存档或转换包")
         if session.original_source_hash and _sha256(original / "Level.sav") != session.original_source_hash: raise RuntimeError("原始联机存档已变化，请重新关联原始联机存档")
+        for record in session.source_player_hashes:
+            guid = str(record.get("guid") or "").replace("-", "").upper()
+            player_file = original / "Players" / str(record.get("file") or f"{guid}.sav")
+            if not guid or not player_file.is_file() or _sha256(player_file) != record.get("hash"):
+                raise RuntimeError(f"原始联机玩家文件已变化：{guid or '未知玩家'}")
+        source_baseline = (session.content_report or {}).get("source_baseline") or {}
+        expected_files = source_baseline.get("non_identity_files")
+        if expected_files is not None and self._world_file_hashes(original, exclude_identity=True) != expected_files:
+            raise RuntimeError("原始联机世界附属文件在预检后发生变化，请重新执行迁移预检")
+        expected_local_data = source_baseline.get("local_data")
+        current_local_data = {path.relative_to(original).as_posix(): _sha256(path) for path in original.rglob("LocalData.sav") if path.is_file()}
+        if expected_local_data is not None and current_local_data != expected_local_data:
+            raise RuntimeError("原始联机 LocalData.sav 在预检后发生变化，请重新执行迁移预检")
         if not latest.is_dir() or not (latest / "Level.sav").is_file(): raise RuntimeError("最新专服快照不存在，请先刷新服务器快照")
         if session.latest_snapshot_hash and _sha256(latest / "Level.sav") != session.latest_snapshot_hash: raise RuntimeError("最新专服快照在映射确认后发生变化，请重新刷新服务器快照")
         root = Path(storage_root) / "migrations" / session.instance_id / "restore"; candidate_input = root / "candidate-input"; candidate = root / "candidate"
         for path in (candidate_input, candidate):
             if path.exists(): shutil.rmtree(path)
-        shutil.copytree(latest, candidate_input)
+        initial_full_deploy = session.schema_version >= 3 and not session.source_world_deployed
+        shutil.copytree(original if initial_full_deploy else latest, candidate_input)
         source_players = original / "Players"; target_players = latest / "Players"; candidate_players = candidate_input / "Players"; candidate_players.mkdir(exist_ok=True)
         active_mappings = tuple(item for item in session.mappings if item.status == "confirmed")
         for mapping in active_mappings:
@@ -673,35 +939,32 @@ class BackupPackageService:
             if not placeholder.is_file(): raise FileNotFoundError(f"目标身份玩家文件不存在：{placeholder.name}")
             old_file = source_players / f"{mapping.old_guid}.sav"
             if not old_file.is_file(): raise FileNotFoundError(f"原始玩家文件不存在：{old_file.name}")
-            # Keep the latest server Level/world state, while providing both source role data and the current placeholder.
-            shutil.copy2(old_file, candidate_players / old_file.name)
-            shutil.copy2(placeholder, candidate_players / placeholder.name)
+            if not initial_full_deploy:
+                # Incremental rounds retain the latest server world and import the immutable source role data.
+                shutil.copy2(old_file, candidate_players / old_file.name)
+            if mapping.old_guid != mapping.new_guid:
+                shutil.copy2(placeholder, candidate_players / placeholder.name)
         if active_mappings:
-            report = PlmCodecPlugin(storage_root).migrate_identities_v2(latest, original, [asdict(item) for item in active_mappings], candidate)
+            plugin = PlmCodecPlugin(storage_root)
+            if initial_full_deploy:
+                report = plugin.migrate_identities(candidate_input, [asdict(item) for item in active_mappings], candidate)
+                report["world_mode"] = "source-authoritative"
+            else:
+                report = plugin.migrate_identities_v2(latest, original, [asdict(item) for item in active_mappings], candidate)
+                report["world_mode"] = "server-incremental"
         else:
             shutil.copytree(candidate_input, candidate); report = {"migrated": 0, "players": []}
+            report["world_mode"] = "source-authoritative" if initial_full_deploy else "server-incremental"
+        for local_data in tuple(candidate.rglob("LocalData.sav")):
+            local_data.unlink()
+        client_package, client_report = self._create_client_data_package(session, original, storage_root)
         decoded = self.inspect_world_players(candidate, storage_root)
-        active = [self._player_guid(item) for item in decoded]
-        source_by_guid = {self._player_guid(item): item for item in session.source_players}
-        candidate_by_guid = {self._player_guid(item): item for item in decoded}
-        for mapping in session.mappings:
-            if active.count(mapping.new_guid) != 1: raise RuntimeError(f"候选世界中的目标玩家 GUID 数量异常：{mapping.new_guid}")
-            if mapping.old_guid != mapping.new_guid and mapping.old_guid in active: raise RuntimeError(f"候选世界仍引用旧玩家 GUID：{mapping.old_guid}")
-            source_player = source_by_guid.get(mapping.old_guid, {}); candidate_player = candidate_by_guid.get(mapping.new_guid, {})
-            source_pals = {str(item.get("individual_id") or "") for item in source_player.get("pals", ()) if item.get("individual_id")}
-            candidate_pals = {str(item.get("individual_id") or "") for item in candidate_player.get("pals", ()) if item.get("individual_id")}
-            missing_pals = source_pals - candidate_pals
-            if missing_pals: raise RuntimeError(f"候选世界缺少玩家 {mapping.old_name or mapping.old_guid} 的帕鲁：{', '.join(sorted(missing_pals))}")
-            def inventory(player):
-                return {
-                    (str(item.get("ContainerId") or container), int(item.get("SlotIndex") or 0)): (str(item.get("ItemId") or ""), int(item.get("StackCount") or 0))
-                    for container, rows in (player.get("items") or {}).items() for item in rows or []
-                }
-            source_items = inventory(source_player); candidate_items = inventory(candidate_player)
-            missing_items = [identity for identity, value in source_items.items() if candidate_items.get(identity) != value]
-            if missing_items: raise RuntimeError(f"候选世界缺少玩家 {mapping.old_name or mapping.old_guid} 的背包或钱包数据，共 {len(missing_items)} 个槽位不一致")
+        content_report = dict(session.content_report or {})
+        content_report.update(self._validate_restore_candidate(session, original, candidate, decoded, initial_full_deploy, storage_root))
+        content_report["client_data"] = client_report
+        report["integrity"] = content_report
         baseline = tuple(sorted(path.name.upper() for path in (candidate / "Players").glob("*.sav")))
-        updated = replace(session, phase="deploying", baseline_player_files=baseline, detail=f"候选验证通过，已迁移 {report.get('migrated', 0)} 个玩家")
+        updated = replace(session, phase="deploying", baseline_player_files=baseline, content_report=content_report, client_data_package_path=client_package, detail=f"候选验证通过，已迁移 {report.get('migrated', 0)} 个玩家")
         self.save_migration_session(storage_root, updated); return updated, report
 
     def extract_saved_snapshot(self, archive: Path, destination: Path) -> Path:
@@ -734,9 +997,14 @@ class BackupPackageService:
             players = self.inspect_world_players(target, storage_root); active = [self._player_guid(item) for item in players]
             for mapping in session.mappings:
                 if active.count(mapping.new_guid) != 1: raise RuntimeError(f"服务器复查未找到唯一目标玩家：{mapping.new_guid}")
+            expected_files = self._world_file_hashes(candidate, exclude_identity=True)
+            deployed_files = self._world_file_hashes(target, exclude_identity=True)
+            if expected_files != deployed_files:
+                raise RuntimeError("部署后复查发现世界附属文件与已验证候选不一致")
             phase = "waiting_placeholders" if session.pending_player_guids else "complete"
             migrated = tuple(replace(item, status="migrated") if item.status == "confirmed" else item for item in session.mappings)
-            updated = replace(session, mappings=migrated, phase=phase, backup_path=restore_point or str(rollback), detail=f"世界恢复完成；已迁移 {len(migrated)} 个玩家；待迁移 {len(session.pending_player_guids)} 个")
+            content_report = dict(session.content_report); content_report["deployment"] = {"verified": True, "kind": "local", "players": len(active), "non_identity_files": len(deployed_files)}
+            updated = replace(session, mappings=migrated, phase=phase, source_world_deployed=True, content_report=content_report, backup_path=restore_point or str(rollback), detail=f"世界恢复完成；已迁移 {len(migrated)} 个玩家；待迁移 {len(session.pending_player_guids)} 个")
             self.save_migration_session(storage_root, updated); progress(100, "恢复完成", updated.detail)
             return RestoreResult(True, session.package_path, updated.backup_path, ("world", "players"), False, updated.detail)
         except Exception as exc:
@@ -786,7 +1054,8 @@ class BackupPackageService:
             for mapping in session.mappings:
                 if active.count(mapping.new_guid) != 1: raise RuntimeError(f"远程服务器复查未找到唯一目标玩家：{mapping.new_guid}")
             phase = "waiting_placeholders" if session.pending_player_guids else "complete"; migrated = tuple(replace(item, status="migrated") if item.status == "confirmed" else item for item in session.mappings); detail = f"世界恢复完成；已迁移 {len(migrated)} 个玩家；待迁移 {len(session.pending_player_guids)} 个"
-            updated = replace(session, mappings=migrated, phase=phase, backup_path=restore_point, detail=detail); self.save_migration_session(storage_root, updated)
+            content_report = dict(session.content_report); content_report["deployment"] = {"verified": True, "kind": "remote", "players": len(active), "level_sha256": _sha256(readback)}
+            updated = replace(session, mappings=migrated, phase=phase, source_world_deployed=True, content_report=content_report, backup_path=restore_point, detail=detail); self.save_migration_session(storage_root, updated)
             RestoreTransaction._cleanup_remote(client, platform_name, rollback, remote_archive); progress(100, "恢复完成", detail)
             return RestoreResult(True, session.package_path, restore_point, ("world", "players"), False, detail)
         except Exception as exc:

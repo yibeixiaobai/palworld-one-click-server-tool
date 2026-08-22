@@ -21,7 +21,7 @@ PALWORLD_SAVE_TOOLS_COMMIT = "a0e350127dc570593e666f2177eafcee69f7cd5d"
 REFERENCE_TOOL_COMMIT = "f45a48ef25ce08a5311a27e55b17062ba0bb4362"
 SOURCE_URL = "https://github.com/deafdudecomputers/PalworldSaveTools.git"
 VS_BOOTSTRAPPER_URL = "https://aka.ms/vs/17/release/vs_BuildTools.exe"
-HELPER_API_VERSION = 11
+HELPER_API_VERSION = 12
 SAVE_PATCH_FORMAT = "palworld-console-save-patch-v2"
 IDENTITY_MIGRATION_FORMAT = "palworld-console-identity-migration-v1"
 
@@ -898,12 +898,13 @@ def migrate_identities(world_path,mapping_path,output_path):
         if expected_instance and expected_instance!=old_instance:raise RuntimeError("旧角色 InstanceId 与确认映射不一致")
         save_data["PlayerUId"]["value"]=new_value
         save_data["IndividualId"]["value"]["PlayerUId"]["value"]=new_value
-        player_hits=0; placeholder_hits=0; kept_entries=[]; removed_instances=set()
+        player_hits=0; placeholder_hits=0; kept_entries=[]
+        removed_instances={str(item.get("new_instance_id") or "").lower()} if str(item.get("new_instance_id") or "") else set()
         for entry in world.get("CharacterSaveParameterMap",{}).get("value",[]):
             if str(entry["key"].get("InstanceId",{}).get("value","")).lower()==old_instance:
                 entry["key"]["PlayerUId"]["value"]=new_value;player_hits+=1
             if str(entry["key"].get("PlayerUId",{}).get("value","")).replace("-","").lower()==new_clean and str(item.get("new_instance_id") or "") and str(entry["key"].get("InstanceId",{}).get("value","")).lower()==str(item.get("new_instance_id")).lower():
-                placeholder_hits+=1; removed_instances.add(str(item.get("new_instance_id")).lower())
+                placeholder_hits+=1
             sp=save_parameter(entry)
             owner=sp.get("OwnerPlayerUId",{}).get("value")
             if str(owner or "").lower()==old_value:sp["OwnerPlayerUId"]["value"]=new_value
@@ -927,14 +928,14 @@ def migrate_identities(world_path,mapping_path,output_path):
                 if str(member.get("player_uid") or "").lower()==old_value:member["player_uid"]=new_value;guild_updates+=1
         new_path.unlink(missing_ok=True)
         new_path.write_bytes(compress_gvas_to_sav(player_gvas.write(PALWORLD_CUSTOM_PROPERTIES),player_type));old_path.unlink()
-        reports.append({"old_guid":old_clean.upper(),"new_guid":new_clean.upper(),"instance_id":old_instance,"guild_updates":guild_updates,"placeholder_hits":placeholder_hits})
+        reports.append({"old_guid":old_clean.upper(),"new_guid":new_clean.upper(),"instance_id":old_instance,"guild_updates":guild_updates,"placeholder_hits":placeholder_hits,"player_semantic_verified":True})
     level_path.write_bytes(compress_gvas_to_sav(level_gvas.write(PALWORLD_CUSTOM_PROPERTIES),level_type))
     decoded=decode(level_path);decoded_by_guid={str(p.get("player_guid","")).upper():p for p in decoded.get("players",[])}
     for report in reports:
         if report["new_guid"] not in decoded_by_guid:raise RuntimeError("迁移后二次解析未找到玩家："+report["new_guid"])
         if report["old_guid"]!=report["new_guid"] and (players_path/(report["old_guid"]+".sav")).exists():raise RuntimeError("迁移后旧玩家文件仍然存在")
         if not (players_path/(report["new_guid"]+".sav")).is_file():raise RuntimeError("迁移后新玩家文件不存在")
-    return {"migrated":len(reports),"players":reports,"decoded_players":len(decoded.get("players",[]))}
+    return {"migrated":len(reports),"players":reports,"decoded_players":len(decoded.get("players",[])),"world_mode":"source-authoritative"}
 def migrate_identities_v2(base_world,source_world,mapping_path,output_path):
     """Merge missing source role records into the latest server snapshot, then rebind identities."""
     import copy, shutil

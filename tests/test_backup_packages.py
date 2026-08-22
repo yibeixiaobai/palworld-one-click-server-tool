@@ -12,6 +12,7 @@ from palworld_console.models import CoopMigrationSession, PlayerIdentityMapping,
 from palworld_console.services import BackupService
 from palworld_console.save_codec import PluginParsedSave
 from palworld_console.management import SaveGameService
+from palworld_console.player_store import PlayerRepository
 
 
 def make_saved(root: Path, world: str = "WORLD-A", secret: str = "source-secret") -> Path:
@@ -221,6 +222,7 @@ def test_prepare_restore_migration_preserves_downloaded_target_snapshot(tmp_path
     target_player = {"player_guid": "B" * 32, "nickname": "Target", "instance_id": "target-instance"}
     monkeypatch.setattr("palworld_console.backup_packages.PlmCodecPlugin.probe", lambda _self: (True, "ready"))
     monkeypatch.setattr(BackupPackageService, "inspect_world_players", staticmethod(lambda world, _root=None: (source_player,) if "source-world" in str(world) else (target_player,)))
+    monkeypatch.setattr(BackupPackageService, "temporary_identity_targets_from_player_center", classmethod(lambda cls, _instance, targets, _root: tuple(targets)))
 
     session = service.prepare_restore_migration(package, instance, target_saved, str(target_saved / "SaveGames" / "0" / "TARGET"), tmp_path / "app")
 
@@ -228,6 +230,40 @@ def test_prepare_restore_migration_preserves_downloaded_target_snapshot(tmp_path
     assert Path(session.target_snapshot_path, "Level.sav").is_file()
     assert session.source_players == (source_player,)
     assert session.placeholder_players == (target_player,)
+
+
+def test_migration_player_sync_never_uses_another_instance_cache(tmp_path: Path, monkeypatch):
+    repository = PlayerRepository(tmp_path / "players.db")
+    try:
+        repository.upsert_save_snapshot("other-server", {"players": [{"player_uid": "shared", "nickname": "Other", "level": 1}]})
+    finally:
+        repository.close()
+    monkeypatch.setattr("palworld_console.backup_packages.PlmCodecPlugin.decode", lambda *_args: (_ for _ in ()).throw(RuntimeError("decode failed")))
+    target = {"player_uid": "shared", "player_guid": "B" * 32, "nickname": "Current", "level": 20}
+
+    targets, report = BackupPackageService.sync_migration_player_center("current-server", tmp_path, tmp_path, (target,), online_error="rest failed")
+
+    assert targets == ()
+    assert report["stale"] is True
+    assert report["source"] == "cache"
+
+
+def test_schema_v2_deployed_session_upgrades_to_incremental_mode(tmp_path: Path):
+    service = BackupPackageService()
+    mapping = PlayerIdentityMapping(old_guid="A" * 32, new_guid="B" * 32, status="migrated", confirmed=True)
+    session = CoopMigrationSession(instance_id="server", source_path="source", target_world_path="target", schema_version=2, mappings=(mapping,))
+    path = service.save_migration_session(tmp_path, session)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for key in ("player_sync_source", "player_sync_detail", "player_sync_stale", "source_world_deployed", "content_report", "client_data_package_path"):
+        payload.pop(key, None)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    upgraded = service.load_migration_session(tmp_path, "server")
+
+    assert upgraded is not None
+    assert upgraded.schema_version == 3
+    assert upgraded.source_world_deployed is True
+    assert upgraded.player_sync_stale is True
 
 
 def test_restore_mapping_keeps_completed_players_and_only_maps_pending(tmp_path: Path):
@@ -263,6 +299,24 @@ def test_identity_target_candidates_exclude_same_used_and_duplicate_guids():
     assert result == ({"player_guid": available, "nickname": "first"},)
 
 
+def test_temporary_identity_targets_only_use_active_player_center_records_below_level_three():
+    targets = (
+        {"player_guid": "A" * 32, "player_uid": "100", "nickname": "stale-a", "level": 80},
+        {"player_guid": "B" * 32, "player_uid": "200", "nickname": "stale-b", "level": 1},
+        {"player_guid": "C" * 32, "player_uid": "300", "nickname": "stale-c", "level": 1},
+        {"player_guid": "D" * 32, "player_uid": "400", "nickname": "not-in-center", "level": 1},
+    )
+    center = (
+        {"player_uid": "100", "nickname": "Temporary A", "level": 2, "save_status": "active"},
+        {"player_uid": "200", "nickname": "Level Three", "level": 3, "save_status": "active"},
+        {"player_uid": "300", "nickname": "Missing", "level": 1, "save_status": "missing"},
+    )
+
+    result = BackupPackageService.temporary_identity_targets(targets, center)
+
+    assert result == ({"player_guid": "A" * 32, "player_uid": "100", "nickname": "Temporary A", "level": 2},)
+
+
 def test_restore_mapping_accepts_identity_preserving_target_and_rejects_reuse(tmp_path: Path):
     service = BackupPackageService(); old_a = "A" * 32; old_c = "C" * 32; target = "B" * 32
     session = CoopMigrationSession(instance_id="server", source_path="source", target_world_path="target", phase="mapping_ready", source_players=({"player_guid": old_a, "nickname": "Alice"}, {"player_guid": old_c, "nickname": "Carol"}), placeholder_players=({"player_guid": old_a}, {"player_guid": target}), pending_player_guids=(old_a, old_c))
@@ -281,6 +335,7 @@ def test_refresh_restore_placeholders_only_returns_players_added_after_baseline(
     (players / existing).write_bytes(b"existing"); (players / pending).write_bytes(b"pending"); (players / placeholder).write_bytes(b"placeholder")
     decoded = ({"player_guid": "A" * 32}, {"player_guid": "C" * 32}, {"player_guid": "D" * 32, "nickname": "New"})
     monkeypatch.setattr(BackupPackageService, "inspect_world_players", staticmethod(lambda *_args: decoded))
+    monkeypatch.setattr(BackupPackageService, "temporary_identity_targets_from_player_center", classmethod(lambda cls, _instance, targets, _root: tuple(targets)))
     session = CoopMigrationSession(
         instance_id="server", source_path="old", target_world_path="target", phase="waiting_placeholders",
         baseline_player_files=(existing.upper(), pending.upper()), pending_player_guids=("C" * 32,), package_path="backup.pwcbackup",
@@ -300,6 +355,7 @@ def test_restore_continuation_keeps_immutable_original_source(tmp_path: Path, mo
     source = tmp_path / "source"; (source / "Players").mkdir(parents=True); (source / "Level.sav").write_bytes(b"source-level")
     (source / "Players" / ("A" * 32 + ".sav")).write_bytes(b"source-player")
     monkeypatch.setattr(BackupPackageService, "inspect_world_players", staticmethod(lambda world, *_args: ({"player_guid": "B" * 32, "instance_id": "new-instance", "nickname": "New"},)))
+    monkeypatch.setattr(BackupPackageService, "temporary_identity_targets_from_player_center", classmethod(lambda cls, _instance, targets, _root: tuple(targets)))
     session = CoopMigrationSession(instance_id="server", source_path=str(source), original_source_path=str(source), target_world_path=str(world), phase="waiting_placeholders", baseline_player_files=(("A" * 32 + ".sav").upper(),), pending_player_guids=("A" * 32,))
     updated = service.refresh_restore_placeholders(session, saved, tmp_path / "app")
     assert updated.original_source_path == str(source)
@@ -345,12 +401,90 @@ def test_refresh_coop_placeholders_matches_player_filenames_case_insensitively(t
     service = BackupPackageService(); target = tmp_path / "target"; players_dir = target / "Players"; players_dir.mkdir(parents=True); (target / "Level.sav").write_bytes(b"level")
     guid = "ABCDEF0123456789ABCDEF0123456789"; (players_dir / f"{guid.lower()}.sav").write_bytes(b"player")
     monkeypatch.setattr(BackupPackageService, "inspect_world_players", staticmethod(lambda *_args: ({"player_guid": guid, "instance_id": "new-instance"},)))
+    monkeypatch.setattr(BackupPackageService, "temporary_identity_targets_from_player_center", classmethod(lambda cls, _instance, targets, _root: tuple(targets)))
     session = CoopMigrationSession(instance_id="server", source_path="source", target_world_path=str(target), phase="waiting_placeholders", baseline_player_files=())
 
     updated = service.refresh_coop_placeholders(session, tmp_path / "storage")
 
     assert service._player_guid(updated.placeholder_players[0]) == guid
     assert updated.phase == "mapping_ready"
+
+
+def test_initial_restore_candidate_uses_complete_source_world_and_exports_local_data(tmp_path: Path, monkeypatch):
+    service = BackupPackageService(); storage = tmp_path / "app"
+    source = tmp_path / "source-world"; target = tmp_path / "target-world"
+    for world, level in ((source, b"source-level"), (target, b"target-level")):
+        (world / "Players").mkdir(parents=True)
+        (world / "Level.sav").write_bytes(level)
+        (world / "Players" / ("A" * 32 + ".sav")).write_bytes(b"player")
+    (source / "LevelMeta.sav").write_bytes(b"source-meta")
+    (source / "WorldOption.sav").write_bytes(b"source-options")
+    (source / "UnknownExtension.bin").write_bytes(b"unknown-world-data")
+    (source / "LocalData.sav").write_bytes(b"client-only")
+    (target / "target-only.bin").write_bytes(b"must-not-survive")
+    player = {"player_guid": "A" * 32, "player_uid": "A" * 32, "instance_id": "source-instance", "nickname": "Source", "level": 20, "pals": [], "items": {}}
+    monkeypatch.setattr(BackupPackageService, "inspect_world_players", staticmethod(lambda *_args: (player,)))
+    monkeypatch.setattr("palworld_console.backup_packages.PlmCodecPlugin.decode", lambda _self, _path: {"players": [player], "guilds": [{"guild_id": "guild-1"}], "bases": [{"base_id": "base-1"}]})
+    session = CoopMigrationSession(
+        instance_id="server", source_path=str(source), original_source_path=str(source), target_world_path=str(target),
+        target_snapshot_path=str(target), latest_snapshot_path=str(target), original_source_hash=hashlib.sha256((source / "Level.sav").read_bytes()).hexdigest(),
+        latest_snapshot_hash=hashlib.sha256((target / "Level.sav").read_bytes()).hexdigest(), source_players=(player,), pending_player_guids=("A" * 32,), phase="candidate_ready",
+    )
+
+    updated, report = service.build_restore_candidate(session, storage)
+
+    candidate = storage / "migrations" / "server" / "restore" / "candidate"
+    assert (candidate / "Level.sav").read_bytes() == b"source-level"
+    assert (candidate / "LevelMeta.sav").read_bytes() == b"source-meta"
+    assert (candidate / "WorldOption.sav").read_bytes() == b"source-options"
+    assert (candidate / "UnknownExtension.bin").read_bytes() == b"unknown-world-data"
+    assert not (candidate / "target-only.bin").exists()
+    assert not (candidate / "LocalData.sav").exists()
+    manifest = service.verify_client_data_package(Path(updated.client_data_package_path))
+    assert manifest["files"][0]["sha256"] == hashlib.sha256(b"client-only").hexdigest()
+    assert report["world_mode"] == "source-authoritative"
+    assert updated.content_report["non_identity_files"]["verified"] is True
+
+
+def test_incremental_restore_candidate_retains_latest_server_progress(tmp_path: Path, monkeypatch):
+    service = BackupPackageService(); storage = tmp_path / "app"
+    source = tmp_path / "source-world"; latest = tmp_path / "latest-world"
+    for world, level in ((source, b"source-level"), (latest, b"latest-level")):
+        (world / "Players").mkdir(parents=True)
+        (world / "Level.sav").write_bytes(level)
+        (world / "Players" / ("A" * 32 + ".sav")).write_bytes(b"player")
+    (source / "source-only.bin").write_bytes(b"old")
+    (latest / "new-server-progress.bin").write_bytes(b"new")
+    player = {"player_guid": "A" * 32, "player_uid": "A" * 32, "instance_id": "instance", "nickname": "Source", "level": 20, "pals": [], "items": {}}
+    monkeypatch.setattr(BackupPackageService, "inspect_world_players", staticmethod(lambda *_args: (player,)))
+    session = CoopMigrationSession(
+        instance_id="server", source_path=str(latest), original_source_path=str(source), target_world_path=str(latest),
+        target_snapshot_path=str(latest), latest_snapshot_path=str(latest), original_source_hash=hashlib.sha256((source / "Level.sav").read_bytes()).hexdigest(),
+        latest_snapshot_hash=hashlib.sha256((latest / "Level.sav").read_bytes()).hexdigest(), source_players=(player,), source_world_deployed=True, phase="candidate_ready",
+    )
+
+    updated, report = service.build_restore_candidate(session, storage)
+
+    candidate = storage / "migrations" / "server" / "restore" / "candidate"
+    assert (candidate / "Level.sav").read_bytes() == b"latest-level"
+    assert (candidate / "new-server-progress.bin").read_bytes() == b"new"
+    assert not (candidate / "source-only.bin").exists()
+    assert report["world_mode"] == "server-incremental"
+    assert updated.source_world_deployed is True
+
+
+def test_client_data_package_rejects_tampering(tmp_path: Path):
+    package = tmp_path / "client-data.zip"
+    payload = b"local-data"
+    manifest = {
+        "schema": "palworld-console-client-data-v1",
+        "files": [{"archive_path": "files/000/LocalData.sav", "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}],
+    }
+    with zipfile.ZipFile(package, "w") as bundle:
+        bundle.writestr("manifest.json", json.dumps(manifest))
+        bundle.writestr("files/000/LocalData.sav", b"tampered")
+    with pytest.raises(ValueError, match="校验失败"):
+        BackupPackageService.verify_client_data_package(package)
 
 
 def test_refresh_coop_placeholders_surfaces_identity_parse_error(tmp_path: Path, monkeypatch):

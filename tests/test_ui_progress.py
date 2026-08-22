@@ -6,7 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtWidgets import QApplication, QMessageBox
-from PySide6.QtCore import QItemSelectionModel
+from PySide6.QtCore import QItemSelectionModel, QThread
 
 from palworld_console.models import ConfigSyncResult, PlayerRecord, ServerInstance, TaskProgress, UninstallResult
 from palworld_console.backup_packages import BackupPackageService, RestoreTransaction
@@ -60,6 +60,31 @@ def test_progress_widget_supports_indeterminate_and_determinate_states(window):
     assert window.install_progress.maximum() == 100
     assert window.install_progress.value() == 64
     assert window.install_percent.text() == "64%"
+
+
+def test_world_path_is_initialized_and_auto_detected_before_save_sync(window, monkeypatch, tmp_path):
+    level = tmp_path / "Saved" / "SaveGames" / "imported-world" / "Level.sav"
+    window.save_remote_path = ""
+    window.save_working_path = None
+    monkeypatch.setattr(window, "_find_save_path", lambda: str(level))
+
+    window.selected.kind = "local"
+    assert window._world_local_path() == level.parent.resolve()
+
+    window.selected.kind = "remote"
+    window.selected.remote_profile["platform"] = "linux"
+    monkeypatch.setattr(window, "_find_save_path", lambda: "/srv/palworld/Pal/Saved/SaveGames/imported-world/Level.sav")
+    assert window._world_remote_path() == "/srv/palworld/Pal/Saved/SaveGames/imported-world"
+
+
+def test_switching_instance_clears_previous_save_paths(window):
+    window.save_remote_path = "/old/SaveGames/WORLD/Level.sav"
+    window.save_working_path = Path("old/Level.sav")
+
+    window.select_instance(0)
+
+    assert window.save_remote_path == ""
+    assert window.save_working_path is None
 
 
 def test_backup_page_mirrors_task_progress_and_heartbeat(window, monkeypatch):
@@ -266,11 +291,32 @@ def test_cancelled_identity_mapping_dialog_does_not_confirm_restore(window, monk
 
     monkeypatch.setattr(ui_module, "IdentityMappingDialog", CancelledDialog)
     monkeypatch.setattr(BackupPackageService, "confirm_restore_mappings", lambda *_args: calls.append("confirm"))
-    session = SimpleNamespace(source_players=(), placeholder_players=())
+    monkeypatch.setattr(BackupPackageService, "temporary_identity_targets_from_player_center", classmethod(lambda cls, _instance, targets, _root: tuple(targets)))
+    session = SimpleNamespace(instance_id="server", source_players=(), placeholder_players=())
 
     window._restore_migration_prepared((session, "restore-point"), "test")
 
     assert calls == []
+
+
+def test_restore_migration_worker_returns_to_main_thread_and_is_released(window, app, monkeypatch):
+    callbacks = []
+    monkeypatch.setattr(
+        window,
+        "_restore_migration_prepared",
+        lambda prepared, reason: callbacks.append((prepared, reason, QThread.currentThread())),
+    )
+    worker = ui_module.Worker(lambda _signals: (("session", "restore-point"), "coop"), with_signals=True)
+    worker.signals.finished.connect(window._restore_migration_task_done)
+
+    window._start_worker(worker)
+    deadline = ui_module.time.monotonic() + 5
+    while (not callbacks or window._active_workers) and ui_module.time.monotonic() < deadline:
+        app.processEvents()
+        QThread.msleep(10)
+
+    assert callbacks == [(('session', 'restore-point'), 'coop', app.thread())]
+    assert worker not in window._active_workers
 
 
 def test_update_check_states_and_automatic_failure(window, monkeypatch):

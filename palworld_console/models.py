@@ -124,13 +124,19 @@ class CoopMigrationSession:
     target_platform: str = "windows"
     pending_player_guids: tuple[str, ...] = ()
     detail: str = ""
-    schema_version: int = 2
+    schema_version: int = 3
     original_source_path: str = ""
     original_source_hash: str = ""
     source_player_hashes: tuple[dict[str, str], ...] = ()
     latest_snapshot_path: str = ""
     latest_snapshot_hash: str = ""
     snapshot_generation: int = 0
+    player_sync_source: str = ""
+    player_sync_detail: str = ""
+    player_sync_stale: bool = False
+    source_world_deployed: bool = False
+    content_report: dict[str, Any] = field(default_factory=dict)
+    client_data_package_path: str = ""
 
 
 @dataclass(frozen=True)

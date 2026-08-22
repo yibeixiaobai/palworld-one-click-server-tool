@@ -83,6 +83,35 @@ class WorldDirectoryTransaction:
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
+    @staticmethod
+    def _local_savegames_root(world: Path) -> Path:
+        for candidate in (world, *world.parents):
+            if candidate.name.casefold() == "savegames":
+                return candidate
+        raise ValueError(f"活动世界不在 SaveGames 目录内：{world}")
+
+    @staticmethod
+    def _remote_savegames_root(remote_world: str, platform_name: str) -> str:
+        if platform_name == "windows":
+            candidate = ntpath.normpath(remote_world)
+            while candidate:
+                if ntpath.basename(candidate).casefold() == "savegames":
+                    return candidate
+                parent = ntpath.dirname(candidate)
+                if parent == candidate:
+                    break
+                candidate = parent
+        else:
+            candidate = remote_world.rstrip("/") or "/"
+            while candidate:
+                if candidate.rsplit("/", 1)[-1].casefold() == "savegames":
+                    return candidate
+                parent = candidate.rsplit("/", 1)[0] or "/"
+                if parent == candidate:
+                    break
+                candidate = parent
+        raise ValueError(f"活动世界不在 SaveGames 目录内：{remote_world}")
+
     def reset_local(
         self,
         world_path: Path,
@@ -94,20 +123,32 @@ class WorldDirectoryTransaction:
     ) -> WorldMutationResult:
         world = Path(world_path).resolve()
         if not (world / "Level.sav").is_file(): raise FileNotFoundError(f"活动世界无效：{world}")
-        rollback = world.parent / f".{world.name}.pwc-reset-{uuid.uuid4().hex}"
-        stop(); package = self._validated_backup(create_backup); world.rename(rollback)
+        savegames = self._local_savegames_root(world)
+        rollback = savegames.parent / f".{savegames.name}.pwc-reset-{uuid.uuid4().hex}"
+        stop()
+        try:
+            package = self._validated_backup(create_backup)
+        except Exception:
+            start()
+            raise
+        savegames.rename(rollback)
         try:
             start(); deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline and not (world / "Level.sav").is_file(): time.sleep(1)
-            if not (world / "Level.sav").is_file(): raise RuntimeError("服务器未在期限内生成新 Level.sav")
+            generated: Path | None = None
+            while time.monotonic() < deadline:
+                generated = next(savegames.rglob("Level.sav"), None) if savegames.is_dir() else None
+                if generated is not None:
+                    break
+                time.sleep(1)
+            if generated is None: raise RuntimeError("服务器未在期限内生成新 Level.sav")
             if not health(): raise RuntimeError("新世界服务器健康检查失败")
             shutil.rmtree(rollback)
-            return WorldMutationResult(str(package), str(world), "reset")
+            return WorldMutationResult(str(package), str(generated.parent), "reset")
         except Exception as exc:
             try:
                 try: stop()
                 except Exception: pass
-                shutil.rmtree(world, ignore_errors=True); rollback.rename(world); start()
+                shutil.rmtree(savegames, ignore_errors=True); rollback.rename(savegames); start()
             except Exception as rollback_exc:
                 raise RuntimeError(f"世界重置回滚失败，服务器已保持停止：{rollback_exc}；原错误：{exc}") from exc
             raise RuntimeError(f"新世界验证失败，已恢复原世界：{exc}") from exc
@@ -191,30 +232,43 @@ class WorldDirectoryTransaction:
     def reset_remote(self, client, remote_world: str, platform_name: str, create_backup: Callable[[], Any], stop: Callable[[], None], start: Callable[[], None], health: Callable[[], bool], timeout: float = 120) -> WorldMutationResult:
         platform_name = platform_name.casefold(); token = uuid.uuid4().hex
         join = ntpath.join if platform_name == "windows" else lambda a, b: f"{a.rstrip('/')}/{b}"
-        parent = ntpath.dirname(remote_world) if platform_name == "windows" else remote_world.rsplit("/", 1)[0]; name = ntpath.basename(remote_world) if platform_name == "windows" else remote_world.rstrip("/").rsplit("/", 1)[-1]; rollback = join(parent, f".{name}.pwc-reset-{token}")
-        stop(); package = self._validated_backup(create_backup)
+        savegames = self._remote_savegames_root(remote_world, platform_name)
+        parent = ntpath.dirname(savegames) if platform_name == "windows" else savegames.rsplit("/", 1)[0]
+        rollback = join(parent, f".SaveGames.pwc-reset-{token}")
+        stop()
+        try:
+            package = self._validated_backup(create_backup)
+        except Exception:
+            start()
+            raise
         if platform_name == "windows":
             from .services import RemoteHostClient
-            q = RemoteHostClient._ps_literal; code, output, error = client.run_powershell(f"Move-Item -LiteralPath {q(remote_world)} -Destination {q(rollback)}")
-        else: code, output, error = client.run(f"mv -- {shlex.quote(remote_world)} {shlex.quote(rollback)}")
+            q = RemoteHostClient._ps_literal; code, output, error = client.run_powershell(f"Move-Item -LiteralPath {q(savegames)} -Destination {q(rollback)}")
+        else: code, output, error = client.run(f"mv -- {shlex.quote(savegames)} {shlex.quote(rollback)}")
         if code:
             start(); raise RuntimeError(error.strip() or output.strip() or "无法暂存原世界")
         try:
-            start(); deadline = time.monotonic() + timeout; exists = False
+            start(); deadline = time.monotonic() + timeout; generated_world = ""
             while time.monotonic() < deadline:
                 if platform_name == "windows":
-                    q = RemoteHostClient._ps_literal; code, output, _ = client.run_powershell(f"if(Test-Path -LiteralPath {q(join(remote_world, 'Level.sav'))} -PathType Leaf){{'yes'}}")
-                else: code, output, _ = client.run(f"test -f {shlex.quote(join(remote_world, 'Level.sav'))} && printf yes")
-                if not code and output.strip().endswith("yes"): exists = True; break
+                    code, output, _ = client.run_powershell(f"$p=Get-ChildItem -LiteralPath {q(savegames)} -Filter 'Level.sav' -File -Recurse -ErrorAction SilentlyContinue|Select-Object -First 1 -ExpandProperty DirectoryName;if($p){{$p}}")
+                else:
+                    code, output, _ = client.run(f"p=$(find {shlex.quote(savegames)} -type f -name Level.sav -print -quit 2>/dev/null); test -n \"$p\" && dirname \"$p\"")
+                if not code and output.strip(): generated_world = output.strip().splitlines()[-1].strip(); break
                 time.sleep(1)
-            if not exists: raise RuntimeError("服务器未在期限内生成新 Level.sav")
+            if not generated_world: raise RuntimeError("服务器未在期限内生成新 Level.sav")
             if not health(): raise RuntimeError("新世界服务器健康检查失败")
             self._remote_cleanup(client, platform_name, rollback)
-            return WorldMutationResult(str(package), remote_world, "reset")
+            return WorldMutationResult(str(package), generated_world, "reset")
         except Exception as exc:
             try:
                 try: stop()
                 except Exception: pass
-                self._remote_rollback(client, platform_name, remote_world, rollback, "", ""); start()
+                if platform_name == "windows":
+                    code, output, error = client.run_powershell(f"$ErrorActionPreference='Stop';Remove-Item -LiteralPath {q(savegames)} -Recurse -Force -ErrorAction SilentlyContinue;Move-Item -LiteralPath {q(rollback)} -Destination {q(savegames)}")
+                else:
+                    code, output, error = client.run(f"set -e; rm -rf -- {shlex.quote(savegames)}; mv -- {shlex.quote(rollback)} {shlex.quote(savegames)}")
+                if code: raise RuntimeError(error.strip() or output.strip() or "远程 SaveGames 目录恢复失败")
+                start()
             except Exception as rollback_exc: raise RuntimeError(f"世界重置回滚失败，服务器已保持停止：{rollback_exc}；原错误：{exc}") from exc
             raise RuntimeError(f"新世界验证失败，已恢复原世界：{exc}") from exc
