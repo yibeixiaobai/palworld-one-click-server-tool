@@ -75,6 +75,180 @@ class Worker(QRunnable):
             pass
 
 
+class IdentityMappingDialog(QDialog):
+    def __init__(
+        self,
+        service,
+        source_players,
+        targets,
+        parent=None,
+        *,
+        title="玩家身份映射",
+        skip_option=None,
+        used_guids=(),
+        pending_guids=None,
+        require_all=False,
+        require_selection=False,
+    ):
+        super().__init__(parent)
+        self.service = service
+        self.skip_option = skip_option
+        self.require_all = require_all
+        self.require_selection = require_selection
+        self.used_guids = {self._normalize_guid(guid) for guid in used_guids if guid}
+        pending = None if pending_guids is None else {self._normalize_guid(guid) for guid in pending_guids if guid}
+        self.source_players = tuple(
+            player for player in source_players
+            if pending is None or service._player_guid(player) in pending
+        )
+        self.targets = service.available_identity_targets("", targets, self.used_guids)
+        self.combos = []
+        self.selected_guids = []
+        self.setWindowTitle(title)
+        self.resize(900, 520)
+        layout = QVBoxLayout(self)
+        self.summary = QLabel()
+        self.summary.setStyleSheet("font-size:15px;font-weight:650;")
+        layout.addWidget(self.summary)
+        hint = QLabel("请为每个存档玩家选择对应的服务器临时身份。选择已占用身份时会自动交换，最终不会产生重复映射。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.table = QTableWidget(len(self.source_players), 4)
+        self.table.setHorizontalHeaderLabels(["存档玩家", "存档 GUID", "目标临时身份", "映射状态"])
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        for row, player in enumerate(self.source_players):
+            old_guid = service._player_guid(player)
+            name = str(player.get("nickname") or "未命名")
+            name_item = QTableWidgetItem(name); name_item.setFlags(Qt.ItemIsEnabled)
+            guid_item = QTableWidgetItem(old_guid); guid_item.setFlags(Qt.ItemIsEnabled)
+            status_item = QTableWidgetItem("待选择"); status_item.setFlags(Qt.ItemIsEnabled)
+            self.table.setItem(row, 0, name_item)
+            self.table.setItem(row, 1, guid_item)
+            combo = QComboBox()
+            combo.setMinimumWidth(300)
+            combo.currentIndexChanged.connect(self._selection_changed)
+            self.combos.append(combo)
+            self.selected_guids.append("")
+            self.table.setCellWidget(row, 2, combo)
+            self.table.setItem(row, 3, status_item)
+        layout.addWidget(self.table, 1)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("确认映射")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self._populate_options()
+        self._apply_unique_name_suggestions()
+
+    @staticmethod
+    def _normalize_guid(value):
+        return str(value or "").replace("-", "").upper()
+
+    def _placeholder_text(self):
+        return self.skip_option or "请选择临时身份"
+
+    def _skip_status_text(self):
+        if not self.skip_option:
+            return "待选择"
+        return "稍后迁移" if self.skip_option.startswith("稍后迁移") else self.skip_option
+
+    def _target_label(self, target):
+        return f"{target.get('nickname') or '未命名'} · {self.service._player_guid(target)}"
+
+    def _selection_changed(self, _index=None):
+        changed_combo = self.sender()
+        if changed_combo not in self.combos:
+            return
+        changed_row = self.combos.index(changed_combo)
+        selected_guid = self._normalize_guid(changed_combo.currentData())
+        previous_guid = self.selected_guids[changed_row]
+        duplicate_row = next(
+            (
+                row for row, guid in enumerate(self.selected_guids)
+                if row != changed_row and selected_guid and guid == selected_guid
+            ),
+            None,
+        )
+        if duplicate_row is not None:
+            duplicate_combo = self.combos[duplicate_row]
+            replacement = previous_guid or ""
+            duplicate_combo.blockSignals(True)
+            duplicate_combo.setCurrentIndex(max(0, duplicate_combo.findData(replacement)))
+            duplicate_combo.blockSignals(False)
+        self.selected_guids = [self._normalize_guid(combo.currentData()) for combo in self.combos]
+        self._update_option_states()
+
+    def _populate_options(self):
+        for combo in self.combos:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem(self._placeholder_text(), "")
+            for target in self.targets:
+                combo.addItem(self._target_label(target), self.service._player_guid(target))
+            combo.blockSignals(False)
+        self._update_option_states()
+
+    def _update_option_states(self):
+        for row, combo in enumerate(self.combos):
+            for index in range(1, combo.count()):
+                item = combo.model().item(index)
+                if item is None:
+                    continue
+                item.setEnabled(True)
+                item.setToolTip("")
+        self.selected_guids = [self._normalize_guid(combo.currentData()) for combo in self.combos]
+        self._update_state()
+
+    def _apply_unique_name_suggestions(self):
+        source_names = [str(player.get("nickname") or "").strip().casefold() for player in self.source_players]
+        target_names = [str(target.get("nickname") or "").strip().casefold() for target in self.targets]
+        suggestions = {}
+        for row, source_name in enumerate(source_names):
+            if not source_name or source_names.count(source_name) != 1 or target_names.count(source_name) != 1:
+                continue
+            target = self.targets[target_names.index(source_name)]
+            target_guid = self.service._player_guid(target)
+            suggestions[row] = target_guid
+        for row, target_guid in suggestions.items():
+            index = self.combos[row].findData(target_guid)
+            if index >= 0:
+                self.combos[row].setCurrentIndex(index)
+
+    def _update_state(self):
+        selected_count = 0
+        for row, combo in enumerate(self.combos):
+            selected = bool(combo.currentData())
+            selected_count += int(selected)
+            if selected:
+                status = "已映射"
+            else:
+                status = self._skip_status_text()
+            self.table.item(row, 3).setText(status)
+        total = len(self.source_players)
+        remaining = total - selected_count
+        suffix = f" · 尚未选择 {remaining}" if self.require_all and remaining else ""
+        self.summary.setText(f"待映射 {total} · 可用临时身份 {len(self.targets)} · 已选择 {selected_count}{suffix}")
+        enabled = bool(total)
+        if self.require_all:
+            enabled = enabled and selected_count == total
+        elif self.require_selection:
+            enabled = enabled and selected_count > 0
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(enabled)
+
+    def confirmations(self):
+        result = {}
+        for player, combo in zip(self.source_players, self.combos):
+            target_guid = self._normalize_guid(combo.currentData())
+            if target_guid:
+                result[self.service._player_guid(player)] = target_guid
+        return result
+
+
 class RestoreOptionsDialog(QDialog):
     def __init__(self, plan, manifest, parent=None, player_uids=(), plugin_status=(False, "PlM 插件尚未检测")):
         super().__init__(parent)
@@ -1577,21 +1751,17 @@ class MainWindow(QMainWindow):
 
     def _restore_migration_prepared(self, payload, reason):
         session, restore_point = payload; service = BackupPackageService(); targets = list(session.placeholder_players)
-        self._set_install_progress(TaskProgress(30, "等待玩家映射确认", "请在弹出的映射窗口中逐项确认玩家身份", False))
-        confirmations = {}; used = set()
-        for player in session.source_players:
-            old_guid = service._player_guid(player); old_name = str(player.get("nickname") or "未命名")
-            available = list(service.available_identity_targets(old_guid, targets, used))
-            options = ["稍后迁移（玩家进入恢复后的服务器创建临时角色）"] + [f"{service._player_guid(item)} · {item.get('nickname') or '未命名'}" for item in available]
-            suggested = 0
-            matches = [index for index, target in enumerate(available, 1) if str(target.get("nickname") or "").casefold() == old_name.casefold()]
-            if len(matches) == 1: suggested = matches[0]
-            choice, ok = QInputDialog.getItem(self, "恢复玩家身份映射", f"备份角色：{old_name} ({old_guid})\n请选择该玩家在目标服务器的登录身份：", options, suggested, False)
-            if not ok: self._finish_backup_task(False); return
-            if choice.startswith("稍后迁移"): continue
-            new_guid = choice.split(" · ", 1)[0]
-            if new_guid in used: self._finish_backup_task(False); return QMessageBox.critical(self, "映射冲突", "同一个目标服务器身份不能分配给多个备份角色。")
-            used.add(new_guid); confirmations[old_guid] = new_guid
+        self._set_install_progress(TaskProgress(30, "等待玩家映射确认", "请在批量映射窗口中确认全部玩家身份", False))
+        dialog = IdentityMappingDialog(
+            service,
+            session.source_players,
+            targets,
+            self,
+            title="恢复玩家身份映射",
+            skip_option="稍后迁移（玩家进入恢复后的服务器创建临时角色）",
+        )
+        if dialog.exec() != QDialog.Accepted: self._finish_backup_task(False); return
+        confirmations = dialog.confirmations()
         try: session = service.confirm_restore_mappings(session, confirmations, self.storage.root)
         except Exception as exc: self._finish_backup_task(False); return QMessageBox.critical(self, "玩家映射失败", str(exc))
         summary = f"将恢复世界并立即迁移 {len(session.mappings)} 个玩家；另有 {len(session.pending_player_guids)} 个玩家需要恢复后创建临时角色。"
@@ -2067,14 +2237,17 @@ class MainWindow(QMainWindow):
         try: session = service.refresh_coop_placeholders(session, self.storage.root)
         except Exception as exc: return QMessageBox.critical(self, "刷新临时角色失败", str(exc))
         if not session.placeholder_players: return QMessageBox.information(self, "尚未发现临时角色", "请让玩家进入专用服务器创建角色并退出后再刷新。")
-        options = [f"{str(item.get('player_guid') or item.get('player_uid') or '').replace('-', '').upper()} · {item.get('nickname') or '未命名'}" for item in session.placeholder_players]
-        confirmations = {}
+        dialog = IdentityMappingDialog(
+            service,
+            session.source_players,
+            session.placeholder_players,
+            self,
+            title="确认玩家映射",
+            require_all=True,
+        )
+        if dialog.exec() != QDialog.Accepted: return
+        confirmations = dialog.confirmations()
         try:
-            for player in session.source_players:
-                old = str(player.get("player_guid") or player.get("player_uid") or "").replace("-", "").upper(); old_name = player.get("nickname") or "未命名"
-                choice, ok = QInputDialog.getItem(self, "确认玩家映射", f"本地角色：{old_name} ({old})\n请选择对应的专服临时角色：", options, 0, False)
-                if not ok: return
-                confirmations[old] = choice.split(" · ", 1)[0]
             session = service.build_identity_mappings(session, confirmations, self.storage.root)
         except Exception as exc: return QMessageBox.critical(self, "玩家映射失败", str(exc))
         if QMessageBox.question(self, "执行角色迁移", f"确认迁移 {len(session.mappings)} 个玩家角色？迁移会停止服务器并创建迁移前备份。") != QMessageBox.Yes: return
@@ -2122,24 +2295,19 @@ class MainWindow(QMainWindow):
         pending = set(session.pending_player_guids); targets = list(session.placeholder_players)
         migrated_count = sum(1 for item in session.mappings if item.status == "migrated")
         self.append_log(f"继续迁移第 {session.snapshot_generation + 1} 轮：已完成 {migrated_count} 个，待处理 {len(pending)} 个")
-        confirmations = {}; used = {item.new_guid for item in session.mappings if item.status == "migrated"}
-        for player in session.source_players:
-            old_guid = service._player_guid(player)
-            if old_guid not in pending: continue
-            old_name = str(player.get("nickname") or "未命名")
-            available = list(service.available_identity_targets(old_guid, targets, used))
-            options = ["暂不迁移"] + [f"{service._player_guid(item)} · {item.get('nickname') or '未命名'}" for item in available]
-            matches = [index for index, target in enumerate(available, 1) if str(target.get("nickname") or "").casefold() == old_name.casefold()]
-            suggested = matches[0] if len(matches) == 1 else 0
-            choice, ok = QInputDialog.getItem(self, "继续玩家身份迁移", f"备份角色：{old_name} ({old_guid})\n请选择刚在服务器创建的临时角色：", options, suggested, False)
-            if not ok: self._finish_backup_task(False); return
-            if choice == "暂不迁移": continue
-            new_guid = choice.split(" · ", 1)[0]
-            if new_guid in used:
-                self._finish_backup_task(False); return QMessageBox.critical(self, "映射冲突", "同一个服务器身份不能分配给多个备份角色。")
-            used.add(new_guid); confirmations[old_guid] = new_guid
-        if not confirmations:
-            self._finish_backup_task(False); return QMessageBox.information(self, "未选择玩家", "本次没有确认任何玩家映射，服务器存档未修改。")
+        dialog = IdentityMappingDialog(
+            service,
+            session.source_players,
+            targets,
+            self,
+            title="继续玩家身份迁移",
+            skip_option="暂不迁移",
+            used_guids=(item.new_guid for item in session.mappings if item.status == "migrated"),
+            pending_guids=pending,
+            require_selection=True,
+        )
+        if dialog.exec() != QDialog.Accepted: self._finish_backup_task(False); return
+        confirmations = dialog.confirmations()
         try: session = service.confirm_restore_mappings(session, confirmations, self.storage.root)
         except Exception as exc: self._finish_backup_task(False); return QMessageBox.critical(self, "玩家映射失败", str(exc))
         if QMessageBox.question(self, "执行玩家迁移", f"本次将迁移 {len(confirmations)} 个玩家；完成后仍有 {len(session.pending_player_guids)} 个玩家待处理。") != QMessageBox.Yes:

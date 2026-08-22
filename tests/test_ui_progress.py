@@ -101,6 +101,178 @@ def test_save_tools_page_mirrors_migration_progress(window, monkeypatch):
     assert window.save_tool_stage.text() == "任务完成"
 
 
+def test_identity_mapping_dialog_keeps_identical_options_and_swaps_claimed_targets(window):
+    dialog = ui_module.IdentityMappingDialog(
+        BackupPackageService(),
+        (
+            {"player_guid": "A" * 32, "nickname": "Alice"},
+            {"player_guid": "C" * 32, "nickname": "Carol"},
+        ),
+        (
+            {"player_guid": "B" * 32, "nickname": "Bob"},
+            {"player_guid": "D" * 32, "nickname": "Dave"},
+            {"player_guid": "E" * 32, "nickname": "Eve"},
+        ),
+        window,
+        require_all=True,
+    )
+
+    assert dialog.table.rowCount() == 2
+    assert dialog.buttons.button(ui_module.QDialogButtonBox.Ok).isEnabled() is False
+    first_options = [dialog.combos[0].itemData(i) for i in range(dialog.combos[0].count())]
+    second_options = [dialog.combos[1].itemData(i) for i in range(dialog.combos[1].count())]
+    assert first_options == second_options == ["", "B" * 32, "D" * 32, "E" * 32]
+    dialog.combos[0].setCurrentIndex(dialog.combos[0].findData("B" * 32))
+    claimed_index = dialog.combos[1].findData("B" * 32)
+    assert claimed_index >= 0
+    assert dialog.combos[1].model().item(claimed_index).isEnabled() is True
+    assert [dialog.combos[1].itemData(i) for i in range(dialog.combos[1].count())] == first_options
+
+    dialog.combos[1].setCurrentIndex(claimed_index)
+    assert dialog.combos[0].currentData() == ""
+    assert dialog.combos[1].currentData() == "B" * 32
+
+    dialog.combos[0].setCurrentIndex(dialog.combos[0].findData("D" * 32))
+    dialog.combos[1].setCurrentIndex(dialog.combos[1].findData("D" * 32))
+
+    assert dialog.confirmations() == {"A" * 32: "B" * 32, "C" * 32: "D" * 32}
+    assert dialog.buttons.button(ui_module.QDialogButtonBox.Ok).isEnabled() is True
+    dialog.close()
+
+
+def test_identity_mapping_dialog_skip_does_not_consume_targets(window):
+    dialog = ui_module.IdentityMappingDialog(
+        BackupPackageService(),
+        (
+            {"player_guid": "A" * 32, "nickname": "Alice"},
+            {"player_guid": "C" * 32, "nickname": "Carol"},
+        ),
+        (
+            {"player_guid": "B" * 32, "nickname": "Bob"},
+            {"player_guid": "D" * 32, "nickname": "Dave"},
+        ),
+        window,
+        skip_option="稍后迁移",
+    )
+
+    assert dialog.buttons.button(ui_module.QDialogButtonBox.Ok).isEnabled() is True
+    assert dialog.confirmations() == {}
+    assert dialog.combos[0].currentText() == "稍后迁移"
+    assert dialog.combos[1].findData("B" * 32) >= 0
+    assert dialog.combos[1].findData("D" * 32) >= 0
+    dialog.close()
+
+
+def test_identity_mapping_dialog_shows_every_temporary_identity_in_every_row(window):
+    dialog = ui_module.IdentityMappingDialog(
+        BackupPackageService(),
+        (
+            {"player_guid": "A" * 32, "nickname": "Alice"},
+            {"player_guid": "C" * 32, "nickname": "Carol"},
+        ),
+        (
+            {"player_guid": "A" * 32, "nickname": "Temporary A"},
+            {"player_guid": "C" * 32, "nickname": "Temporary C"},
+            {"player_guid": "D" * 32, "nickname": "Temporary D"},
+        ),
+        window,
+        require_all=True,
+    )
+
+    expected = ["", "A" * 32, "C" * 32, "D" * 32]
+    assert [dialog.combos[0].itemData(i) for i in range(dialog.combos[0].count())] == expected
+    assert [dialog.combos[1].itemData(i) for i in range(dialog.combos[1].count())] == expected
+    assert dialog.combos[0].model().item(dialog.combos[0].findData("A" * 32)).isEnabled() is True
+    assert dialog.combos[0].model().item(dialog.combos[0].findData("C" * 32)).isEnabled() is True
+    assert dialog.combos[1].model().item(dialog.combos[1].findData("A" * 32)).isEnabled() is True
+    assert dialog.combos[1].model().item(dialog.combos[1].findData("C" * 32)).isEnabled() is True
+    dialog.combos[0].setCurrentIndex(dialog.combos[0].findData("A" * 32))
+    assert dialog.combos[0].currentData() == "A" * 32
+    dialog.close()
+
+
+def test_identity_mapping_dialog_filters_history_pending_invalid_and_self_targets(window):
+    dialog = ui_module.IdentityMappingDialog(
+        BackupPackageService(),
+        (
+            {"player_guid": "A" * 32, "nickname": "Pending"},
+            {"player_guid": "F" * 32, "nickname": "Finished"},
+        ),
+        (
+            {"player_guid": "B" * 32, "nickname": "Completed"},
+            {"player_guid": "A" * 32, "nickname": "Same"},
+            {"player_guid": "D" * 32, "nickname": "Available"},
+            {"player_guid": "d" * 32, "nickname": "Duplicate"},
+            {"player_guid": "", "nickname": "Invalid"},
+        ),
+        window,
+        skip_option="暂不迁移",
+        used_guids=("B" * 32,),
+        pending_guids=("A" * 32,),
+        require_selection=True,
+    )
+
+    assert dialog.table.rowCount() == 1
+    assert dialog.combos[0].findData("B" * 32) == -1
+    own_index = dialog.combos[0].findData("A" * 32)
+    assert own_index >= 0
+    assert dialog.combos[0].model().item(own_index).isEnabled() is True
+    assert [dialog.combos[0].itemData(i) for i in range(dialog.combos[0].count())] == ["", "A" * 32, "D" * 32]
+    dialog.combos[0].setCurrentIndex(own_index)
+    assert dialog.combos[0].currentData() == "A" * 32
+    assert dialog.buttons.button(ui_module.QDialogButtonBox.Ok).isEnabled() is True
+    dialog.combos[0].setCurrentIndex(dialog.combos[0].findData("D" * 32))
+    assert dialog.buttons.button(ui_module.QDialogButtonBox.Ok).isEnabled() is True
+    dialog.close()
+
+
+def test_identity_mapping_dialog_only_preselects_globally_unique_names(window):
+    dialog = ui_module.IdentityMappingDialog(
+        BackupPackageService(),
+        (
+            {"player_guid": "A" * 32, "nickname": "Alice"},
+            {"player_guid": "C" * 32, "nickname": "Twin"},
+            {"player_guid": "F" * 32, "nickname": "Twin"},
+        ),
+        (
+            {"player_guid": "B" * 32, "nickname": "Alice"},
+            {"player_guid": "D" * 32, "nickname": "Twin"},
+            {"player_guid": "E" * 32, "nickname": "Twin"},
+        ),
+        window,
+        require_all=True,
+    )
+
+    assert dialog.combos[0].currentData() == "B" * 32
+    assert dialog.combos[1].currentData() == ""
+    assert dialog.combos[2].currentData() == ""
+    assert dialog.buttons.button(ui_module.QDialogButtonBox.Ok).isEnabled() is False
+    dialog.close()
+
+
+def test_cancelled_identity_mapping_dialog_does_not_confirm_restore(window, monkeypatch):
+    calls = []
+
+    class CancelledDialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def exec(self):
+            return ui_module.QDialog.Rejected
+
+        def confirmations(self):
+            calls.append("confirmations")
+            return {}
+
+    monkeypatch.setattr(ui_module, "IdentityMappingDialog", CancelledDialog)
+    monkeypatch.setattr(BackupPackageService, "confirm_restore_mappings", lambda *_args: calls.append("confirm"))
+    session = SimpleNamespace(source_players=(), placeholder_players=())
+
+    window._restore_migration_prepared((session, "restore-point"), "test")
+
+    assert calls == []
+
+
 def test_update_check_states_and_automatic_failure(window, monkeypatch):
     messages = []
     logs = []

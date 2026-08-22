@@ -480,7 +480,6 @@ class BackupPackageService:
             old_key = str(old_guid).replace("-", "").upper(); new_key = str(new_guid).replace("-", "").upper()
             if old_key not in source_by_uid or new_key not in target_by_uid: raise ValueError("玩家映射引用了不存在的角色")
             source = source_by_uid[old_key]; target = target_by_uid[new_key]
-            if old_key == new_key: raise ValueError(f"玩家 {source.get('nickname') or old_key} 不能映射到自己的旧 GUID；请让该玩家进入专服创建新角色后选择新的 GUID")
             if new_key in used: raise ValueError(f"目标 GUID {new_key} 已分配给其他玩家，存在重复目标 GUID；每个专服临时角色只能使用一次")
             used.add(new_key)
             mappings.append(PlayerIdentityMapping(old_guid=old_key, new_guid=new_key, old_name=str(source.get("nickname") or ""), new_name=str(target.get("nickname") or ""), old_instance_id=str(source.get("instance_id") or ""), new_instance_id=str(target.get("instance_id") or ""), confirmed=True, status="confirmed"))
@@ -605,7 +604,6 @@ class BackupPackageService:
             if not new_key: continue
             if old_key not in source or old_key not in allowed or new_key not in targets: raise ValueError("玩家映射引用了不存在或已完成迁移的角色")
             old = source[old_key]; new = targets[new_key]
-            if old_key == new_key: raise ValueError(f"玩家 {old.get('nickname') or old_key} 不能映射到自己的旧 GUID；请让该玩家进入专服创建新角色后选择新的 GUID")
             if new_key in used: raise ValueError(f"目标 GUID {new_key} 已分配给其他玩家，存在重复目标 GUID；每个专服临时角色只能使用一次")
             used.add(new_key)
             mappings.append(PlayerIdentityMapping(old_guid=old_key, new_guid=new_key, old_name=str(old.get("nickname") or ""), new_name=str(new.get("nickname") or ""), old_instance_id=str(old.get("instance_id") or ""), confirmed=True, new_instance_id=str(new.get("instance_id") or ""), status="confirmed"))
@@ -684,9 +682,24 @@ class BackupPackageService:
             shutil.copytree(candidate_input, candidate); report = {"migrated": 0, "players": []}
         decoded = self.inspect_world_players(candidate, storage_root)
         active = [self._player_guid(item) for item in decoded]
+        source_by_guid = {self._player_guid(item): item for item in session.source_players}
+        candidate_by_guid = {self._player_guid(item): item for item in decoded}
         for mapping in session.mappings:
             if active.count(mapping.new_guid) != 1: raise RuntimeError(f"候选世界中的目标玩家 GUID 数量异常：{mapping.new_guid}")
-            if mapping.old_guid in active: raise RuntimeError(f"候选世界仍引用旧玩家 GUID：{mapping.old_guid}")
+            if mapping.old_guid != mapping.new_guid and mapping.old_guid in active: raise RuntimeError(f"候选世界仍引用旧玩家 GUID：{mapping.old_guid}")
+            source_player = source_by_guid.get(mapping.old_guid, {}); candidate_player = candidate_by_guid.get(mapping.new_guid, {})
+            source_pals = {str(item.get("individual_id") or "") for item in source_player.get("pals", ()) if item.get("individual_id")}
+            candidate_pals = {str(item.get("individual_id") or "") for item in candidate_player.get("pals", ()) if item.get("individual_id")}
+            missing_pals = source_pals - candidate_pals
+            if missing_pals: raise RuntimeError(f"候选世界缺少玩家 {mapping.old_name or mapping.old_guid} 的帕鲁：{', '.join(sorted(missing_pals))}")
+            def inventory(player):
+                return {
+                    (str(item.get("ContainerId") or container), int(item.get("SlotIndex") or 0)): (str(item.get("ItemId") or ""), int(item.get("StackCount") or 0))
+                    for container, rows in (player.get("items") or {}).items() for item in rows or []
+                }
+            source_items = inventory(source_player); candidate_items = inventory(candidate_player)
+            missing_items = [identity for identity, value in source_items.items() if candidate_items.get(identity) != value]
+            if missing_items: raise RuntimeError(f"候选世界缺少玩家 {mapping.old_name or mapping.old_guid} 的背包或钱包数据，共 {len(missing_items)} 个槽位不一致")
         baseline = tuple(sorted(path.name.upper() for path in (candidate / "Players").glob("*.sav")))
         updated = replace(session, phase="deploying", baseline_player_files=baseline, detail=f"候选验证通过，已迁移 {report.get('migrated', 0)} 个玩家")
         self.save_migration_session(storage_root, updated); return updated, report

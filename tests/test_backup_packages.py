@@ -263,12 +263,13 @@ def test_identity_target_candidates_exclude_same_used_and_duplicate_guids():
     assert result == ({"player_guid": available, "nickname": "first"},)
 
 
-def test_restore_mapping_reports_same_and_reused_target_separately(tmp_path: Path):
+def test_restore_mapping_accepts_identity_preserving_target_and_rejects_reuse(tmp_path: Path):
     service = BackupPackageService(); old_a = "A" * 32; old_c = "C" * 32; target = "B" * 32
     session = CoopMigrationSession(instance_id="server", source_path="source", target_world_path="target", phase="mapping_ready", source_players=({"player_guid": old_a, "nickname": "Alice"}, {"player_guid": old_c, "nickname": "Carol"}), placeholder_players=({"player_guid": old_a}, {"player_guid": target}), pending_player_guids=(old_a, old_c))
 
-    with pytest.raises(ValueError, match="不能映射到自己的旧 GUID"):
-        service.confirm_restore_mappings(session, {old_a: old_a}, tmp_path)
+    updated = service.confirm_restore_mappings(session, {old_a: old_a}, tmp_path)
+    assert updated.mappings[0].old_guid == old_a
+    assert updated.mappings[0].new_guid == old_a
     with pytest.raises(ValueError, match="已分配给其他玩家"):
         service.confirm_restore_mappings(session, {old_a: target, old_c: target}, tmp_path)
 

@@ -21,7 +21,7 @@ PALWORLD_SAVE_TOOLS_COMMIT = "a0e350127dc570593e666f2177eafcee69f7cd5d"
 REFERENCE_TOOL_COMMIT = "f45a48ef25ce08a5311a27e55b17062ba0bb4362"
 SOURCE_URL = "https://github.com/deafdudecomputers/PalworldSaveTools.git"
 VS_BOOTSTRAPPER_URL = "https://aka.ms/vs/17/release/vs_BuildTools.exe"
-HELPER_API_VERSION = 9
+HELPER_API_VERSION = 11
 SAVE_PATCH_FORMAT = "palworld-console-save-patch-v2"
 IDENTITY_MIGRATION_FORMAT = "palworld-console-identity-migration-v1"
 
@@ -873,13 +873,13 @@ def migrate_identities(world_path,mapping_path,output_path):
     if manifest.get("format")!="palworld-console-identity-migration-v1":raise RuntimeError("unsupported identity migration format")
     mappings=manifest.get("mappings") or []
     if not mappings:raise RuntimeError("迁移映射为空")
-    prepared=[];old_set=set();new_set=set()
+    prepared=[];old_set=set();new_set=set();same_set=set()
     for item in mappings:
         old_clean,old_value=guid(item.get("old_guid"));new_clean,new_value=guid(item.get("new_guid"))
-        if old_clean==new_clean:raise RuntimeError("新旧 GUID 不能相同")
         if old_clean in old_set or new_clean in new_set:raise RuntimeError("迁移映射包含重复 GUID")
+        if old_clean==new_clean:same_set.add(old_clean)
         old_set.add(old_clean);new_set.add(new_clean);prepared.append((item,old_clean,old_value,new_clean,new_value))
-    if old_set & new_set:raise RuntimeError("迁移映射不能形成交叉覆盖")
+    if (old_set & new_set)-same_set:raise RuntimeError("迁移映射不能形成交叉覆盖")
     if output_path.exists():shutil.rmtree(output_path)
     shutil.copytree(world_path,output_path)
     level_path=output_path/"Level.sav";players_path=output_path/"Players"
@@ -889,6 +889,9 @@ def migrate_identities(world_path,mapping_path,output_path):
         old_path=players_path/(old_clean.upper()+".sav");new_path=players_path/(new_clean.upper()+".sav")
         if not old_path.is_file():raise RuntimeError("旧玩家文件不存在："+old_path.name)
         if not new_path.is_file():raise RuntimeError("专服临时玩家文件不存在："+new_path.name)
+        if old_clean==new_clean:
+            reports.append({"old_guid":old_clean.upper(),"new_guid":new_clean.upper(),"instance_id":str(item.get("old_instance_id") or "").lower(),"guild_updates":0,"placeholder_hits":0,"identity_preserved":True})
+            continue
         player_gvas,player_type=read_gvas(old_path);save_data=player_gvas.properties["SaveData"]["value"]
         old_instance=str(save_data["IndividualId"]["value"]["InstanceId"]["value"]).lower()
         expected_instance=str(item.get("old_instance_id") or "").lower()
@@ -929,7 +932,7 @@ def migrate_identities(world_path,mapping_path,output_path):
     decoded=decode(level_path);decoded_by_guid={str(p.get("player_guid","")).upper():p for p in decoded.get("players",[])}
     for report in reports:
         if report["new_guid"] not in decoded_by_guid:raise RuntimeError("迁移后二次解析未找到玩家："+report["new_guid"])
-        if (players_path/(report["old_guid"]+".sav")).exists():raise RuntimeError("迁移后旧玩家文件仍然存在")
+        if report["old_guid"]!=report["new_guid"] and (players_path/(report["old_guid"]+".sav")).exists():raise RuntimeError("迁移后旧玩家文件仍然存在")
         if not (players_path/(report["new_guid"]+".sav")).is_file():raise RuntimeError("迁移后新玩家文件不存在")
     return {"migrated":len(reports),"players":reports,"decoded_players":len(decoded.get("players",[]))}
 def migrate_identities_v2(base_world,source_world,mapping_path,output_path):
@@ -948,7 +951,20 @@ def migrate_identities_v2(base_world,source_world,mapping_path,output_path):
         _source_level,_,source_data=load(source_world/"Level.sav")
         base_entries=base_data.setdefault("CharacterSaveParameterMap",{}).setdefault("value",[])
         source_entries=source_data.get("CharacterSaveParameterMap",{}).get("value",[])
-        base_instances={str(e.get("key",{}).get("InstanceId",{}).get("value","" )).lower() for e in base_entries}
+        def reference_id(prop):
+            value=(prop or {}).get("value",{}) if isinstance(prop,dict) else {}
+            identity=value.get("ID",{}) if isinstance(value,dict) else {}
+            return str(identity.get("value") or "") if isinstance(identity,dict) else str(identity or "")
+        def merge_containers(section,wanted):
+            wanted={str(value).lower() for value in wanted if value}
+            if not wanted:return 0
+            source_rows=source_data.get(section,{}).get("value",[]); matches=[entry for entry in source_rows if container_id(entry).lower() in wanted]
+            found={container_id(entry).lower() for entry in matches};missing=wanted-found
+            if missing:raise RuntimeError("原始世界缺少玩家容器："+",".join(sorted(missing)))
+            target_rows=base_data.setdefault(section,{}).setdefault("value",[])
+            target_rows[:]=[entry for entry in target_rows if container_id(entry).lower() not in wanted]
+            target_rows.extend(copy.deepcopy(entry) for entry in matches);return len(matches)
+        base_instances={str(e.get("key",{}).get("InstanceId",{}).get("value","" )).lower() for e in base_entries};preserved=[];rebound=[]
         for item in mappings:
             old_clean,_=guid(item.get("old_guid")); old_value=guid(item.get("old_guid"))[1]; new_clean,_=guid(item.get("new_guid"))
             old_instance=str(item.get("old_instance_id") or "").lower()
@@ -956,9 +972,45 @@ def migrate_identities_v2(base_world,source_world,mapping_path,output_path):
                 for entry in source_entries:
                     if str(entry.get("key",{}).get("PlayerUId",{}).get("value","")).replace("-","").lower()==old_clean:
                         old_instance=str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower(); break
+            source_entry=next((entry for entry in source_entries if str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower()==old_instance),None)
+            new_instance=str(item.get("new_instance_id") or "").lower()
+            source_player=source_world/"Players"/(old_clean.upper()+".sav")
+            if not source_player.is_file():raise RuntimeError("原始玩家文件不存在："+source_player.name)
+            source_save=read_gvas(source_player)[0].properties.get("SaveData",{}).get("value",{})
+            inventory=source_save.get("InventoryInfo",{}).get("value",{});item_containers=set()
+            for prop in inventory.values() if isinstance(inventory,dict) else []:
+                identity=reference_id(prop)
+                if identity:item_containers.add(identity)
+            pal_container=reference_id(source_save.get("PalStorageContainerId"))
+            item_container_count=merge_containers("ItemContainerSaveData",item_containers)
+            character_container_count=merge_containers("CharacterContainerSaveData",{pal_container} if pal_container else set())
+            source_pals=[entry for entry in source_entries if str(save_parameter(entry).get("OwnerPlayerUId",{}).get("value") or "").replace("-","").lower()==old_clean]
+            source_pal_ids={str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower() for entry in source_pals}
+            if old_clean==new_clean:
+                base_entries[:]=[entry for entry in base_entries if not (str(save_parameter(entry).get("OwnerPlayerUId",{}).get("value") or "").replace("-","").lower()==old_clean and str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower() not in source_pal_ids)]
+            for pal_entry in source_pals:
+                pal_instance=str(pal_entry.get("key",{}).get("InstanceId",{}).get("value","")).lower()
+                base_entries[:]=[entry for entry in base_entries if str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower()!=pal_instance]
+                base_entries.append(copy.deepcopy(pal_entry));base_instances.add(pal_instance)
+            if old_clean==new_clean:
+                existing=next((entry for entry in base_entries if old_instance and str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower()==old_instance),None)
+                template=next((entry for entry in base_entries if (new_instance and str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower()==new_instance) or str(entry.get("key",{}).get("PlayerUId",{}).get("value","")).replace("-","").lower()==new_clean),None)
+                if source_entry is None:raise RuntimeError("原始 Level.sav 中找不到待迁移玩家记录："+old_clean.upper())
+                if existing is None and template is None:raise RuntimeError("最新专服快照中找不到对应临时角色记录："+new_clean.upper())
+                if existing is not None:
+                    if template is not None and template is not existing:base_entries.remove(template)
+                else:
+                    template["key"]["PlayerUId"]["value"]=source_entry["key"]["PlayerUId"]["value"]
+                    template["key"]["InstanceId"]["value"]=source_entry["key"]["InstanceId"]["value"]
+                    template["value"]["RawData"]["value"]["object"]["SaveParameter"]["value"]=copy.deepcopy(save_parameter(source_entry))
+                for group in base_data.get("GroupSaveDataMap",{}).get("value",[]):
+                    if enum_value(group.get("value",{}).get("GroupType"))!="EPalGroupType::Guild":continue
+                    raw=group["value"]["RawData"]["value"]
+                    if new_instance and new_instance!=old_instance:raw["individual_character_handle_ids"]=[handle for handle in raw.get("individual_character_handle_ids",[]) if str(handle.get("instance_id","")).lower()!=new_instance]
+                preserved.append({"old_guid":old_clean.upper(),"new_guid":new_clean.upper(),"instance_id":old_instance,"guild_updates":0,"placeholder_hits":1 if new_instance and new_instance!=old_instance else 0,"identity_preserved":True,"pals":len(source_pals),"item_containers":item_container_count,"character_containers":character_container_count})
+                continue
+            rebound.append(item)
             if old_instance and old_instance not in base_instances:
-                source_entry=next((entry for entry in source_entries if str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower()==old_instance),None)
-                new_instance=str(item.get("new_instance_id") or "").lower()
                 template=next((entry for entry in base_entries if str(entry.get("key",{}).get("PlayerUId",{}).get("value","")).replace("-","").lower()==new_clean or (new_instance and str(entry.get("key",{}).get("InstanceId",{}).get("value","")).lower()==new_instance)),None)
                 if source_entry is None:raise RuntimeError("原始 Level.sav 中找不到待迁移玩家记录："+old_clean.upper())
                 if template is None:raise RuntimeError("最新专服快照中找不到对应临时角色记录："+new_clean.upper())
@@ -973,12 +1025,14 @@ def migrate_identities_v2(base_world,source_world,mapping_path,output_path):
         for item in mappings:
             old_clean,_=guid(item.get("old_guid")); old_path=source_players/(old_clean.upper()+".sav")
             if old_path.is_file(): shutil.copy2(old_path,players/old_path.name)
-        legacy_mapping=staging.parent/(staging.name+"-mapping-v1.json")
-        legacy_mapping.write_text(json.dumps({"format":"palworld-console-identity-migration-v1","mappings":mappings},ensure_ascii=False),encoding="utf-8")
-        try:
-            return migrate_identities(staging,legacy_mapping,output_path)
-        finally:
-            legacy_mapping.unlink(missing_ok=True)
+        if rebound:
+            legacy_mapping=staging.parent/(staging.name+"-mapping-v1.json")
+            legacy_mapping.write_text(json.dumps({"format":"palworld-console-identity-migration-v1","mappings":rebound},ensure_ascii=False),encoding="utf-8")
+            try:report=migrate_identities(staging,legacy_mapping,output_path)
+            finally:legacy_mapping.unlink(missing_ok=True)
+            report["migrated"]=int(report.get("migrated",0))+len(preserved);report["players"]=list(report.get("players") or [])+preserved;return report
+        if output_path.exists():shutil.rmtree(output_path)
+        shutil.copytree(staging,output_path);return {"migrated":len(preserved),"players":preserved,"decoded_players":len(decode(output_path/"Level.sav").get("players",[]))}
     finally:
         if staging.exists():shutil.rmtree(staging)
 def convert_file(source,output):

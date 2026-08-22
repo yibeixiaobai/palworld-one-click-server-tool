@@ -270,3 +270,77 @@ def test_identity_migration_removes_placeholder_before_rebinding_guild_and_pals(
     assert guild["players"] == [{"player_uid": new_uid}]
     assert guild["individual_character_handle_ids"] == [{"instance_id": old_instance, "guid": new_uid}]
     assert report["players"][0]["placeholder_hits"] == 1
+
+
+def test_identity_migration_v2_preserves_guid_and_replaces_placeholder_data(tmp_path: Path, monkeypatch):
+    core = types.ModuleType("palsav.core"); core.decompress_sav_to_gvas = lambda _data: (b"", 49); core.compress_gvas_to_sav = lambda data, _save_type: data
+    gvas = types.ModuleType("palsav.gvas"); gvas.GvasFile = object
+    paltypes = types.ModuleType("palsav.paltypes"); paltypes.PALWORLD_TYPE_HINTS = {}; paltypes.PALWORLD_CUSTOM_PROPERTIES = {}
+    monkeypatch.setitem(sys.modules, "palsav", types.ModuleType("palsav")); monkeypatch.setitem(sys.modules, "palsav.core", core); monkeypatch.setitem(sys.modules, "palsav.gvas", gvas); monkeypatch.setitem(sys.modules, "palsav.paltypes", paltypes)
+    namespace = {"__name__": "plm_helper_identity_preserving_test"}; exec(compile(PLM_HELPER, "plm_helper.py", "exec"), namespace)
+    clean = "a" * 32; uid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    old_instance = "old-instance"; temporary_instance = "temporary-instance"
+    pal_instance = "source-pal"; wallet_container = "wallet-container"; pal_container = "pal-container"
+    source_parameter = {"IsPlayer": {"value": True}, "NickName": {"value": "Source"}}
+    temporary_parameter = {"IsPlayer": {"value": True}, "NickName": {"value": "Temporary"}}
+    pal_parameter = {"OwnerPlayerUId": {"value": uid}, "NickName": {"value": "Migrated Pal"}}
+
+    def entry(instance_id, parameter):
+        return {
+            "key": {"PlayerUId": {"value": uid}, "InstanceId": {"value": instance_id}},
+            "value": {"RawData": {"value": {"object": {"SaveParameter": {"value": parameter}}}}},
+        }
+
+    base_data = {
+        "CharacterSaveParameterMap": {"value": [entry(temporary_instance, temporary_parameter)]},
+        "ItemContainerSaveData": {"value": []},
+        "CharacterContainerSaveData": {"value": []},
+        "GroupSaveDataMap": {"value": [{"value": {"GroupType": {"value": "Guild"}, "RawData": {"value": {
+            "individual_character_handle_ids": [{"instance_id": temporary_instance, "guid": uid}],
+            "players": [{"player_uid": uid}],
+        }}}}]},
+    }
+    source_data = {
+        "CharacterSaveParameterMap": {"value": [entry(old_instance, source_parameter), entry(pal_instance, pal_parameter)]},
+        "ItemContainerSaveData": {"value": [{
+            "key": {"ID": {"value": wallet_container}},
+            "value": {"Slots": {"value": {"values": [{"RawData": {"value": {"slot_index": 0, "item": {"static_id": "Money"}, "count": 1234}}}]}}},
+        }]},
+        "CharacterContainerSaveData": {"value": [{
+            "key": {"ID": {"value": pal_container}},
+            "value": {"Slots": {"value": {"values": [{"RawData": {"value": {"instance_id": pal_instance}}}]}}},
+        }]},
+    }
+
+    class FakeGvas:
+        def write(self, _types): return b"encoded-level"
+
+    class FakePlayerGvas:
+        properties = {"SaveData": {"value": {
+            "InventoryInfo": {"value": {"CommonContainerId": {"value": {"ID": {"value": wallet_container}}}}},
+            "PalStorageContainerId": {"value": {"ID": {"value": pal_container}}},
+        }}}
+
+    base = tmp_path / "base"; source = tmp_path / "source"
+    for world, player_bytes in ((base, b"temporary-player"), (source, b"source-player")):
+        (world / "Players").mkdir(parents=True); (world / "Level.sav").write_bytes(b"level"); (world / "Players" / f"{clean.upper()}.sav").write_bytes(player_bytes)
+    mapping = tmp_path / "mapping-v2.json"
+    mapping.write_text(json.dumps({"format": "palworld-console-identity-migration-v2", "mappings": [{"old_guid": clean, "new_guid": clean, "old_instance_id": old_instance, "new_instance_id": temporary_instance}]}), encoding="utf-8")
+    namespace["load"] = lambda path: (FakeGvas(), 49, source_data if "source" in str(path) else base_data)
+    namespace["read_gvas"] = lambda _path: (FakePlayerGvas(), 49)
+    namespace["save_parameter"] = lambda item: item["value"]["RawData"]["value"]["object"]["SaveParameter"]["value"]
+    namespace["enum_value"] = lambda value: "EPalGroupType::Guild" if value else ""
+    namespace["decode"] = lambda _path: {"players": [{"player_guid": clean.upper()}]}
+
+    output = tmp_path / "output"
+    report = namespace["migrate_identities_v2"](base, source, mapping, output)
+
+    migrated_entry = base_data["CharacterSaveParameterMap"]["value"][0]
+    assert migrated_entry["key"]["InstanceId"]["value"] == old_instance
+    assert namespace["save_parameter"](migrated_entry)["NickName"]["value"] == "Source"
+    assert base_data["GroupSaveDataMap"]["value"][0]["value"]["RawData"]["value"]["individual_character_handle_ids"] == []
+    assert any(entry["key"]["InstanceId"]["value"] == pal_instance for entry in base_data["CharacterSaveParameterMap"]["value"])
+    assert base_data["ItemContainerSaveData"]["value"][0]["key"]["ID"]["value"] == wallet_container
+    assert base_data["CharacterContainerSaveData"]["value"][0]["key"]["ID"]["value"] == pal_container
+    assert (output / "Players" / f"{clean.upper()}.sav").read_bytes() == b"source-player"
+    assert report["players"] == [{"old_guid": clean.upper(), "new_guid": clean.upper(), "instance_id": old_instance, "guild_updates": 0, "placeholder_hits": 1, "identity_preserved": True, "pals": 1, "item_containers": 1, "character_containers": 1}]
